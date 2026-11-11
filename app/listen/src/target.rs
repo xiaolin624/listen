@@ -416,12 +416,15 @@ impl NativeEditor {
                 _hook: hook,
                 _com: com,
             };
-            editor.validate()?;
+            editor.validate_writable()?;
             Ok(Some(editor))
         }
     }
 
-    fn validate(&self) -> AppResult<()> {
+    /// Identity and lifetime of the editor selected at capture start. Reading remains
+    /// possible after the provider reports the control read-only or disabled, because
+    /// that is how a failed delivery can report whether the target changed.
+    fn validate_identity(&self) -> AppResult<()> {
         pump_events();
         if LIFETIME.with(|state| state.get().invalid) {
             return Err(
@@ -462,48 +465,64 @@ impl NativeEditor {
                 "The original target was rebuilt; replacement controls are not used".into(),
             );
         }
-        let state = unsafe {
-            let control_type = self
-                .element
-                .CurrentControlType()
-                .map_err(|e| format!("Cannot validate the original target: {e}"))?;
-            let enabled = self
-                .element
-                .CurrentIsEnabled()
-                .map_err(|e| format!("Cannot validate the original target: {e}"))?
-                .as_bool();
-            let password = self
-                .element
-                .CurrentIsPassword()
-                .map_err(|e| format!("Cannot validate the original target: {e}"))?
-                .as_bool();
-            let read_only = self
-                .value
-                .CurrentIsReadOnly()
-                .map_err(|e| format!("Cannot validate the original target: {e}"))?
-                .as_bool();
-            let process = self
-                .element
+        let process = unsafe {
+            self.element
                 .CurrentProcessId()
                 .map_err(|e| format!("Cannot validate the original target: {e}"))?
-                as u32;
-            (
-                writable_editor_type(control_type.0),
-                enabled,
-                password,
-                read_only,
-                process,
-            )
+                as u32
         };
-        let (editable, enabled, password, read_only, process) = state;
-        if !editable || !enabled || password || read_only || process != self.focus.process {
-            return Err("The original target is not an enabled writable editor".into());
+        if process != self.focus.process {
+            return Err(
+                "The original target was rebuilt; replacement controls are not used".into(),
+            );
         }
         belongs_to_root(&self.automation, &self.element, &self.focus)
     }
 
+    /// Output is only attempted while the selected editor is still the same live,
+    /// enabled, non-password and writable editor of the selected window.
+    fn validate_writable(&self) -> AppResult<()> {
+        self.validate_identity()?;
+        let control_type = unsafe {
+            self.element
+                .CurrentControlType()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+        };
+        if !writable_editor_type(control_type.0) {
+            return Err("The original target is no longer a supported editor".into());
+        }
+        let enabled = unsafe {
+            self.element
+                .CurrentIsEnabled()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool()
+        };
+        if !enabled {
+            return Err("The original target is disabled".into());
+        }
+        let password = unsafe {
+            self.element
+                .CurrentIsPassword()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool()
+        };
+        if password {
+            return Err("The original target is a password field".into());
+        }
+        let read_only = unsafe {
+            self.value
+                .CurrentIsReadOnly()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool()
+        };
+        if read_only {
+            return Err("The original target is read-only".into());
+        }
+        Ok(())
+    }
+
     fn content(&self) -> AppResult<String> {
-        self.validate()?;
+        self.validate_identity()?;
         unsafe {
             match self.value.CurrentValue() {
                 Ok(value) => Ok(value.to_string()),
@@ -532,18 +551,41 @@ impl NativeEditor {
             );
         }
         let normalized = replacement.replace("\r\n", "\n").replace('\n', "\r\n");
-        self.validate()?;
+        self.validate_writable()?;
         unsafe {
             self.value
                 .SetValue(&BSTR::from(normalized.as_str()))
                 .map_err(|e| format!("Target output failed or is unconfirmed: {e}"))?;
         }
-        let expected = replacement.replace("\r\n", "\n");
+        let intended = replacement.replace("\r\n", "\n");
+        let previous = expected.replace("\r\n", "\n");
         let deadline = Instant::now() + CONFIRM_TIMEOUT;
+        // A provider may accept the write but store only a prefix when the editor has
+        // a smaller capacity. Requiring a stable prefix avoids mistaking a provider
+        // that still shows the old draft, or a write that is still being applied, for
+        // truncation. The write itself is never repeated.
+        let mut truncated: Option<(usize, u8)> = None;
         loop {
             let observed = self.content()?.replace("\r\n", "\n");
-            if observed == expected {
+            if observed == intended {
                 return Ok(());
+            }
+            if !observed.is_empty() && observed != previous && intended.starts_with(&observed) {
+                truncated = Some(match truncated {
+                    Some((length, polls)) if length == observed.len() => (length, polls + 1),
+                    _ => (observed.len(), 1),
+                });
+                if let Some((_, polls)) = truncated {
+                    if polls >= 3 {
+                        return Err(format!(
+                            "The original target accepted only {} of {} characters; the appended text was truncated",
+                            observed.chars().count(),
+                            intended.chars().count()
+                        ));
+                    }
+                }
+            } else {
+                truncated = None;
             }
             if Instant::now() >= deadline {
                 return Err("The complete target output could not be confirmed".into());

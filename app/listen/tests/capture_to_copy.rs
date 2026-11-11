@@ -5,10 +5,15 @@ use listen::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const TRANSCRIPT: &str = "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀";
 
 struct Runtime(PathBuf);
 impl Runtime {
@@ -389,11 +394,49 @@ fn playback_open_error_never_claims_to_capture_and_preserves_the_device_error() 
     assert_eq!(app.snapshot().phase, Phase::Failure);
 }
 
+/// A test editor is either writable, or it accepts reads but refuses writes the way
+/// a real UIA editor reports its own state. A capacity limit stores only a prefix of
+/// the requested value, and a concurrent edit is applied by the operator just before
+/// the tool's replace call, after the draft was already read.
+#[derive(Clone, Copy)]
+enum Blocked {
+    ReadOnly,
+    Disabled,
+}
+
+impl Blocked {
+    fn error(self) -> &'static str {
+        match self {
+            Blocked::ReadOnly => "The original target is read-only",
+            Blocked::Disabled => "The original target is disabled",
+        }
+    }
+}
+
 struct Editors {
     focused: Option<usize>,
     drafts: [String; 2],
     available: [bool; 2],
+    blocked: [Option<Blocked>; 2],
+    limit: [Option<usize>; 2],
+    concurrent_edit: Option<String>,
     unconfirmed: bool,
+    replace_calls: usize,
+}
+
+impl Editors {
+    fn with_drafts(first: &str, second: &str) -> Self {
+        Self {
+            focused: Some(0),
+            drafts: [first.into(), second.into()],
+            available: [true; 2],
+            blocked: [None; 2],
+            limit: [None; 2],
+            concurrent_edit: None,
+            unconfirmed: false,
+            replace_calls: 0,
+        }
+    }
 }
 
 struct Desktop(Arc<Mutex<Editors>>);
@@ -404,12 +447,20 @@ struct BoundEditor {
 
 impl TargetSelection for Desktop {
     fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
-        Ok(self.0.lock().unwrap().focused.map(|selected| {
-            Box::new(BoundEditor {
-                editors: self.0.clone(),
-                selected,
-            }) as Box<dyn Target>
-        }))
+        let desktop = self.0.lock().unwrap();
+        let Some(selected) = desktop.focused else {
+            return Ok(None);
+        };
+        if !desktop.available[selected] {
+            return Err("The original target was destroyed before binding".into());
+        }
+        if let Some(blocked) = desktop.blocked[selected] {
+            return Err(blocked.error().into());
+        }
+        Ok(Some(Box::new(BoundEditor {
+            editors: self.0.clone(),
+            selected,
+        })))
     }
 }
 
@@ -424,14 +475,26 @@ impl Target for BoundEditor {
 
     fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
         let mut desktop = self.editors.lock().unwrap();
+        desktop.replace_calls += 1;
         if !desktop.available[self.selected] {
             return Err("The original target was destroyed".into());
         }
-        if desktop.drafts[self.selected] != expected {
-            return Err("The draft changed before output".into());
+        if let Some(blocked) = desktop.blocked[self.selected] {
+            return Err(blocked.error().into());
         }
-        desktop.drafts[self.selected] = replacement.into();
-        if desktop.unconfirmed {
+        if let Some(edit) = desktop.concurrent_edit.take() {
+            desktop.drafts[self.selected].push_str(&edit);
+        }
+        if desktop.drafts[self.selected] != expected {
+            return Err(
+                "The target draft changed during output; no replacement was attempted".into(),
+            );
+        }
+        desktop.drafts[self.selected] = match desktop.limit[self.selected] {
+            Some(limit) => replacement.chars().take(limit).collect(),
+            None => replacement.into(),
+        };
+        if desktop.limit[self.selected].is_some() || desktop.unconfirmed {
             return Err("The complete target output could not be confirmed".into());
         }
         Ok(())
@@ -441,12 +504,7 @@ impl Target for BoundEditor {
 #[test]
 fn hotkey_binds_original_editor_and_appends_complete_result_to_its_latest_draft() {
     let runtime = Runtime::new();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: Some(0),
-        drafts: ["原有草稿".into(), "另一个输入框".into()],
-        available: [true; 2],
-        unconfirmed: false,
-    }));
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(LocalModel),
@@ -480,12 +538,7 @@ fn hotkey_binds_original_editor_and_appends_complete_result_to_its_latest_draft(
 #[test]
 fn no_speech_never_appends_empty_lines_or_generated_text_to_a_bound_target() {
     let runtime = Runtime::new();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: Some(0),
-        drafts: ["原有草稿".into(), "另一个输入框".into()],
-        available: [true; 2],
-        unconfirmed: false,
-    }));
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(NoSpeechModel),
@@ -505,12 +558,9 @@ fn no_speech_never_appends_empty_lines_or_generated_text_to_a_bound_target() {
 #[test]
 fn no_target_at_start_keeps_the_complete_fallback_and_does_not_retarget_later_focus() {
     let runtime = Runtime::new();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: None,
-        drafts: ["原有草稿".into(), "后来获得焦点".into()],
-        available: [true; 2],
-        unconfirmed: false,
-    }));
+    let mut editors = Editors::with_drafts("原有草稿", "后来获得焦点");
+    editors.focused = None;
+    let editors = Arc::new(Mutex::new(editors));
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(LocalModel),
@@ -541,12 +591,7 @@ fn no_target_at_start_keeps_the_complete_fallback_and_does_not_retarget_later_fo
 #[test]
 fn destroyed_original_target_keeps_the_full_result_and_never_uses_a_replacement() {
     let runtime = Runtime::new();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: Some(0),
-        drafts: ["原有草稿".into(), "旁边输入框".into()],
-        available: [true; 2],
-        unconfirmed: false,
-    }));
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(LocalModel),
@@ -577,12 +622,8 @@ fn destroyed_original_target_keeps_the_full_result_and_never_uses_a_replacement(
 #[test]
 fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_the_append() {
     let runtime = Runtime::new();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: Some(0),
-        drafts: ["原有草稿".into(), "旁边输入框".into()],
-        available: [true; 2],
-        unconfirmed: true,
-    }));
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().unconfirmed = true;
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(SlowModel),
@@ -624,12 +665,7 @@ fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_
 fn result_storage_failure_keeps_the_complete_text_and_audio_without_writing_the_target() {
     let runtime = Runtime::new();
     fs::create_dir(runtime.0.join("current-result.txt")).unwrap();
-    let editors = Arc::new(Mutex::new(Editors {
-        focused: Some(0),
-        drafts: ["原有草稿".into(), "旁边输入框".into()],
-        available: [true; 2],
-        unconfirmed: false,
-    }));
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
     let mut app = Application::new(
         Arc::new(Playback),
         Arc::new(LocalModel),
@@ -649,6 +685,274 @@ fn result_storage_failure_keeps_the_complete_text_and_audio_without_writing_the_
     assert_eq!(result.retained_audio.len(), 1);
     assert!(result.retained_audio[0].is_file());
     assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
+}
+
+struct NumberedModel(AtomicUsize);
+impl LocalTranscriber for NumberedModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
+        if wav.duration() == 0 {
+            return Err("no playback audio reached the local model".into());
+        }
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(format!(
+            "第 {index} 段完整转写：Rust 和 WASAPI。\nSecond line {index}. 🦀"
+        ))
+    }
+}
+
+#[test]
+fn read_only_target_during_capture_keeps_the_complete_fallback_without_writing_it() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.blocked[0] = Some(Blocked::ReadOnly);
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(result.detail.contains("read-only"), "{result:?}");
+    assert!(result.detail.contains("nothing was written"), "{result:?}");
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    {
+        let desktop = editors.lock().unwrap();
+        assert_eq!(desktop.drafts, ["原有草稿", "旁边输入框"]);
+        assert_eq!(desktop.replace_calls, 1, "a refused write is never retried");
+    }
+
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(
+        app.snapshot().text,
+        TRANSCRIPT,
+        "the fallback stays copyable"
+    );
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
+}
+
+#[test]
+fn disabled_target_at_start_is_reported_without_writing_any_control() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().blocked[0] = Some(Blocked::Disabled);
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(result.detail.contains("disabled"), "{result:?}");
+    assert!(
+        result.detail.contains("No text was written to any control"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "旁边输入框"]);
+    assert_eq!(
+        desktop.replace_calls, 0,
+        "a disabled target is never written"
+    );
+}
+
+#[test]
+fn capacity_limited_target_is_reported_as_truncated_and_keeps_the_complete_fallback() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.limit[0] = Some(30);
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    let intended = format!("原有草稿\n{TRANSCRIPT}");
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        !result.detail.contains("The complete result was appended"),
+        "a truncated write must never be reported as complete success: {result:?}"
+    );
+    assert!(result.detail.contains("truncated"), "{result:?}");
+    assert!(
+        result.detail.contains("not a complete delivery"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains(&format!(
+            "only 30 of {} characters",
+            intended.chars().count()
+        )),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("Check the original target"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("not retried automatically"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        intended.chars().take(30).collect::<String>(),
+        "the target keeps only the truncated prefix it accepted"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+}
+
+#[test]
+fn concurrent_target_edit_during_output_is_reported_unconfirmed_and_never_reverted() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.concurrent_edit = Some("用户同时输入".into());
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("could not be confirmed"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("may be partially written"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("Check the original target"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("not retried automatically"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0], "原有草稿用户同时输入",
+        "the operator's concurrent edit is kept and nothing is rolled back"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+}
+
+#[test]
+fn repeated_stop_held_hotkey_and_processing_controls_deliver_each_result_once() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let model = Arc::new(NumberedModel(AtomicUsize::new(0)));
+    let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    // A held or auto-repeating hotkey turns into several events: only the first can
+    // stop the capture; the rest arrive during local processing.
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    for _ in 0..4 {
+        app.dispatch(Control::Toggle);
+    }
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    assert!(app.snapshot().detail.contains("Still processing"));
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+
+    let first = await_phase(&mut app, Phase::Result);
+    let once = editors.lock().unwrap().drafts[0].clone();
+    assert_eq!(once, format!("原有草稿\n{}", first.text));
+    assert_eq!(once.matches("Rust 和 WASAPI").count(), 1);
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+    assert_eq!(first.delivery, Some(Delivery::Appended));
+
+    // Lost key-up / repeated stop after the result must not append or re-enter.
+    for _ in 0..3 {
+        app.dispatch(Control::Stop);
+    }
+    app.poll();
+    assert!(app.snapshot().detail.contains("Not capturing"));
+    assert_eq!(app.snapshot().phase, Phase::Result);
+    assert_eq!(app.snapshot().text, first.text);
+    assert_eq!(editors.lock().unwrap().drafts[0], once);
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+
+    // A later capture binds the focus at its own start; it never reuses or mixes
+    // the previous target, result, or append.
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let second = await_phase(&mut app, Phase::Result);
+    assert_ne!(second.text, first.text);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts[0], once);
+    assert_eq!(desktop.drafts[1], format!("另一个输入框\n{}", second.text));
+    assert_eq!(desktop.replace_calls, 2);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        second.text
+    );
 }
 
 /// An operator owns and focuses the fixture; the product receives no coordinates,

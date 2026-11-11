@@ -76,7 +76,9 @@ pub trait Target: Send {
     fn content(&mut self) -> AppResult<String>;
     /// Replace only if the latest draft still equals `expected`, and return success
     /// only after reading back the complete replacement. An error may mean output
-    /// happened partially; callers must retain the transcript and never retry it.
+    /// happened partially; callers must retain the transcript and never retry it or
+    /// restore the previous text automatically. Reading the target afterwards for a
+    /// status report is allowed.
     fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()>;
 }
 
@@ -119,6 +121,110 @@ struct Completed {
     delivery: Option<Delivery>,
     detail: String,
     save_error: Option<String>,
+}
+
+/// One delivery attempt's user-visible outcome. A complete append is only reported
+/// after the target contract confirms that the whole replacement was read back.
+fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> (Delivery, String) {
+    let mut target = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return not_delivered(
+                "No supported editable target was selected at capture start".into(),
+            );
+        }
+        Err(error) => return not_delivered(error),
+    };
+    let latest = match target.content() {
+        Ok(latest) => latest,
+        Err(error) => return not_delivered(error),
+    };
+    let replacement = if latest.is_empty() {
+        text.to_string()
+    } else {
+        format!("{latest}\n{text}")
+    };
+    match target.replace(&latest, &replacement) {
+        Ok(()) => (
+            Delivery::Appended,
+            "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
+        ),
+        Err(error) => {
+            // Diagnose the failed write by reading the target again. Reading is not a
+            // retry: the write is never repeated and the previous text is never restored.
+            let observed = target.content();
+            failed_write(&latest, &replacement, &error, observed)
+        }
+    }
+}
+
+/// Nothing was sent to the target because selection, reading, or saving failed first.
+fn not_delivered(reason: String) -> (Delivery, String) {
+    (
+        Delivery::Fallback,
+        format!(
+            "{reason}. No text was written to any control. The complete result is in the fallback text box. Review and copy it to the intended input."
+        ),
+    )
+}
+
+/// Reports what the target actually holds after a failed write, without ever claiming
+/// a complete delivery. The read-back distinguishes a refused write from a truncated
+/// one, a late complete write, and a possibly partial one.
+fn failed_write(
+    previous: &str,
+    intended: &str,
+    error: &str,
+    observed: AppResult<String>,
+) -> (Delivery, String) {
+    let advice = "Check the original target before copying; output is not retried automatically and the original text is not reverted.";
+    let fallback = "The complete result is in the fallback text box.";
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(read_error) => {
+            return (
+                Delivery::Fallback,
+                format!(
+                    "The write to the original target could not be confirmed ({error}); the target could not be read back ({read_error}). {advice} {fallback}"
+                ),
+            );
+        }
+    };
+    // Line endings are not part of the delivered text's meaning.
+    let observed = observed.replace("\r\n", "\n");
+    let previous = previous.replace("\r\n", "\n");
+    let intended = intended.replace("\r\n", "\n");
+    if observed == previous {
+        (
+            Delivery::Fallback,
+            format!(
+                "The original target still holds its previous content, so nothing was written to it ({error}). {fallback} Review and copy it to the intended input."
+            ),
+        )
+    } else if observed == intended {
+        (
+            Delivery::Fallback,
+            format!(
+                "The write to the original target could not be confirmed ({error}), but it now contains the complete appended text. {advice} A copy remains in Listen."
+            ),
+        )
+    } else if !observed.is_empty() && intended.starts_with(&observed) {
+        (
+            Delivery::Fallback,
+            format!(
+                "The original target holds only {} of {} characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. {advice} {fallback}",
+                observed.chars().count(),
+                intended.chars().count()
+            ),
+        )
+    } else {
+        (
+            Delivery::Fallback,
+            format!(
+                "The write to the original target could not be confirmed ({error}); the target content changed and may be partially written. {advice} {fallback}"
+            ),
+        )
+    }
 }
 
 /// The application boundary used by both global hotkey and complete-flow tests.
@@ -253,7 +359,8 @@ impl Application {
                             Err(format!("{recognition}; {capture}"))
                         }
                         (Err(error), _) => Err(error),
-                    }.and_then(|(text, description)| {
+                    }
+                    .and_then(|(text, description)| {
                         // Silence and non-speech leave the previous result and every
                         // target untouched; nothing is saved or appended for them.
                         if text.trim().is_empty() {
@@ -265,35 +372,23 @@ impl Application {
                                 save_error: None,
                             });
                         }
-                        let save_error = fs::write(current_result, &text).err().map(|e| e.to_string());
-                        let mut output_attempted = false;
-                        let output = save_error.as_ref().map_or(Ok(()), |error| {
-                            Err(format!("Could not save the current result: {error}"))
-                        }).and_then(|()| target).and_then(|target| {
-                            let Some(mut target) = target else {
-                                return Err("No supported editable target was selected at capture start".into());
-                            };
-                            let latest = target.content()?;
-                            let replacement = if latest.is_empty() {
-                                text.clone()
-                            } else {
-                                format!("{latest}\n{text}")
-                            };
-                            output_attempted = true;
-                            target.replace(&latest, &replacement)
-                        });
-                        let (delivery, detail) = match output {
-                            Ok(()) => (Delivery::Appended, "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into()),
-                            Err(error) => {
-                                let advice = if output_attempted {
-                                    "Check the original target before copying; output is not retried automatically."
-                                } else {
-                                    "Review and copy it to the intended input."
-                                };
-                                (Delivery::Fallback, format!("{error}. The complete result is in the fallback text box. {advice}"))
+                        let save_error = fs::write(current_result, &text)
+                            .err()
+                            .map(|e| e.to_string());
+                        let (delivery, detail) = match &save_error {
+                            // Saving first means a storage failure never changes a target.
+                            Some(error) => {
+                                not_delivered(format!("Could not save the current result: {error}"))
                             }
+                            None => deliver(target, &text),
                         };
-                        Ok(Completed { text, description, delivery: Some(delivery), detail, save_error })
+                        Ok(Completed {
+                            text,
+                            description,
+                            delivery: Some(delivery),
+                            detail,
+                            save_error,
+                        })
                     });
                     let _ = tx.send(result);
                 });
