@@ -37,6 +37,22 @@ pub trait Recording: Send {
     fn failure(&self) -> Option<String> {
         None
     }
+    /// The render endpoint this recording actually captured. Device-bound
+    /// implementations report the role, identifier and friendly name read from the
+    /// OS; a recording that cannot name its endpoint must return `None` rather than
+    /// letting the application claim a route it has not verified.
+    fn endpoint(&self) -> Option<CaptureEndpoint> {
+        None
+    }
+}
+
+/// The exact render route a capture is bound to. The role is kept as text because
+/// the application never captures a communications endpoint or a microphone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureEndpoint {
+    pub role: String,
+    pub id: String,
+    pub name: String,
 }
 
 pub struct CapturedAudio {
@@ -118,6 +134,19 @@ pub struct Snapshot {
     pub progress: CaptureProgress,
     pub delivery: Option<Delivery>,
     pub retry_available: bool,
+    pub endpoint: Option<CaptureEndpoint>,
+}
+
+/// States which render route the capture is bound to and which routes are outside
+/// its scope. A capture that cannot name its endpoint never claims to cover one.
+fn capture_scope(endpoint: Option<&CaptureEndpoint>) -> String {
+    match endpoint {
+        Some(endpoint) => format!(
+            "Capturing the {} '{}' ({}); no microphone is used. Only this endpoint is captured: audio routed only to the default communication endpoint or to another device is outside this capture. Press the hotkey again to stop.",
+            endpoint.role, endpoint.name, endpoint.id
+        ),
+        None => "Capturing playback audio; the selected render endpoint could not be identified, so this result does not claim to cover a specific endpoint. No microphone is used. Press the hotkey again to stop.".into(),
+    }
 }
 
 struct Completed {
@@ -283,12 +312,13 @@ impl Application {
         Self {
             snapshot: Snapshot {
                 phase: if initial_error.is_some() { Phase::Failure } else { Phase::Ready },
-                detail: initial_error.unwrap_or_else(|| "Ready. Ctrl+Alt+R starts playback capture. Closing the window keeps Listen in the tray.".into()),
+                detail: initial_error.unwrap_or_else(|| "Ready. Ctrl+Alt+R captures only the default multimedia playback endpoint; audio routed only to the default communication endpoint or another device is outside this capture. Closing the window keeps Listen in the tray.".into()),
                 text: fs::read_to_string(runtime.join("current-result.txt")).unwrap_or_default(),
                 retained_audio: Vec::new(),
                 progress: CaptureProgress::default(),
                 delivery: None,
                 retry_available: false,
+                endpoint: None,
             },
             audio,
             transcriber,
@@ -327,6 +357,7 @@ impl Application {
                     .targets
                     .as_ref()
                     .map_or(Ok(None), |targets| targets.focused_target());
+                self.snapshot.endpoint = None;
                 let result = (|| {
                     if let Some(error) = &self.control_error {
                         return Err(format!("Global hotkey unavailable: {error}"));
@@ -343,6 +374,10 @@ impl Application {
                     fs::create_dir(&directory).map_err(|e| e.to_string())?;
                     self.session = Some(directory.clone());
                     self.recording = Some(self.audio.start(&directory)?);
+                    self.snapshot.endpoint = self
+                        .recording
+                        .as_ref()
+                        .and_then(|recording| recording.endpoint());
                     if let Some(stream) = self.recording.as_mut().unwrap().take_segments() {
                         self.progress = Some(stream.progress.clone());
                         self.recognition = Some(RecognitionWorker::start(
@@ -360,8 +395,7 @@ impl Application {
                         self.snapshot.delivery = None;
                         self.snapshot.retained_audio.clear();
                         self.snapshot.retry_available = false;
-                        self.snapshot.detail =
-                            "Capturing playback audio; press the hotkey again to stop.".into();
+                        self.snapshot.detail = capture_scope(self.snapshot.endpoint.as_ref());
                     }
                     Err(error) => {
                         self.bound_target = Ok(None);
@@ -634,7 +668,8 @@ impl Application {
         if self.snapshot.phase == Phase::Capturing && self.recognition.is_some() {
             let p = &self.snapshot.progress;
             self.snapshot.detail = format!(
-                "Capturing playback and recognizing locally; no subtitles. {:.1} s received; {} recognition windows pending, {} completed; {} bytes audio on disk; {} samples audio in memory.{}",
+                "{} {:.1} s received; {} recognition windows pending, {} completed; {} bytes audio on disk; {} samples audio in memory.{}",
+                capture_scope(self.snapshot.endpoint.as_ref()),
                 p.received_samples as f64 / streaming::SAMPLE_RATE as f64,
                 p.pending_segments,
                 p.recognized_segments,
@@ -755,6 +790,7 @@ impl Application {
             }
         }
         self.snapshot.phase = Phase::Failure;
+        let error = error.trim_end_matches('.').to_string();
         self.snapshot.detail = if self.snapshot.retained_audio.is_empty() {
             error
         } else {
@@ -773,7 +809,7 @@ impl Application {
             if let Ok(text) = fs::read_to_string(&path) {
                 if !text.is_empty() {
                     self.snapshot.text = text;
-                    self.snapshot.detail.push_str(&format!(". Incomplete recoverable text is in the fallback box and {}. This is not a completed transcription.", path.display()));
+                    self.snapshot.detail.push_str(&format!(". The capture was interrupted, so this text is incomplete: it is shown in the fallback box and stored at {}. This is not a completed transcription.", path.display()));
                 }
             }
         }

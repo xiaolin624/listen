@@ -3,11 +3,11 @@
 use crate::streaming::{
     CaptureProgress, Progress, SegmentConfig, SegmentStream, SegmentedAudioWriter,
 };
-use crate::{AppResult, CapturedAudio, PlaybackAudio, Recording};
+use crate::{AppResult, CaptureEndpoint, CapturedAudio, PlaybackAudio, Recording};
 use std::{
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -16,18 +16,29 @@ use std::{
 };
 use windows::{
     Win32::{
+        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Media::Audio::{
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
-            IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEXTENSIBLE,
-            eMultimedia, eRender,
+            AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient, IMMDevice,
+            IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEXTENSIBLE, eMultimedia, eRender,
         },
+        System::Com::StructuredStorage::{PropVariantClear, PropVariantToBSTR},
         System::Com::{
             CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-            CoUninitialize,
+            CoUninitialize, STGM_READ,
         },
     },
     core::GUID,
 };
+
+/// The OS role of the single render endpoint this tool captures. The role is
+/// reported to the user verbatim so that a communications endpoint or another
+/// device is never implied to be part of the capture.
+const ENDPOINT_ROLE: &str = "default multimedia render endpoint";
+/// Polling interval for the OS default endpoint. WASAPI raises
+/// `AUDCLNT_E_DEVICE_INVALIDATED` immediately for a removed client, while a route
+/// switch is detected by comparing this identity.
+const ROUTE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct WasapiPlayback;
 struct WasapiRecording {
@@ -35,6 +46,8 @@ struct WasapiRecording {
     worker: Option<JoinHandle<AppResult<CapturedAudio>>>,
     segments: Option<SegmentStream>,
     progress: Arc<Progress>,
+    endpoint: CaptureEndpoint,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaybackAudio for WasapiPlayback {
@@ -43,9 +56,11 @@ impl PlaybackAudio for WasapiPlayback {
         let signal = stop.clone();
         let (writer, segments) = SegmentedAudioWriter::new(directory, SegmentConfig::default())?;
         let progress = segments.progress.clone();
+        let last_error = Arc::new(Mutex::new(None));
+        let capture_error = last_error.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
-            let result = capture(writer, signal, &tx);
+            let result = capture(writer, signal, &tx, capture_error.clone());
             if let Err(error) = &result {
                 let _ = tx.try_send(Err(error.clone()));
             }
@@ -54,15 +69,19 @@ impl PlaybackAudio for WasapiPlayback {
         match rx.recv().map_err(|_| {
             "Playback capture thread stopped during device initialization".to_string()
         })? {
-            Ok(()) => Ok(Box::new(WasapiRecording {
+            Ok(endpoint) => Ok(Box::new(WasapiRecording {
                 stop,
                 worker: Some(worker),
                 segments: Some(segments),
                 progress,
+                endpoint,
+                last_error,
             })),
             Err(error) => {
                 let _ = worker.join();
-                Err(format!("Cannot open the default playback device: {error}"))
+                Err(format!(
+                    "Cannot open the default multimedia render endpoint: {error}"
+                ))
             }
         }
     }
@@ -83,12 +102,24 @@ impl Recording for WasapiRecording {
     }
 
     fn failure(&self) -> Option<String> {
+        if let Some(error) = self.last_error.lock().ok().and_then(|error| error.clone()) {
+            return Some(error);
+        }
         self.progress.failure().or_else(|| {
             self.worker
                 .as_ref()
                 .filter(|worker| worker.is_finished())
-                .map(|_| "Playback capture was interrupted".into())
+                .map(|_| {
+                    format!(
+                        "Playback capture from the {} '{}' ({}) was interrupted; received audio is retained and this capture is incomplete",
+                        self.endpoint.role, self.endpoint.name, self.endpoint.id
+                    )
+                })
         })
+    }
+
+    fn endpoint(&self) -> Option<CaptureEndpoint> {
+        Some(self.endpoint.clone())
     }
 }
 
@@ -143,10 +174,63 @@ impl Resampler {
     }
 }
 
+/// Read the endpoint identity the user is actually routed to. The device id is
+/// required so a default-route switch can be detected; the friendly name is best
+/// effort and never blocks capture by itself.
+fn endpoint_identity(device: &IMMDevice) -> AppResult<CaptureEndpoint> {
+    unsafe {
+        let id_ptr = device.GetId().map_err(|e| e.to_string())?;
+        let id = id_ptr.to_string().map_err(|e| e.to_string());
+        CoTaskMemFree(Some(id_ptr.0.cast()));
+        let id = id?;
+        let name = (|| -> Option<String> {
+            let store = device.OpenPropertyStore(STGM_READ).ok()?;
+            let mut value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
+            let name = PropVariantToBSTR(&value).ok().map(|name| name.to_string());
+            let _ = PropVariantClear(&mut value);
+            name
+        })()
+        .unwrap_or_else(|| "unknown endpoint name".into());
+        Ok(CaptureEndpoint {
+            role: ENDPOINT_ROLE.into(),
+            id,
+            name,
+        })
+    }
+}
+
+/// Turns a WASAPI/COM failure into the exact interruption the user sees. A removed
+/// endpoint is named; the message never claims that the partial capture is complete.
+fn capture_error(
+    endpoint: &CaptureEndpoint,
+    operation: &str,
+    error: &windows::core::Error,
+) -> String {
+    let reason = if error.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+        "was removed or became invalid (AUDCLNT_E_DEVICE_INVALIDATED)".to_string()
+    } else if error.code() == AUDCLNT_E_SERVICE_NOT_RUNNING {
+        "lost the Windows audio service (AUDCLNT_E_SERVICE_NOT_RUNNING)".to_string()
+    } else {
+        format!("could not be read while {operation} ({error})")
+    };
+    format!(
+        "The playback endpoint '{}' ({}) {reason}. Capture stopped; received audio is retained and this capture is incomplete.",
+        endpoint.name, endpoint.id
+    )
+}
+
+fn route_changed_message(previous: &CaptureEndpoint, current: &CaptureEndpoint) -> String {
+    format!(
+        "The default multimedia render endpoint changed during capture from '{}' ({}) to '{}' ({}). Capture stopped before audio from the new endpoint was mixed in; received audio is retained and this capture is incomplete.",
+        previous.name, previous.id, current.name, current.id
+    )
+}
+
 fn capture(
     mut writer: SegmentedAudioWriter,
     stop: Arc<AtomicBool>,
-    started: &mpsc::SyncSender<AppResult<()>>,
+    started: &mpsc::SyncSender<AppResult<CaptureEndpoint>>,
+    last_error: Arc<Mutex<Option<String>>>,
 ) -> AppResult<CapturedAudio> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
@@ -157,11 +241,8 @@ fn capture(
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
         let device = enumerator
             .GetDefaultAudioEndpoint(eRender, eMultimedia)
-            .map_err(|e| e.to_string())?;
-        let id_ptr = device.GetId().map_err(|e| e.to_string())?;
-        let endpoint = id_ptr.to_string().map_err(|e| e.to_string());
-        CoTaskMemFree(Some(id_ptr.0.cast()));
-        let endpoint = endpoint?;
+            .map_err(|e| format!("Cannot select the {ENDPOINT_ROLE}: {e}"))?;
+        let endpoint = endpoint_identity(&device)?;
         let client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .map_err(|e| e.to_string())?;
@@ -207,13 +288,16 @@ fn capture(
         let mut discontinuities = 0u64;
         let mut peak = 0f32;
         let mut flushed = Instant::now();
-        client.Start().map_err(|e| e.to_string())?;
-        let _ = started.send(Ok(()));
+        let mut route_checked = Instant::now();
+        client
+            .Start()
+            .map_err(|e| capture_error(&endpoint, "starting playback capture", &e))?;
+        let _ = started.send(Ok(endpoint.clone()));
         let result = (|| -> AppResult<()> {
             loop {
                 while reader
                     .GetNextPacketSize()
-                    .map_err(|e| format!("Playback device interrupted: {e}"))?
+                    .map_err(|e| capture_error(&endpoint, "reading packet size", &e))?
                     > 0
                 {
                     let mut data = std::ptr::null_mut();
@@ -221,7 +305,7 @@ fn capture(
                     let mut flags = 0;
                     reader
                         .GetBuffer(&mut data, &mut count, &mut flags, None, None)
-                        .map_err(|e| format!("Cannot read playback audio: {e}"))?;
+                        .map_err(|e| capture_error(&endpoint, "reading playback audio", &e))?;
                     if flags & 1 != 0 {
                         discontinuities += 1;
                     }
@@ -267,7 +351,9 @@ fn capture(
                         }
                         Ok(())
                     })();
-                    let released = reader.ReleaseBuffer(count).map_err(|e| e.to_string());
+                    let released = reader
+                        .ReleaseBuffer(count)
+                        .map_err(|e| capture_error(&endpoint, "releasing playback audio", &e));
                     packet_result?;
                     released?;
                 }
@@ -278,14 +364,43 @@ fn capture(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                // A default-route switch leaves the old client alive in WASAPI, so
+                // packet errors alone would keep reporting the old endpoint as if it
+                // were still the user's route. Compare the OS default identity.
+                if route_checked.elapsed() >= ROUTE_CHECK_INTERVAL {
+                    route_checked = Instant::now();
+                    let current = enumerator
+                        .GetDefaultAudioEndpoint(eRender, eMultimedia)
+                        .map_err(|error| {
+                            format!(
+                                "The default multimedia render endpoint '{}' ({}) could not be confirmed during capture ({error}); the route may have been removed or changed. Capture stopped; received audio is retained and this capture is incomplete.",
+                                endpoint.name, endpoint.id
+                            )
+                        })?;
+                    let current = endpoint_identity(&current).map_err(|error| {
+                        format!(
+                            "The default multimedia render endpoint changed during capture but the new endpoint could not be identified ({error}); capture stopped; received audio is retained and this capture is incomplete."
+                        )
+                    })?;
+                    if current.id != endpoint.id {
+                        return Err(route_changed_message(&endpoint, &current));
+                    }
+                }
                 thread::sleep(Duration::from_millis(5));
             }
             Ok(())
         })();
-        let stopped = client.Stop().map_err(|e| e.to_string());
+        if let Err(error) = &result {
+            if let Ok(mut last) = last_error.lock() {
+                *last = Some(error.clone());
+            }
+        }
+        let stopped = client
+            .Stop()
+            .map_err(|e| capture_error(&endpoint, "stopping playback capture", &e));
         let finalized = writer.finish(format!(
-                "default-render/multimedia {endpoint}; {:.3} s, {rate} Hz/{channels} ch/{bits} bit; peak={peak:.5}; discontinuities={discontinuities}",
-                frames as f64 / rate as f64
+                "default multimedia render endpoint '{}' ({}); audio routed only to the default communication endpoint is not included; {:.3} s, {rate} Hz/{channels} ch/{bits} bit; peak={peak:.5}; discontinuities={discontinuities}",
+                endpoint.name, endpoint.id, frames as f64 / rate as f64
             ));
         result?;
         stopped?;

@@ -163,7 +163,7 @@ pub fn run(config: Config) -> Result<(), String> {
             };
         let explanation = child(
             w!("STATIC"),
-            "Ctrl+Alt+R 开始 / 停止  ·  直接采集默认播放设备的全部声音  ·  本地识别",
+            "Ctrl+Alt+R 开始 / 停止  ·  仅采集默认多媒体播放设备（不含默认通信设备）  ·  本地识别",
             WINDOW_STYLE::default(),
             110,
         )?;
@@ -427,9 +427,24 @@ impl Ui {
                 !state.text.is_empty(),
             );
             let status = format!(
-                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.role.as_str())
+                    .unwrap_or(""),
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.id.as_str())
+                    .unwrap_or(""),
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.name.as_str())
+                    .unwrap_or(""),
                 self.runtime.join("current-result.txt").display(),
                 state
                     .retained_audio
@@ -464,7 +479,7 @@ impl Ui {
                         &mut icon.szInfo,
                         match state.phase {
                             Phase::Capturing => {
-                                "Capturing the default playback device. Ctrl+Alt+R stops."
+                                "Capturing the default multimedia playback endpoint. Ctrl+Alt+R stops."
                             }
                             Phase::Processing => {
                                 "Recognizing locally. Wait for the current result."
