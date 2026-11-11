@@ -553,3 +553,78 @@ fn result_storage_failure_keeps_the_complete_text_and_audio_without_writing_the_
     assert!(result.retained_audio[0].is_file());
     assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
 }
+
+/// An operator owns and focuses the fixture; the product receives no coordinates,
+/// HWND, DOM selector, application name, or alternate output adapter.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an operator-owned focused editor and LISTEN_EDITOR_HANDSHAKE"]
+fn selected_generic_editor_receives_complete_output_through_the_real_target_adapter() {
+    let handshake = PathBuf::from(
+        std::env::var_os("LISTEN_EDITOR_HANDSHAKE")
+            .expect("set LISTEN_EDITOR_HANDSHAKE to a fresh operator-owned directory"),
+    );
+    fs::create_dir_all(&handshake).unwrap();
+    let runtime = Runtime::new();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(listen::target::NativeTargets));
+    fs::write(
+        handshake.join("ready"),
+        "Focus the owned editor, then create focused.",
+    )
+    .unwrap();
+    wait_for_operator(&handshake.join("focused"));
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    fs::write(
+        handshake.join("capturing"),
+        "Edit the draft, switch focus, then create stop.",
+    )
+    .unwrap();
+    wait_for_operator(&handshake.join("stop"));
+    app.dispatch(Control::Stop);
+    let result = await_phase(&mut app, Phase::Result);
+    fs::write(handshake.join("detail.txt"), &result.detail).unwrap();
+    fs::write(handshake.join("transcript.txt"), &result.text).unwrap();
+    fs::write(
+        handshake.join("delivery.txt"),
+        format!("{:?}", result.delivery),
+    )
+    .unwrap();
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    let expected = match std::env::var("LISTEN_EDITOR_EXPECT_FALLBACK").as_deref() {
+        Ok("1") => Delivery::Fallback,
+        _ => Delivery::Appended,
+    };
+    assert_eq!(result.delivery, Some(expected), "{}", result.detail);
+    assert!(result.retained_audio.is_empty());
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(app.snapshot().text, result.text);
+    fs::write(
+        handshake.join("finished"),
+        "Check the owned editor and send counters.",
+    )
+    .unwrap();
+}
+
+#[cfg(windows)]
+fn wait_for_operator(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "operator marker missing: {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}

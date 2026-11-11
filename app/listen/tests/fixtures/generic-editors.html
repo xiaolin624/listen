@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Listen owned editor verification</title>
+<style>
+  body { max-width: 960px; margin: 24px auto; font: 18px/1.5 system-ui; color: #17202a; }
+  textarea, [contenteditable] { box-sizing: border-box; width: 100%; min-height: 150px; margin: 6px 0 18px; padding: 12px; border: 2px solid #526579; font: inherit; white-space: pre-wrap; }
+  button { padding: 8px 16px; margin-right: 12px; }
+  output { display: block; white-space: pre-wrap; border: 1px solid #ccc; padding: 12px; }
+</style>
+<h1>Listen editor fixture</h1>
+<p>Task-owned test drafts only. All submits and Enter keys are counted locally; no network request is sent.</p>
+<form id="form">
+  <label for="plain">普通多行编辑框</label>
+  <textarea id="plain" aria-label="Listen plain target">网页原有草稿：Rust 123。
+第二行 draft。</textarea>
+  <label id="rich-label">网页富文本编辑区</label>
+  <div id="rich" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="rich-label"><b>富文本原有草稿：Rust 123。</b><div>第二行 draft。</div></div>
+  <label for="other">非目标输入框</label>
+  <textarea id="other" aria-label="Listen non-target">旁边输入框必须保持不变。</textarea>
+  <button id="send" type="submit">Send (local counter only)</button>
+  <button id="rebuild" type="button">Rebuild selected target</button>
+  <button id="readonly" type="button">Make selected target read-only</button>
+</form>
+<p id="counts" role="status">Enter: 0 · Submit: 0</p>
+<output id="evidence" aria-label="Fixture evidence"></output>
+<script>
+  const selected = new URLSearchParams(location.search).get('target') || 'plain';
+  const state = { enter: 0, submit: 0, input: 0, selected };
+  function text(id) {
+    const element = document.getElementById(id);
+    return element instanceof HTMLTextAreaElement ? element.value : element.innerText;
+  }
+  function snapshot() {
+    return { ...state, active: document.activeElement.id,
+      plain: text('plain'), rich: text('rich'), other: text('other') };
+  }
+  function render() {
+    document.getElementById('counts').textContent = `Enter: ${state.enter} · Submit: ${state.submit}`;
+    document.getElementById('evidence').textContent = JSON.stringify(snapshot(), null, 2);
+  }
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Enter') state.enter++;
+    render();
+  }, true);
+  document.addEventListener('input', () => { state.input++; render(); }, true);
+  document.addEventListener('focusin', render);
+  document.getElementById('form').addEventListener('submit', event => {
+    event.preventDefault(); state.submit++; render();
+  });
+  document.getElementById('rebuild').addEventListener('click', () => {
+    const original = document.getElementById(selected);
+    const replacement = original.cloneNode(true);
+    if (replacement instanceof HTMLTextAreaElement) replacement.value = '重建的相似输入框';
+    else replacement.textContent = '重建的相似输入框';
+    original.replaceWith(replacement); replacement.focus(); render();
+  });
+  document.getElementById('readonly').addEventListener('click', () => {
+    const target = document.getElementById(selected);
+    if (target instanceof HTMLTextAreaElement) target.readOnly = true;
+    else { target.contentEditable = 'false'; target.setAttribute('aria-readonly', 'true'); }
+    render();
+  });
+  window.listenFixture = { snapshot, selected, render };
+  render();
+</script>
+</html>
