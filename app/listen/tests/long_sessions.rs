@@ -442,6 +442,80 @@ impl LocalTranscriber for SpeechThenSilence {
     }
 }
 
+/// Fails the first windowed recognition, then recognizes the whole rejoined capture
+/// in one call. The retry must see every captured sample exactly once.
+struct GatedRetryModel {
+    release: Arc<AtomicBool>,
+    durations: Mutex<Vec<usize>>,
+}
+impl LocalTranscriber for GatedRetryModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, audio: &CapturedAudio, _: &Path) -> AppResult<String> {
+        let duration = hound::WavReader::open(&audio.path)
+            .map_err(|e| e.to_string())?
+            .duration() as usize;
+        self.durations.lock().unwrap().push(duration);
+        Ok(format!("合并音频 {duration} 个样本"))
+    }
+    fn transcribe_segment(&self, _: &CapturedAudio, _: &Path) -> AppResult<Vec<TimedText>> {
+        // Let capture store every sample before reporting the backend failure, so
+        // the retry source is deterministic rather than timing-dependent.
+        while !self.release.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err("Local whisper.cpp recognition failed (exit code: 2)".into())
+    }
+}
+
+#[test]
+fn streaming_failure_retries_the_whole_retained_capture_without_repeating_the_overlap() {
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let release = Arc::new(AtomicBool::new(false));
+    let model = Arc::new(GatedRetryModel {
+        release: release.clone(),
+        durations: Mutex::new(Vec::new()),
+    });
+    let mut app = Application::new(
+        Arc::new(Playback {
+            input: Mutex::new(Some(rx)),
+            config: config(),
+        }),
+        model.clone(),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Start);
+    let mut samples = vec![1000; 1600];
+    samples.extend(vec![4000; 400]);
+    tx.send(samples).unwrap();
+    wait(&mut app, |s| s.progress.received_samples == 2000);
+    release.store(true, Ordering::Release);
+    let failure = wait(&mut app, |s| s.phase == Phase::Failure);
+    assert!(failure.detail.contains("recognition failed"), "{failure:?}");
+    assert!(failure.retry_available, "{failure:?}");
+    assert!(!failure.retained_audio.is_empty());
+
+    app.dispatch(Control::Retry);
+    let result = wait(&mut app, |s| s.phase == Phase::Result);
+    assert_eq!(result.text, "合并音频 2000 个样本");
+    assert_eq!(
+        *model.durations.lock().unwrap(),
+        [2000],
+        "the retry must rejoin both retained windows and drop their shared overlap"
+    );
+    assert!(!result.retry_available);
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        fs::read_dir(&runtime.0)
+            .unwrap()
+            .all(|entry| !entry.unwrap().path().is_dir()),
+        "a successful streaming retry must clean its temporary audio"
+    );
+}
+
 #[test]
 fn silence_in_a_later_window_does_not_erase_the_already_recognized_trailing_word() {
     let runtime = Runtime::new();

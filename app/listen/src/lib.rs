@@ -99,6 +99,8 @@ pub enum Control {
     Start,
     Stop,
     Toggle,
+    Retry,
+    CleanupAudio,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +117,7 @@ pub struct Snapshot {
     pub retained_audio: Vec<PathBuf>,
     pub progress: CaptureProgress,
     pub delivery: Option<Delivery>,
+    pub retry_available: bool,
 }
 
 struct Completed {
@@ -123,6 +126,25 @@ struct Completed {
     delivery: Option<Delivery>,
     detail: String,
     save_error: Option<String>,
+    directory: PathBuf,
+}
+
+/// Audio from a failed recognition attempt, kept on disk so the user can retry
+/// without replaying the speech. The target is the one bound at capture start;
+/// retrying never selects the focus that happens to be active later.
+struct RetainedCapture {
+    audio: CapturedAudio,
+    directory: PathBuf,
+    target: AppResult<Option<Box<dyn Target>>>,
+}
+
+enum Completion {
+    Finished(Completed),
+    Failed {
+        error: String,
+        directory: PathBuf,
+        retry: Option<RetainedCapture>,
+    },
 }
 
 /// One delivery attempt's user-visible outcome. A complete append is only reported
@@ -239,7 +261,8 @@ pub struct Application {
     recognition: Option<RecognitionWorker>,
     progress: Option<Arc<streaming::Progress>>,
     session: Option<PathBuf>,
-    completion: Option<mpsc::Receiver<AppResult<Completed>>>,
+    completion: Option<mpsc::Receiver<Completion>>,
+    retry: Option<RetainedCapture>,
     control_error: Option<String>,
     targets: Option<Arc<dyn TargetSelection>>,
     bound_target: AppResult<Option<Box<dyn Target>>>,
@@ -265,6 +288,7 @@ impl Application {
                 retained_audio: Vec::new(),
                 progress: CaptureProgress::default(),
                 delivery: None,
+                retry_available: false,
             },
             audio,
             transcriber,
@@ -274,6 +298,7 @@ impl Application {
             progress: None,
             session: None,
             completion: None,
+            retry: None,
             control_error,
             targets: None,
             bound_target: Ok(None),
@@ -293,6 +318,10 @@ impl Application {
         };
         match control {
             Control::Start if self.recording.is_none() && self.completion.is_none() => {
+                if self.retry.is_some() {
+                    self.snapshot.detail = "A failed capture's audio is retained for local retry. Retry local recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
+                    return;
+                }
                 // Capture the actual selection before readiness checks or any UI feedback.
                 self.bound_target = self
                     .targets
@@ -329,20 +358,25 @@ impl Application {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Capturing;
                         self.snapshot.delivery = None;
+                        self.snapshot.retained_audio.clear();
+                        self.snapshot.retry_available = false;
                         self.snapshot.detail =
                             "Capturing playback audio; press the hotkey again to stop.".into();
                     }
                     Err(error) => {
                         self.bound_target = Ok(None);
-                        self.fail(error);
+                        let directory = self.session.take();
+                        self.fail(directory.as_deref(), error);
                     }
                 }
             }
             Control::Stop if self.recording.is_some() => {
                 let recording = self.recording.take().unwrap();
-                let directory = self.session.clone().unwrap();
+                let directory = self.session.take().unwrap();
                 let transcriber = self.transcriber.clone();
                 let recognition = self.recognition.take();
+                let streaming = recognition.is_some();
+                let progress = self.progress.clone();
                 let target = std::mem::replace(&mut self.bound_target, Ok(None));
                 let current_result = self.runtime.join("current-result.txt");
                 let (tx, rx) = mpsc::channel();
@@ -352,48 +386,110 @@ impl Application {
                 thread::spawn(move || {
                     let captured = recording.finish();
                     let recognized = recognition.map(|worker| worker.finish());
-                    let result = match (captured, recognized) {
-                        (Ok(audio), Some(result)) => result.map(|text| (text, audio.description)),
-                        (Ok(audio), None) => transcriber
-                            .transcribe(&audio, &directory)
-                            .map(|text| (text, audio.description)),
-                        (Err(capture), Some(Err(recognition))) => {
-                            Err(format!("{recognition}; {capture}"))
+                    let audio = match captured {
+                        Ok(audio) => audio,
+                        Err(capture_error) => {
+                            let error = match &recognized {
+                                Some(Err(recognition_error)) => {
+                                    format!("{recognition_error}; {capture_error}")
+                                }
+                                _ => capture_error,
+                            };
+                            let _ = tx.send(Completion::Failed {
+                                error,
+                                directory,
+                                retry: None,
+                            });
+                            return;
                         }
-                        (Err(error), _) => Err(error),
-                    }
-                    .and_then(|(text, description)| {
+                    };
+                    let recognized = match recognized {
+                        Some(result) => result,
+                        None => transcriber.transcribe(&audio, &directory),
+                    };
+                    let completion = match recognized {
+                        // Only an unfragmented capture can be retried as a whole. A
+                        // streamed session that has already consumed windows no longer
+                        // has their audio on disk, so its checkpoint stays a partial
+                        // result instead of pretending the remaining windows are whole.
+                        Err(error) => {
+                            let retained = if audio.path.is_file() {
+                                Some(CapturedAudio {
+                                    path: audio.path.clone(),
+                                    description: audio.description.clone(),
+                                })
+                            } else if streaming
+                                && progress.as_ref().is_some_and(|progress| {
+                                    progress.snapshot().recognized_segments == 0
+                                })
+                            {
+                                streaming::retained_audio_path(&directory).ok().map(|path| {
+                                    CapturedAudio {
+                                        path,
+                                        description: audio.description.clone(),
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+                            let retry = retained.map(|audio| RetainedCapture {
+                                audio,
+                                directory: directory.clone(),
+                                target,
+                            });
+                            Completion::Failed {
+                                error,
+                                directory,
+                                retry,
+                            }
+                        }
                         // Silence and non-speech leave the previous result and every
                         // target untouched; nothing is saved or appended for them.
-                        if text.trim().is_empty() {
-                            return Ok(Completed {
-                                text,
-                                description,
-                                delivery: None,
-                                detail: String::new(),
-                                save_error: None,
-                            });
-                        }
-                        let save_error = fs::write(current_result, &text)
-                            .err()
-                            .map(|e| e.to_string());
-                        let (delivery, detail) = match &save_error {
-                            // Saving first means a storage failure never changes a target.
-                            Some(error) => {
-                                not_delivered(format!("Could not save the current result: {error}"))
-                            }
-                            None => deliver(target, &text),
-                        };
-                        Ok(Completed {
+                        Ok(text) if text.trim().is_empty() => Completion::Finished(Completed {
                             text,
-                            description,
-                            delivery: Some(delivery),
-                            detail,
-                            save_error,
-                        })
-                    });
-                    let _ = tx.send(result);
+                            description: audio.description,
+                            delivery: None,
+                            detail: String::new(),
+                            save_error: None,
+                            directory,
+                        }),
+                        Ok(text) => {
+                            let save_error = fs::write(&current_result, &text)
+                                .err()
+                                .map(|e| e.to_string());
+                            let (delivery, detail) = match &save_error {
+                                // Saving first means a storage failure never changes a target.
+                                Some(error) => not_delivered(format!(
+                                    "Could not save the current result: {error}"
+                                )),
+                                None => deliver(target, &text),
+                            };
+                            Completion::Finished(Completed {
+                                text,
+                                description: audio.description,
+                                delivery: Some(delivery),
+                                detail,
+                                save_error,
+                                directory,
+                            })
+                        }
+                    };
+                    let _ = tx.send(completion);
                 });
+            }
+            Control::Retry => {
+                if self.recording.is_some() || self.completion.is_some() {
+                    self.snapshot.detail = "Still processing the current playback locally; wait for the result before retrying.".into();
+                    return;
+                }
+                self.retry_local_recognition();
+            }
+            Control::CleanupAudio => {
+                if self.recording.is_some() || self.completion.is_some() {
+                    self.snapshot.detail = "Still processing the current playback locally; wait for the result before cleaning failed audio.".into();
+                    return;
+                }
+                self.cleanup_failed_audio();
             }
             _ if self.completion.is_some() => {
                 self.snapshot.detail = "Still processing the current playback locally; wait for the result before starting again.".into();
@@ -410,6 +506,119 @@ impl Application {
                         self.snapshot.detail
                     );
                 }
+            }
+        }
+    }
+
+    /// Re-run local recognition over the exact audio kept from a failed attempt.
+    /// This never starts capture, never re-selects a target, and never uses a
+    /// remote service: the only recognizer is the configured local transcriber.
+    fn retry_local_recognition(&mut self) {
+        let Some(retry) = self.retry.take() else {
+            self.snapshot.retry_available = false;
+            self.snapshot.detail = "No retained audio is available for a local retry, so nothing was recognized and no result was delivered. The current result is unchanged.".into();
+            return;
+        };
+        if !retry.audio.path.is_file() {
+            self.snapshot.retry_available = false;
+            self.snapshot.retained_audio.clear();
+            let _ = fs::remove_dir_all(&retry.directory);
+            self.snapshot.detail = "The audio retained from the failed capture is no longer on disk, so it was not retried. The current result is unchanged.".into();
+            return;
+        }
+        let RetainedCapture {
+            audio,
+            directory,
+            target,
+        } = retry;
+        let transcriber = self.transcriber.clone();
+        let current_result = self.runtime.join("current-result.txt");
+        let (tx, rx) = mpsc::channel();
+        self.completion = Some(rx);
+        self.snapshot.phase = Phase::Processing;
+        self.snapshot.delivery = None;
+        self.snapshot.retry_available = false;
+        self.snapshot.detail =
+            "Retrying recognition locally on the retained audio; no replay is needed and no messages are sent.".into();
+        thread::spawn(move || {
+            let recognized = transcriber
+                .check_ready()
+                .and_then(|()| transcriber.transcribe(&audio, &directory));
+            let completion = match recognized {
+                // Still failing: the same audio stays retryable after another local
+                // repair. Nothing has been written to any target.
+                Err(error) => {
+                    let retry = RetainedCapture {
+                        audio,
+                        directory: directory.clone(),
+                        target,
+                    };
+                    Completion::Failed {
+                        error: format!("Local retry failed: {error}"),
+                        directory,
+                        retry: Some(retry),
+                    }
+                }
+                Ok(text) if text.trim().is_empty() => Completion::Finished(Completed {
+                    text,
+                    description: audio.description,
+                    delivery: None,
+                    detail: String::new(),
+                    save_error: None,
+                    directory,
+                }),
+                Ok(text) => match fs::write(&current_result, &text) {
+                    Ok(()) => {
+                        let (delivery, detail) = deliver(target, &text);
+                        Completion::Finished(Completed {
+                            text,
+                            description: audio.description,
+                            delivery: Some(delivery),
+                            detail,
+                            save_error: None,
+                            directory,
+                        })
+                    }
+                    Err(error) => {
+                        let retry = RetainedCapture {
+                            audio,
+                            directory: directory.clone(),
+                            target,
+                        };
+                        Completion::Failed {
+                            error: format!("Could not save the current result: {error}"),
+                            directory,
+                            retry: Some(retry),
+                        }
+                    }
+                },
+            };
+            let _ = tx.send(completion);
+        });
+    }
+
+    /// Delete the audio kept from a failed recognition at the user's explicit
+    /// request. A later retry must not act as if a capture were still available.
+    fn cleanup_failed_audio(&mut self) {
+        let Some(retry) = self.retry.take() else {
+            self.snapshot.retry_available = false;
+            self.snapshot.detail =
+                "There is no failed capture audio to clean. The current result is unchanged."
+                    .into();
+            return;
+        };
+        match fs::remove_dir_all(&retry.directory) {
+            Ok(()) => {
+                self.snapshot.retained_audio.clear();
+                self.snapshot.retry_available = false;
+                self.snapshot.detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+            }
+            Err(error) => {
+                self.retry = Some(retry);
+                self.snapshot.retry_available = true;
+                self.snapshot.detail = format!(
+                    "The temporarily retained audio could not be deleted ({error}), so it is still available for a local retry."
+                );
             }
         }
     }
@@ -454,19 +663,23 @@ impl Application {
         let Some(rx) = &self.completion else {
             return;
         };
-        let result = match rx.try_recv() {
-            Ok(result) => result,
+        let completion = match rx.try_recv() {
+            Ok(completion) => completion,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                Err("Local processing worker stopped unexpectedly".into())
+                self.completion = None;
+                self.fail(None, "Local processing worker stopped unexpectedly".into());
+                return;
             }
         };
         self.completion = None;
-        match result {
-            Ok(completed) if completed.text.trim().is_empty() => {
+        match completion {
+            Completion::Finished(completed) if completed.text.trim().is_empty() => {
                 // A completed no-speech session is not a new transcript. In particular,
                 // leave the previous copyable result and its on-disk copy untouched.
-                match fs::remove_dir_all(self.session.as_ref().unwrap()) {
+                self.snapshot.retained_audio.clear();
+                self.snapshot.retry_available = false;
+                match fs::remove_dir_all(&completed.directory) {
                     Ok(()) => {
                         self.snapshot.phase = Phase::NoSpeech;
                         self.snapshot.delivery = None;
@@ -474,41 +687,60 @@ impl Application {
                             "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {}", completed.description
                         );
                     }
-                    Err(error) => self.fail(format!(
-                        "No valid speech detected, but temporary audio could not be cleaned: {error}"
-                    )),
+                    Err(error) => self.fail(
+                        Some(&completed.directory),
+                        format!(
+                            "No valid speech detected, but temporary audio could not be cleaned: {error}"
+                        ),
+                    ),
                 }
             }
-            Ok(completed) => {
-                let result = completed.save_error.map_or_else(
-                    || {
-                        fs::remove_dir_all(self.session.as_ref().unwrap())
-                            .map_err(|e| e.to_string())
-                    },
-                    Err,
-                );
+            Completion::Finished(completed) => {
+                let cleanup = if let Some(error) = &completed.save_error {
+                    // A storage failure keeps the audio recoverable, as before.
+                    Err(error.clone())
+                } else {
+                    fs::remove_dir_all(&completed.directory).map_err(|e| e.to_string())
+                };
                 self.snapshot.text = completed.text;
                 self.snapshot.delivery = completed.delivery;
-                match result {
+                self.snapshot.retained_audio.clear();
+                self.snapshot.retry_available = false;
+                match cleanup {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Result;
                         self.snapshot.detail =
                             format!("{}\nPlayback: {}", completed.detail, completed.description);
                     }
-                    Err(error) => self.fail(format!(
-                        "Could not save the current result or clean temporary audio: {error}"
-                    )),
+                    Err(error) => self.fail(
+                        Some(&completed.directory),
+                        format!(
+                            "Could not save the current result or clean temporary audio: {error}"
+                        ),
+                    ),
                 }
             }
-            Err(error) => self.fail(error),
+            Completion::Failed {
+                error,
+                directory,
+                retry,
+            } => {
+                let retryable = retry.is_some();
+                self.retry = retry;
+                self.snapshot.retry_available = retryable;
+                self.fail(Some(&directory), error);
+                if retryable {
+                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the fallback text box is used if it is no longer valid.");
+                }
+            }
         }
     }
 
-    fn fail(&mut self, error: String) {
-        if let Some(directory) = &self.session {
-            let mut pending = vec![directory.clone()];
+    fn fail(&mut self, directory: Option<&Path>, error: String) {
+        if let Some(directory) = directory {
+            let mut pending = vec![directory.to_path_buf()];
             while let Some(directory) = pending.pop() {
-                if let Ok(entries) = fs::read_dir(directory) {
+                if let Ok(entries) = fs::read_dir(&directory) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
@@ -536,11 +768,8 @@ impl Application {
                     .join(", ")
             )
         };
-        if let Some(path) = self
-            .session
-            .as_ref()
-            .map(|directory| directory.join("partial-result.txt"))
-        {
+        if let Some(directory) = directory {
+            let path = directory.join("partial-result.txt");
             if let Ok(text) = fs::read_to_string(&path) {
                 if !text.is_empty() {
                     self.snapshot.text = text;

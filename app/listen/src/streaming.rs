@@ -109,6 +109,17 @@ impl SegmentedAudioWriter {
         {
             return Err("Invalid bounded playback window configuration".into());
         }
+        // Retry after a failed first recognition needs to know how much audio the
+        // adjacent windows share, so the whole capture can be rejoined without
+        // repeating the overlap. This is capture metadata, not a user-visible name.
+        fs::write(
+            directory.join("capture-manifest.txt"),
+            format!(
+                "window_samples={}\noverlap_samples={}\n",
+                config.window_samples, config.overlap_samples
+            ),
+        )
+        .map_err(|e| format!("Cannot write temporary capture metadata: {e}"))?;
         let (sender, receiver) = mpsc::sync_channel(config.max_pending_segments);
         let progress = Arc::new(Progress::default());
         let writer = Self {
@@ -195,7 +206,7 @@ impl SegmentedAudioWriter {
                     .store(self.overlap.len(), Ordering::Relaxed);
             }
             if self.samples == self.config.window_samples {
-                self.emit(false)?;
+                self.emit(false, false)?;
             }
             Ok(())
         })();
@@ -214,7 +225,7 @@ impl SegmentedAudioWriter {
         Ok(())
     }
 
-    fn emit(&mut self, final_segment: bool) -> AppResult<()> {
+    fn emit(&mut self, final_segment: bool, tolerate_disconnected: bool) -> AppResult<()> {
         self.writer
             .take()
             .unwrap()
@@ -239,6 +250,7 @@ impl SegmentedAudioWriter {
             Err(mpsc::TrySendError::Full(_)) => {
                 return Err("Recognition backlog exhausted the bounded playback spool; capture interrupted, received audio and checkpoint retained".into());
             }
+            Err(mpsc::TrySendError::Disconnected(_)) if tolerate_disconnected => {}
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 return Err(
                     "Local recognition stopped; capture interrupted, received audio retained"
@@ -256,13 +268,106 @@ impl SegmentedAudioWriter {
 
     pub fn finish(mut self, description: String) -> AppResult<CapturedAudio> {
         if self.fresh_samples > 0 {
-            self.emit(true)?;
+            // The last window is finalized on disk before it is queued. If the
+            // recognition worker already stopped, the audio is still complete and
+            // its own failure is reported separately; hand-off alone is not a
+            // capture failure.
+            self.emit(true, true)?;
         }
         Ok(CapturedAudio {
             path: self.directory.clone(),
             description,
         })
     }
+}
+
+/// One WAV file holding the whole capture that a failed first recognition attempt
+/// left on disk. A single retained window is already whole; several windows are
+/// rejoined with their shared overlap removed, so a whole-file retry never repeats
+/// words at a window boundary.
+pub fn retained_audio_path(directory: &Path) -> AppResult<PathBuf> {
+    let mut segments = Vec::new();
+    let entries =
+        fs::read_dir(directory).map_err(|e| format!("Cannot read retained capture: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("segment-") || !entry.path().is_dir() {
+            continue;
+        }
+        let path = entry.path().join("playback.wav");
+        if path.is_file() {
+            segments.push(path);
+        }
+    }
+    segments.sort();
+    match segments.len() {
+        0 => Err("The failed capture left no complete retained audio".into()),
+        1 => Ok(segments.pop().unwrap()),
+        _ => merge_segments(directory, &segments),
+    }
+}
+
+fn merge_segments(directory: &Path, segments: &[PathBuf]) -> AppResult<PathBuf> {
+    let manifest = fs::read_to_string(directory.join("capture-manifest.txt"))
+        .map_err(|e| format!("Cannot read the temporary capture metadata: {e}"))?;
+    let overlap = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("overlap_samples="))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .ok_or_else(|| {
+            "The temporary capture metadata does not describe the window overlap".to_string()
+        })?;
+    let output = directory.join("retry-audio.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&output, spec)
+        .map_err(|e| format!("Cannot create the retained capture for retry: {e}"))?;
+    let mut written = 0usize;
+    for (index, segment) in segments.iter().enumerate() {
+        let mut reader = hound::WavReader::open(segment)
+            .map_err(|e| format!("Cannot read retained audio {}: {e}", segment.display()))?;
+        let spec = reader.spec();
+        if spec.channels != 1
+            || spec.sample_rate != SAMPLE_RATE as u32
+            || spec.bits_per_sample != 16
+        {
+            return Err(format!(
+                "Retained audio {} is not the expected mono 16-bit 16 kHz window",
+                segment.display()
+            ));
+        }
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let skip = if index == 0 { 0 } else { overlap };
+        if samples.len() < skip {
+            return Err(format!(
+                "Retained audio {} is too short to rejoin the capture",
+                segment.display()
+            ));
+        }
+        for &sample in &samples[skip..] {
+            writer
+                .write_sample(sample)
+                .map_err(|e| format!("Cannot rejoin retained capture audio: {e}"))?;
+            written += 1;
+        }
+    }
+    writer
+        .finalize()
+        .map_err(|e| format!("Cannot finalize the retained capture for retry: {e}"))?;
+    if written == 0 {
+        return Err("The failed capture left no audio samples to retry".into());
+    }
+    Ok(output)
 }
 
 pub(crate) struct RecognitionWorker {

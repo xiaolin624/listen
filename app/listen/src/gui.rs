@@ -25,6 +25,8 @@ const ID_TOGGLE: usize = 101;
 const ID_COPY: usize = 102;
 const ID_EXIT: usize = 103;
 const ID_SHOW: usize = 104;
+const ID_RETRY: usize = 105;
+const ID_CLEANUP: usize = 106;
 
 struct Ui {
     app: Application,
@@ -32,6 +34,8 @@ struct Ui {
     status: HWND,
     result: HWND,
     toggle: HWND,
+    retry: HWND,
+    cleanup: HWND,
     copy: HWND,
     exit: HWND,
     explanation: HWND,
@@ -81,6 +85,8 @@ pub fn control(command: &str) -> Result<(), String> {
         "toggle" => 3,
         "show" => 4,
         "quit" => 5,
+        "retry" => 6,
+        "cleanup" => 7,
         _ => return Err(format!("Unknown control command: {command}")),
     };
     unsafe {
@@ -203,6 +209,18 @@ pub fn run(config: Config) -> Result<(), String> {
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             ID_COPY,
         )?;
+        let retry = child(
+            w!("BUTTON"),
+            "重试本地识别",
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            ID_RETRY,
+        )?;
+        let cleanup = child(
+            w!("BUTTON"),
+            "清理失败音频",
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            ID_CLEANUP,
+        )?;
         let exit = child(
             w!("BUTTON"),
             "退出",
@@ -229,6 +247,8 @@ pub fn run(config: Config) -> Result<(), String> {
             status,
             result,
             toggle,
+            retry,
+            cleanup,
             copy,
             exit,
             explanation,
@@ -310,8 +330,10 @@ impl Ui {
             let _ = MoveWindow(self.label, 16, 182, width, 24, true);
             let _ = MoveWindow(self.result, 16, 210, width, (bottom - 224).max(120), true);
             let _ = MoveWindow(self.toggle, 16, bottom, 140, 32, true);
-            let _ = MoveWindow(self.copy, 168, bottom, 160, 32, true);
-            let _ = MoveWindow(self.exit, (width - 104).max(340), bottom, 120, 32, true);
+            let _ = MoveWindow(self.retry, 164, bottom, 150, 32, true);
+            let _ = MoveWindow(self.cleanup, 322, bottom, 150, 32, true);
+            let _ = MoveWindow(self.copy, 480, bottom, 160, 32, true);
+            let _ = MoveWindow(self.exit, (width - 136).max(648), bottom, 120, 32, true);
         }
     }
 
@@ -332,6 +354,7 @@ impl Ui {
                     || last.text != state.text
                     || last.retained_audio != state.retained_audio
                     || last.delivery != state.delivery
+                    || last.retry_available != state.retry_available
             });
             if !changed {
                 return;
@@ -390,12 +413,21 @@ impl Ui {
                 self.toggle,
                 state.phase != Phase::Processing,
             );
+            let idle = !matches!(state.phase, Phase::Capturing | Phase::Processing);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                self.retry,
+                idle && state.retry_available,
+            );
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                self.cleanup,
+                idle && state.retry_available,
+            );
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                 self.copy,
                 !state.text.is_empty(),
             );
             let status = format!(
-                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 self.runtime.join("current-result.txt").display(),
@@ -405,6 +437,7 @@ impl Ui {
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
                     .join(" | "),
+                state.retry_available,
                 std::process::id()
             );
             if let Err(error) = fs::write(self.runtime.join("status.txt"), status) {
@@ -447,7 +480,11 @@ impl Ui {
                                 "No valid speech detected. Nothing was delivered; the previous result is unchanged."
                             }
                             Phase::Failure => {
-                                "The operation failed. Open Listen for details and retained audio paths."
+                                if state.retry_available {
+                                    "Recognition failed. The captured audio is retained; open Listen to retry locally."
+                                } else {
+                                    "The operation failed. Open Listen for details and retained audio paths."
+                                }
                             }
                             _ => "Ready. Ctrl+Alt+R starts playback capture.",
                         },
@@ -474,6 +511,8 @@ impl Ui {
                 1 => self.app.dispatch(Control::Start),
                 2 => self.app.dispatch(Control::Stop),
                 3 | ID_TOGGLE => self.app.dispatch(Control::Toggle),
+                6 | ID_RETRY => self.app.dispatch(Control::Retry),
+                7 | ID_CLEANUP => self.app.dispatch(Control::CleanupAudio),
                 4 | ID_SHOW => self.show(),
                 5 | ID_EXIT => {
                     self.quit_requested = true;
@@ -506,6 +545,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         };
         let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("显示当前结果"));
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, w!("开始 / 停止  Ctrl+Alt+R"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_RETRY, w!("重试本地识别"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_CLEANUP, w!("清理失败音频"));
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -545,7 +586,7 @@ unsafe extern "system" fn window_proc(
         }
         if message == WM_GETMINMAXINFO {
             let limits = &mut *(lparam.0 as *mut MINMAXINFO);
-            limits.ptMinTrackSize = POINT { x: 620, y: 500 };
+            limits.ptMinTrackSize = POINT { x: 900, y: 500 };
             return LRESULT(0);
         }
         let handled = UI.with(|slot| {

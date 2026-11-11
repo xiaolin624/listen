@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -243,6 +243,365 @@ fn local_backend_failure_keeps_recoverable_audio_and_explains_failure() {
         failure.retained_audio,
         "repeated stop must not lose recoverable audio"
     );
+}
+
+/// Fails the first `failures` recognition calls, then returns the known transcript.
+/// Every call records the exact audio path it was asked to recognize, so the test can
+/// prove that a retry reuses the retained capture instead of demanding a replay.
+struct RepairableModel {
+    failures: usize,
+    calls: AtomicUsize,
+    attempts: Mutex<Vec<(PathBuf, usize)>>,
+}
+impl RepairableModel {
+    fn new(failures: usize) -> Self {
+        Self {
+            failures,
+            calls: AtomicUsize::new(0),
+            attempts: Mutex::new(Vec::new()),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+impl LocalTranscriber for RepairableModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
+        let duration = wav.duration() as usize;
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.attempts
+            .lock()
+            .unwrap()
+            .push((audio.path.clone(), duration));
+        if call < self.failures {
+            Err("whisper.cpp process could not start: missing runtime DLL".into())
+        } else {
+            Ok(TRANSCRIPT.into())
+        }
+    }
+}
+
+#[test]
+fn failed_recognition_offers_retry_on_the_retained_audio_and_cleans_it_after_success() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    assert_eq!(failure.retained_audio.len(), 1);
+    let retained = failure.retained_audio[0].clone();
+    assert!(retained.is_file());
+    assert_eq!(model.calls(), 1);
+
+    app.dispatch(Control::Retry);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(!result.retry_available);
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        !retained.exists(),
+        "a successful retry must clean its audio"
+    );
+    assert_eq!(model.calls(), 2);
+    let attempts = model.attempts.lock().unwrap();
+    assert_eq!(
+        attempts[0].0, retained,
+        "the failed attempt used this audio"
+    );
+    assert_eq!(
+        attempts[1].0, retained,
+        "the retry must reuse the same retained audio, not a new capture"
+    );
+    assert!(attempts[1].1 > 0);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    assert!(
+        !fs::read_dir(&runtime.0)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_dir()),
+        "a successful retry must leave no session audio directory"
+    );
+}
+
+#[test]
+fn a_retry_that_fails_again_keeps_the_same_audio_retryable_until_it_succeeds() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(2));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let first_failure = await_phase(&mut app, Phase::Failure);
+    let retained = first_failure.retained_audio[0].clone();
+    assert!(first_failure.retry_available);
+
+    app.dispatch(Control::Retry);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    // A held retry control must not start a second recognition on the same audio.
+    app.dispatch(Control::Retry);
+    assert!(app.snapshot().detail.contains("Still processing"));
+    let second_failure = await_phase(&mut app, Phase::Failure);
+    assert!(
+        second_failure.detail.contains("Local retry failed"),
+        "{second_failure:?}"
+    );
+    assert!(second_failure.retry_available);
+    assert_eq!(second_failure.retained_audio, [retained.clone()]);
+    assert!(second_failure.text.is_empty());
+    assert!(retained.is_file(), "a failed retry must keep its audio");
+    assert_eq!(model.calls(), 2);
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert!(!result.retry_available);
+    assert!(!retained.exists());
+    assert_eq!(model.calls(), 3);
+    let attempts = model.attempts.lock().unwrap();
+    assert!(
+        attempts.iter().all(|(path, _)| *path == retained),
+        "every retry must reuse the retained audio: {attempts:?}"
+    );
+}
+
+#[test]
+fn retry_delivers_to_the_target_bound_at_capture_start_not_to_later_focus() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available);
+
+    // The failed capture stays the only pending capture: starting another one
+    // cannot mix its target, result, or audio with the retry.
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Failure);
+    assert!(
+        app.snapshot()
+            .detail
+            .contains("before starting a new capture"),
+        "{:?}",
+        app.snapshot()
+    );
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
+    assert_eq!(result.text, TRANSCRIPT);
+    assert!(result.retained_audio.is_empty());
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "the retry must append only to the target bound at capture start"
+    );
+    assert_eq!(
+        desktop.drafts[1], "另一个输入框",
+        "the input focused at retry time must never receive the result"
+    );
+    assert_eq!(desktop.replace_calls, 1, "one retry performs one delivery");
+}
+
+#[test]
+fn retry_without_a_valid_original_target_uses_the_fallback_not_the_retry_time_focus() {
+    let runtime = Runtime::new();
+    let mut editors = Editors::with_drafts("原有草稿", "重试时获得焦点");
+    editors.focused = None;
+    let editors = Arc::new(Mutex::new(editors));
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    editors.lock().unwrap().focused = Some(1);
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("No supported editable target"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "重试时获得焦点"]);
+    assert_eq!(
+        desktop.replace_calls, 0,
+        "no target was bound, so the retry writes nothing"
+    );
+}
+
+#[test]
+fn cleaning_failed_audio_updates_the_state_and_prevents_invalid_retries() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(2));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    let retained = failure.retained_audio[0].clone();
+    assert!(failure.retry_available);
+
+    app.dispatch(Control::CleanupAudio);
+    let cleared = app.snapshot();
+    assert_eq!(cleared.phase, Phase::Failure);
+    assert!(!cleared.retry_available);
+    assert!(cleared.retained_audio.is_empty());
+    assert!(
+        !retained.exists(),
+        "cleaning must delete the retained audio"
+    );
+    assert!(
+        cleared.detail.contains("deleted at your request"),
+        "{cleared:?}"
+    );
+
+    let calls_without_audio = model.calls();
+    app.dispatch(Control::Retry);
+    app.poll();
+    assert_eq!(
+        model.calls(),
+        calls_without_audio,
+        "a cleaned failure must not invoke the local model again"
+    );
+    let after_retry = app.snapshot();
+    assert_eq!(after_retry.phase, Phase::Failure);
+    assert!(after_retry.text.is_empty());
+    assert!(after_retry.detail.contains("No retained audio"));
+}
+
+#[test]
+fn unconfirmed_retry_write_keeps_one_fallback_and_later_controls_never_append_it_again() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().unconfirmed = true;
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("could not be confirmed"),
+        "{result:?}"
+    );
+    assert!(!result.retry_available);
+    assert_eq!(
+        editors.lock().unwrap().drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}")
+    );
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+
+    // The write was already attempted once for this result: a retry control must
+    // not append the same text again, and must not restore or revert the target.
+    for control in [Control::Retry, Control::Stop, Control::Retry] {
+        app.dispatch(control);
+    }
+    app.poll();
+    assert_eq!(app.snapshot().phase, Phase::Result);
+    assert_eq!(app.snapshot().text, TRANSCRIPT);
+    assert!(!app.snapshot().retry_available);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "an unconfirmed write must never be duplicated by a retry operation"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+    assert_eq!(model.calls(), 2, "a result-phase retry recognizes nothing");
+}
+
+/// The local model is unavailable on a retry until its readiness condition is
+/// repaired. Retrying must not invoke recognition while it is unavailable, and the
+/// same retained audio must still recover afterwards.
+struct RepairableReadinessModel {
+    ready: AtomicBool,
+    calls: AtomicUsize,
+}
+impl LocalTranscriber for RepairableReadinessModel {
+    fn check_ready(&self) -> AppResult<()> {
+        if self.ready.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("Local model is missing: ggml-small.bin".into())
+        }
+    }
+    fn transcribe(&self, _audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err("Local whisper.cpp recognition failed (exit code: 2)".into())
+        } else {
+            Ok(TRANSCRIPT.into())
+        }
+    }
+}
+
+#[test]
+fn retry_waits_for_the_local_condition_to_be_repaired_and_then_recovers_the_same_audio() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableReadinessModel {
+        ready: AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    let retained = failure.retained_audio[0].clone();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+    // The local model is now unavailable: retrying reports that condition without
+    // invoking recognition, and the audio remains retryable.
+    model.ready.store(false, Ordering::SeqCst);
+    app.dispatch(Control::Retry);
+    let unavailable = await_phase(&mut app, Phase::Failure);
+    assert!(
+        unavailable.detail.contains("Local model is missing"),
+        "{unavailable:?}"
+    );
+    assert!(unavailable.retry_available);
+    assert_eq!(unavailable.retained_audio, [retained.clone()]);
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        1,
+        "an unavailable local model must not be invoked"
+    );
+
+    model.ready.store(true, Ordering::SeqCst);
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(!retained.exists());
 }
 
 #[test]
