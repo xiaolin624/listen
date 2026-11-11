@@ -21,7 +21,7 @@ enum LaunchAction {
     Help,
 }
 
-const HELP: &str = "Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nThe engine package must include vad-speech-segments.exe.\nControl running application: --control <start|stop|toggle|show|quit>\nResults are copyable in the application. Messages are never sent automatically.";
+const HELP: &str = "Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nThe engine package must include vad-speech-segments.exe.\nControl running application: --control <start|stop|toggle|retry|cleanup|show|quit>\nRetry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.\nResults are copyable in the application. Messages are never sent automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
