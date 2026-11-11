@@ -321,3 +321,112 @@ fn slow_recognition_reports_bounded_backlog_then_retains_audio_and_checkpoint_af
     app.dispatch(Control::Stop);
     assert_eq!(app.snapshot().text, failure.text);
 }
+
+#[cfg(windows)]
+#[test]
+fn local_cli_timestamp_output_preserves_split_chinese_bytes_and_merges_only_the_audio_overlap() {
+    let runtime = Runtime::new();
+    let engine = runtime.0.join("whisper-cli.exe");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/local_backend.rs");
+    let linker = std::env::var("CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER").unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .arg("--edition=2024").arg(source).arg("-o").arg(&engine)
+        .args(["-C", "link-self-contained=yes", "-C", &format!("linker={linker}")])
+        .output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    fs::copy(&engine, runtime.0.join("vad-speech-segments.exe")).unwrap();
+    let model = runtime.0.join("ggml.bin");
+    fs::write(&model, 0x67676d6cu32.to_le_bytes()).unwrap();
+    let transcriber = listen::whisper::Whisper {
+        executable: engine, model: model.clone(), vad_model: model,
+        language: "zh".into(), threads: 1,
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback { input: Mutex::new(Some(rx)), config: config() }),
+        Arc::new(transcriber), runtime.0.join("flow"), Ok(())
+    );
+    app.dispatch(Control::Start);
+    let mut samples = vec![1000; 1280];
+    samples.extend(vec![2000; 480]);
+    samples.extend(vec![3000; 960]);
+    samples.extend(vec![4000; 480]);
+    tx.send(samples).unwrap();
+    wait(&mut app, |s| s.progress.recognized_segments >= 2);
+    app.dispatch(Control::Stop);
+    let result = wait(&mut app, |s| s.phase == Phase::Result);
+    assert_eq!(result.text, "开始跨段 Rust 收尾。");
+}
+
+struct CrashedModel;
+impl LocalTranscriber for CrashedModel {
+    fn check_ready(&self) -> AppResult<()> { Ok(()) }
+    fn transcribe(&self, _: &CapturedAudio, _: &Path) -> AppResult<String> { panic!("backend process boundary crashed") }
+}
+
+#[test]
+fn a_crashed_background_recognizer_is_reported_without_waiting_for_more_audio() {
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback { input: Mutex::new(Some(rx)), config: config() }),
+        Arc::new(CrashedModel), runtime.0.clone(), Ok(())
+    );
+    app.dispatch(Control::Start);
+    tx.send(vec![1000; 1600]).unwrap();
+    let failure = wait(&mut app, |s| s.phase == Phase::Failure);
+    assert!(failure.detail.contains("panicked"), "{failure:?}");
+    assert_eq!(failure.retained_audio.len(), 1);
+}
+
+struct SpeechThenSilence;
+impl LocalTranscriber for SpeechThenSilence {
+    fn check_ready(&self) -> AppResult<()> { Ok(()) }
+    fn transcribe(&self, _: &CapturedAudio, _: &Path) -> AppResult<String> { unreachable!() }
+    fn transcribe_segment(&self, audio: &CapturedAudio, _: &Path) -> AppResult<Vec<TimedText>> {
+        let mut wav = hound::WavReader::open(&audio.path).unwrap();
+        if wav.samples::<i16>().all(|sample| sample.unwrap() == 1000) {
+            Ok(vec![TimedText { start_ms: 0, end_ms: 80, text: "开始".into() },
+                TimedText { start_ms: 90, end_ms: 100, text: "收尾。".into() }])
+        } else { Ok(Vec::new()) }
+    }
+}
+
+#[test]
+fn silence_in_a_later_window_does_not_erase_the_already_recognized_trailing_word() {
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback { input: Mutex::new(Some(rx)), config: config() }),
+        Arc::new(SpeechThenSilence), runtime.0.clone(), Ok(())
+    );
+    app.dispatch(Control::Start);
+    let mut samples = vec![1000; 1600];
+    samples.extend(vec![0; 1280]);
+    tx.send(samples).unwrap();
+    wait(&mut app, |s| s.progress.recognized_segments == 2);
+    app.dispatch(Control::Stop);
+    let result = wait(&mut app, |s| s.phase == Phase::Result);
+    assert_eq!(result.text, "开始收尾。");
+}
+
+#[test]
+fn equal_words_spoken_on_both_sides_of_a_boundary_remain_two_distinct_utterances() {
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback { input: Mutex::new(Some(rx)), config: config() }),
+        Arc::new(Words), runtime.0.clone(), Ok(())
+    );
+    app.dispatch(Control::Start);
+    let mut samples = vec![1000; 1280];
+    samples.extend(vec![4000; 320]);
+    samples.extend(vec![0; 960]);
+    samples.extend(vec![4000; 320]);
+    samples.extend(vec![0; 320]);
+    tx.send(samples).unwrap();
+    wait(&mut app, |s| s.progress.received_samples == 3200);
+    app.dispatch(Control::Stop);
+    let result = wait(&mut app, |s| s.phase == Phase::Result);
+    assert_eq!(result.text, "开始 收尾。 收尾。");
+}
