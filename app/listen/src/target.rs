@@ -1,8 +1,10 @@
 //! Editors selected from the real foreground thread through UI Automation.
-//! Selection is fixed when capture starts. Output uses only `ValuePattern.SetValue`;
-//! no clipboard, keyboard injection, focus changes, or submit patterns are used.
+//! Selection is fixed when capture starts. Output uses `ValuePattern.SetValue`, and
+//! only when a provider silently drops that write does it fall back to an appending
+//! clipboard paste that produces real editing events (see `crate::paste`). Both paths
+//! read the draft immediately before writing, confirm the result, and never send Enter.
 
-use crate::{AppResult, Target, TargetSelection};
+use crate::{AppResult, Target, TargetSelection, paste};
 use std::{
     cell::Cell,
     sync::{
@@ -34,11 +36,12 @@ use windows::{
     core::{BSTR, Interface, PCWSTR},
 };
 
-const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Chromium applies `ValuePattern.SetValue` on its UI thread after the call returns.
 /// Confirmation waits for the new accessible value; the write itself is never repeated.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(20);
+/// The caller's wait covers the confirmation window plus the fallback paste sequence.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ANCESTORS: usize = 64;
 
 pub struct NativeTargets;
@@ -151,7 +154,6 @@ impl TargetSelection for NativeTargets {
         }
     }
 }
-
 /// UIA reports a native multiline EDIT (and some rich editors) as `Document`, while
 /// single-line edits, browser text areas and contenteditable regions are `Edit`.
 /// Both can carry a writable Value pattern, so writability is decided by the pattern
@@ -533,23 +535,90 @@ impl NativeEditor {
         }
         let normalized = replacement.replace("\r\n", "\n").replace('\n', "\r\n");
         self.validate()?;
-        unsafe {
+        let written = unsafe {
             self.value
                 .SetValue(&BSTR::from(normalized.as_str()))
-                .map_err(|e| format!("Target output failed or is unconfirmed: {e}"))?;
+                .is_ok()
+        };
+        if written && self.confirmed(replacement) {
+            return Ok(());
         }
+        // Some providers expose a Value pattern but drop the write (a controlled
+        // rich-text composer restores its own state). Fall back to a real paste,
+        // which produces ordinary editing events, while the target still owns the
+        // foreground keyboard focus.
+        self.paste_output(expected, replacement)
+    }
+
+    /// Waits for the accessible value to show the complete replacement. The write
+    /// itself is never repeated; only reads are retried.
+    fn confirmed(&self, replacement: &str) -> bool {
         let expected = replacement.replace("\r\n", "\n");
         let deadline = Instant::now() + CONFIRM_TIMEOUT;
         loop {
-            let observed = self.content()?.replace("\r\n", "\n");
-            if observed == expected {
-                return Ok(());
+            if let Ok(observed) = self.content() {
+                if observed.replace("\r\n", "\n") == expected {
+                    return true;
+                }
             }
             if Instant::now() >= deadline {
-                return Err("The complete target output could not be confirmed".into());
+                return false;
             }
             thread::sleep(CONFIRM_INTERVAL);
         }
+    }
+
+    /// The paste fallback only appends, so a draft that cannot be read through UIA
+    /// is preserved instead of being replaced. Nothing is written unless the draft
+    /// can be read first, and the editor is read back before the result is trusted.
+    fn paste_output(&self, expected: &str, replacement: &str) -> AppResult<()> {
+        self.require_foreground_focus()?;
+        let backup = paste::ClipboardBackup::save();
+        let draft = paste::read_draft()?.replace("\r\n", "\n");
+        let wanted_text = replacement.replace("\r\n", "\n");
+        let known_prefix = if expected.is_empty() {
+            String::new()
+        } else {
+            format!("{expected}\n")
+        };
+        let payload = wanted_text
+            .strip_prefix(&known_prefix)
+            .map(str::to_string)
+            .unwrap_or_else(|| wanted_text.clone());
+        let separator = if draft.is_empty() { "" } else { "\n" };
+        paste::paste(&format!("{separator}{payload}"))?;
+        let observed = paste::read_back()?.replace("\r\n", "\n");
+        paste::collapse_to_end();
+        drop(backup);
+        let wanted = format!("{draft}{separator}{payload}");
+        if observed.trim_end() != wanted.trim_end() {
+            return Err(
+                "The complete target output could not be confirmed after the fallback write".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The fallback writer sends real key events, so it may only run while the bound
+    /// editor itself still owns the foreground keyboard focus.
+    fn require_foreground_focus(&self) -> AppResult<()> {
+        unsafe {
+            if GetForegroundWindow() != HWND(self.focus.window as *mut _) {
+                return Err(
+                    "The original target is no longer the foreground window, so the fallback writer was not used"
+                        .into(),
+                );
+            }
+        }
+        let focused = unsafe { self.automation.GetFocusedElement() }
+            .map_err(|e| format!("Cannot confirm the focused target: {e}"))?;
+        if runtime_id(&focused)? != self.runtime_id {
+            return Err(
+                "The focused control is not the original target, so the fallback writer was not used"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 

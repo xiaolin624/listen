@@ -8,6 +8,8 @@ use std::{
 
 #[cfg(windows)]
 pub mod audio;
+#[cfg(windows)]
+pub mod paste;
 pub mod streaming;
 #[cfg(windows)]
 pub mod target;

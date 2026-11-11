@@ -128,9 +128,57 @@ FINAL_TARGET 富文本原有草稿：Rust 123。\n第二行 draft。\n采集中�
 
 驱动与证据：`E:\luyin\.artifacts\quality-live-driver\accept-quality-live.ps1`、`E:\luyin\.artifacts\quality-capture\live-evidence.json` 及每个样本的 `<sample>.json`。这是一次**真实 WASAPI 采集 + 真实 whisper.cpp** 的运行，目标由真实焦点选定，没有向工具传递任何窗口句柄。
 
+## 受控富文本编辑器的降级写入：粘贴 + 校验（2026-11-11 深夜补测）
+
+用户在 2026-11-11 明确：不要求在某个特定桌面应用上验收，"只要能往输入框里真正写入文字"，并授权用 **DeepSeek Harness 的输入框**做实测样例。
+
+在 Harness 上暴露了一个 UIA 覆盖不到的情况：
+
+| 能力 | 结果 |
+| --- | --- |
+| UIA 类型 / 模式 | `ControlType.Edit`，`ValuePattern` 与 `TextPattern` 都存在，`IsReadOnly=false` |
+| `ValuePattern.SetValue` | 调用成功返回，但**内容始终为空** |
+| `Value` / `TextPattern` 读取 | 只能读到占位提示，读不到真实内容（空/有内容都一样） |
+| 真实鼠标点击 + 键盘输入 | 有效（截图确认） |
+| 真实点击 + `Ctrl+V` 粘贴 | 有效 |
+| `Ctrl+A` + `Ctrl+C` 读回 | 有效，可拿到编辑区真实内容 |
+
+这是受控富文本编辑器（ProseMirror 类）的典型行为：Chrome 对它暴露了 Value 模式，但写入不进入编辑状态。只靠 UIA 无法覆盖这一类输入框。
+
+### 实现：只追加、可校验、不发送
+
+`app/listen/src/paste.rs` 新增降级写入，`target.rs` 在 **UIA 写入未被读回确认** 时才使用它：
+
+1. 先确认绑定目标仍是**前台窗口**，且 UIA 焦点元素仍是开始时绑定的那个元素（运行时 ID 相等）；否则不写按键，直接回退备用文本框。
+2. 备份剪贴板文本。
+3. `Ctrl+A`、`Ctrl+C` 读出**编辑区真实草稿**（先清空剪贴板，避免空选择时读到旧内容）。
+4. 把光标收起到末尾，只**追加**本次新增文本（草稿非空时前面加一个换行）。**不覆盖用户已有草稿。**
+5. `Ctrl+V` 粘贴。
+6. `Ctrl+A`、`Ctrl+C` 读回整个编辑区，与期望全文逐字比较；不一致就报告"写入未确认"，不重试。
+7. 收起选区到末尾，恢复原剪贴板文本。
+
+全程只发 `Ctrl+A / Ctrl+V / Ctrl+C / →`，**从不发送 Enter**，因此不会触发发送。降级路径的调用者等待上限也从 2 秒提高到 15 秒，覆盖 2 秒读回确认加粘贴序列；此前的 2 秒上限会让确认窗口先于内部轮询超时。
+
+### 实测（真实 Harness 输入框，真实 WASAPI，真实 whisper small + Silero）
+
+| 样本 | 阶段 | 产品说明 | 输入框最终内容 |
+| --- | --- | --- | --- |
+| mandarin | `Result` | `The complete result was appended to the original target` | 一段转写，逐字等于 `current-result.txt` |
+| mixed-technical | `Result` | 同上 | 保留上一段，追加第二段中英混合转写 |
+
+- 两段都在输入框里，原有内容没有被删除；发送按钮只是变为可用，**没有发送任何消息**（对话里没有出现新的用户消息）。
+- 证据：`E:\luyin\.artifacts\quality-harness\`（`harness-evidence.json`、`harness-window.png`、`composer-*.png`）与 `E:\luyin\.artifacts\quality-harness-driver\accept-harness-target.ps1`。
+
+### 新引入的限制（必须如实记录）
+
+- **会短暂借用系统剪贴板**：写入后恢复原来的剪贴板文本；如果原来不是文本内容（例如图片），只能清空剪贴板，无法还原非文本格式。
+- **需要目标窗口在停止那一刻仍是前台**：降级路径要发真实按键。用户在别的窗口按停止时，这一层不生效，按原规则进入备用文本框并提示检查。
+- **只追加**：降级路径不会删除或改写编辑区里已有的内容，因此不会因为读不到草稿而覆盖用户原文；代价是它不能像 UIA 路径那样做"整值替换"。
+- 受控编辑器仍然可能在我们写入后、下一次自身重渲染时改变内容；本实现只能确认写入当时的内容，不能保证编辑器内部状态长期一致。Harness 的实测中没有观察到回退。
+
 ## 尚未验证
 
-- **Codex 桌面端**：本机未发现已确认的 Codex 桌面 GUI 入口，只有 CLI；按任务要求没有用 CLI 冒充桌面端输入框。该项验收仍缺用户确认的实际样例。
+- **桌面应用样例**：用户已确认不限定具体应用，只要能往输入框写入文字即可，并授权用 DeepSeek Harness 的输入框验收；本记录已用该输入框跑通真实 WASAPI 完整流程（见上节）。Codex 桌面端本身仍没有可用入口，不再作为阻塞项。
 - **浏览器插件/扩展内的编辑区**：本轮验证的是普通 Chrome 页面中的 `contenteditable`；没有单独启动并验证某个扩展自己的输入区。它们若使用同一 Chromium UIA 暴露方式，理论上走同一路径，但缺少真实样例证据。
 - **受控 React/Vue 富文本编辑器**：夹具的 `#rich` 是非受控 `contenteditable`。受控组件在无 `input` 事件时是否覆盖、何时覆盖，尚未用真实页面验证。
 - **原生编辑区的路径**：已在上节用 8 个真实 WASAPI 样本回归通过（多行 EDIT 被 UIA 报成 `Document`，现在按可写 `ValuePattern` 判定）。单行 EDIT、RichEdit 及其他第三方 UIA 提供程序仍只有通用契约，没有逐个实测。
