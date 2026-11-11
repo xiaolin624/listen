@@ -1,6 +1,6 @@
 # Issue #8 实现与验证记录：耳机播放路由变化与采集中断反馈
 
-范围：[T7：耳机播放路由变化与采集中断反馈](https://github.com/xiaolin624/listen/issues/8)。工作树 `E:\luyin\.worktrees\issue-8`，分支 `implement/issue-8-device-routing`，开始基线 `9faa9c3`（含 #3/#4/#5/#6/#7/#9）。实现提交 `c20576e`，本文档随后单独提交。未推送、未关闭 issue，主工作树未改动。
+范围：[T7：耳机播放路由变化与采集中断反馈](https://github.com/xiaolin624/listen/issues/8)。工作树 `E:\luyin\.worktrees\issue-8`，分支 `implement/issue-8-device-routing`，开始基线 `9faa9c3`（含 #3/#4/#5/#6/#7/#9）。实现提交 `c20576e`，路由检查细化提交 `fa578d7`，本文档随后单独提交。未推送、未关闭 issue，主工作树未改动。
 
 本次实现采集的端点身份、默认多媒体端点切换、当前端点移除/失活、以及中断后保留可恢复结果。工具不跟随新端点，而是在无法确认新端点仍是用户耳机路径时立即中断并如实标注。没有打开麦克风，也没有新增按应用筛选。
 
@@ -132,7 +132,7 @@ cd E:\luyin\.worktrees\issue-8
 git diff --check                                                        # 通过
 ```
 
-最终 `-Task Build` 为增量 release 构建（12.21 s）；实现初期干净依赖构建为 49.25 s。产物为 `app\listen\target\release\listen.exe` 和相邻 `libunwind.dll`。自动行为测试不连接桌面、不运行真实 WASAPI 或识别引擎；桌面证据来自上节独立验收。
+最终 `-Task Build` 为增量 release 构建（11.79 s）；实现初期干净依赖构建为 49.25 s。产物为 `app\listen\target\release\listen.exe` 和相邻 `libunwind.dll`。自动行为测试不连接桌面、不运行真实 WASAPI 或识别引擎；桌面证据来自上节独立验收。
 
 ## 已知限制与未覆盖
 
