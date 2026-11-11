@@ -354,13 +354,14 @@ fn local_cli_timestamp_output_preserves_split_chinese_bytes_and_merges_only_the_
     fs::copy(&engine, runtime.0.join("vad-speech-segments.exe")).unwrap();
     let model = runtime.0.join("ggml.bin");
     fs::write(&model, 0x67676d6cu32.to_le_bytes()).unwrap();
-    let transcriber = listen::whisper::Whisper {
-        executable: engine,
-        model: model.clone(),
-        vad_model: model,
-        language: "zh".into(),
-        threads: 1,
-    };
+    let transcriber = listen::whisper::Whisper::with_backend(
+        engine,
+        model.clone(),
+        model,
+        "zh".into(),
+        1,
+        listen::whisper::Backend::Cli,
+    );
     let (tx, rx) = mpsc::sync_channel(1);
     let mut app = Application::new(
         Arc::new(Playback {

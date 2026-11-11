@@ -230,13 +230,14 @@ pub fn run(config: Config) -> Result<(), String> {
         let registration = RegisterHotKey(Some(hwnd), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'R' as u32).map_err(|e| format!("Ctrl+Alt+R: {e}. Release this shortcut in the other application, then restart Listen."));
         let app = Application::new(
             Arc::new(WasapiPlayback),
-            Arc::new(Whisper {
-                executable: config.engine,
-                model: config.model,
-                vad_model: config.vad_model,
-                language: config.language,
-                threads: config.threads,
-            }),
+            Arc::new(Whisper::with_backend(
+                config.engine,
+                config.model,
+                config.vad_model,
+                config.language,
+                config.threads,
+                config.backend,
+            )),
             config.runtime.clone(),
             registration,
         )
@@ -305,7 +306,7 @@ impl Ui {
         let icon_id = match state.phase {
             Phase::Failure => IDI_ERROR,
             Phase::Capturing => IDI_WARNING,
-            Phase::Processing => IDI_INFORMATION,
+            Phase::Processing | Phase::Preparing => IDI_INFORMATION,
             _ => IDI_APPLICATION,
         };
         let mut data = NOTIFYICONDATAW {
@@ -355,6 +356,8 @@ impl Ui {
                     || last.retained_audio != state.retained_audio
                     || last.delivery != state.delivery
                     || last.retry_available != state.retry_available
+                    || last.backend != state.backend
+                    || last.timing != state.timing
             });
             if !changed {
                 return;
@@ -370,6 +373,9 @@ impl Ui {
             );
             if self.quit_requested {
                 detail.push_str("\r\nFinishing the current operation before exiting.");
+            }
+            if let Some(backend) = &state.backend {
+                detail.push_str(&format!("\r\nBackend: {backend}"));
             }
             if !self.tray {
                 detail.push_str(
@@ -405,15 +411,20 @@ impl Ui {
                     "停止并转写"
                 } else if state.phase == Phase::Processing {
                     "正在本机转写…"
+                } else if state.phase == Phase::Preparing {
+                    "正在准备本地模型…"
                 } else {
                     "开始采集"
                 },
             );
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                 self.toggle,
-                state.phase != Phase::Processing,
+                !matches!(state.phase, Phase::Processing | Phase::Preparing),
             );
-            let idle = !matches!(state.phase, Phase::Capturing | Phase::Processing);
+            let idle = !matches!(
+                state.phase,
+                Phase::Capturing | Phase::Processing | Phase::Preparing
+            );
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                 self.retry,
                 idle && state.retry_available,
@@ -426,8 +437,9 @@ impl Ui {
                 self.copy,
                 !state.text.is_empty(),
             );
+            let timing = &state.timing;
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -453,6 +465,40 @@ impl Ui {
                     .collect::<Vec<_>>()
                     .join(" | "),
                 state.retry_available,
+                state.backend.as_deref().unwrap_or(""),
+                timing
+                    .preparation_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .stop_to_result_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .finalize_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .recognition_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .last_window_wait_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .last_window_inference_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .save_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .delivery_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing.recognition_windows,
                 std::process::id()
             );
             if let Err(error) = fs::write(self.runtime.join("status.txt"), status) {
@@ -483,6 +529,9 @@ impl Ui {
                             }
                             Phase::Processing => {
                                 "Recognizing locally. Wait for the current result."
+                            }
+                            Phase::Preparing => {
+                                "Preparing the local model. Capture starts after Ready."
                             }
                             Phase::Result => {
                                 if state.delivery == Some(Delivery::Appended) {

@@ -1,12 +1,30 @@
-//! Local whisper.cpp CLI adapter. No networking or alternative recognizer exists.
-use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText};
+//! Local whisper.cpp adapter. The model can stay resident in this process
+//! (in-process `whisper.dll`, fresh decode state per request) with an explicit
+//! fallback to the one-shot `whisper-cli.exe`. No networking or alternative
+//! recognizer exists.
+use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText, whisper_host::ModelHost};
 use std::{
     fs::{self, File},
     io::Read,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// Load the model once into this process and decode each window in a fresh state.
+    #[default]
+    ModelHost,
+    /// Keep the previous behavior: one `whisper-cli.exe` process per window.
+    Cli,
+}
 
 pub struct Whisper {
     pub executable: PathBuf,
@@ -14,9 +32,58 @@ pub struct Whisper {
     pub vad_model: PathBuf,
     pub language: String,
     pub threads: usize,
+    pub backend: Backend,
+    host: Arc<Mutex<Option<ModelHost>>>,
+    note: Arc<Mutex<Option<String>>>,
+    host_disabled: Arc<AtomicBool>,
 }
 
 impl Whisper {
+    pub fn with_backend(
+        executable: PathBuf,
+        model: PathBuf,
+        vad_model: PathBuf,
+        language: String,
+        threads: usize,
+        backend: Backend,
+    ) -> Self {
+        Self {
+            executable,
+            model,
+            vad_model,
+            language,
+            threads,
+            backend,
+            host: Arc::new(Mutex::new(None)),
+            note: Arc::new(Mutex::new(if backend == Backend::Cli {
+                Some(
+                    "whisper.cpp CLI (one process per window; the model is reloaded each window)."
+                        .to_string(),
+                )
+            } else {
+                None
+            })),
+            host_disabled: Arc::new(AtomicBool::new(backend == Backend::Cli)),
+        }
+    }
+
+    pub fn new(
+        executable: PathBuf,
+        model: PathBuf,
+        vad_model: PathBuf,
+        language: String,
+        threads: usize,
+    ) -> Self {
+        Self::with_backend(
+            executable,
+            model,
+            vad_model,
+            language,
+            threads,
+            Backend::ModelHost,
+        )
+    }
+
     fn vad_executable(&self) -> PathBuf {
         self.executable.with_file_name("vad-speech-segments.exe")
     }
@@ -93,10 +160,10 @@ impl Whisper {
         Ok(count > 0)
     }
 
-    /// Run the local decoder for one captured window and return its output stem.
+    /// Run the local CLI for one captured window and return its output stem.
     /// Full JSON adds the per-token byte fragments and timestamps that overlap
     /// ownership needs; plain text is enough for a single whole-file result.
-    fn recognize(
+    fn recognize_cli(
         &self,
         audio: &CapturedAudio,
         directory: &Path,
@@ -137,7 +204,7 @@ impl Whisper {
         let status = command
             .arg("-of")
             .arg(&stem)
-            // CPU is explicit for this first integration. CUDA selection/performance is later work.
+            // CPU is explicit for this integration. CUDA selection/performance is later work.
             .arg("-ng")
             .creation_flags(0x08000000)
             .stdin(Stdio::null())
@@ -158,9 +225,76 @@ impl Whisper {
         }
         Ok(stem)
     }
+
+    fn host_result<T>(
+        &self,
+        run: impl FnOnce(&mut ModelHost) -> AppResult<T>,
+    ) -> Option<AppResult<T>> {
+        if self.backend == Backend::Cli || self.host_disabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut guard = self.host.lock().unwrap();
+        let host = guard.as_mut()?;
+        let result = run(host);
+        drop(guard);
+        if let Err(error) = &result {
+            self.disable_host(error);
+        }
+        Some(result)
+    }
+
+    /// Stop using the resident model after a host error and say so. The current
+    /// window is retried through the CLI path by the caller; no audio is lost.
+    fn disable_host(&self, error: &str) {
+        self.host_disabled.store(true, Ordering::Release);
+        *self.note.lock().unwrap() = Some(format!(
+            "The resident local model failed ({error}); remaining windows use the whisper.cpp CLI, which reloads the model. No audio was lost."
+        ));
+        self.host.lock().unwrap().take();
+    }
 }
 
 impl LocalTranscriber for Whisper {
+    fn prepare(&self) -> Option<mpsc::Receiver<AppResult<String>>> {
+        if self.backend == Backend::Cli {
+            return None;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let host = self.host.clone();
+        let note = self.note.clone();
+        let disabled = self.host_disabled.clone();
+        let executable = self.executable.clone();
+        let model = self.model.clone();
+        let language = self.language.clone();
+        let threads = self.threads;
+        thread::spawn(move || {
+            match ModelHost::load(&executable, &model, threads, &language) {
+                Ok(loaded) => {
+                    *host.lock().unwrap() = Some(loaded);
+                    let message = "Local model is loaded and resident in this process (CPU, no CUDA backend); every window decodes in a fresh state and no window waits to reload the model.".to_string();
+                    *note.lock().unwrap() = Some(message.clone());
+                    let _ = sender.send(Ok(message));
+                }
+                Err(error) => {
+                    // The CLI path was validated by check_ready. Keep capture
+                    // available, but state explicitly that every window will pay
+                    // the model load again rather than claiming a false warm state.
+                    disabled.store(true, Ordering::Release);
+                    let message = format!(
+                        "The resident local model is unavailable ({error}); Listen will use the whisper.cpp CLI for each window, which reloads the model and is slower. No audio is lost."
+                    );
+                    *note.lock().unwrap() = Some(message.clone());
+                    let _ = sender.send(Ok(message));
+                }
+            }
+        });
+        Some(receiver)
+    }
+
+    fn backend_note(&self) -> Option<String> {
+        self.note.lock().unwrap().clone()
+    }
+
     fn check_ready(&self) -> AppResult<()> {
         if !self.executable.is_file() {
             return Err(format!(
@@ -213,14 +347,21 @@ impl LocalTranscriber for Whisper {
         if !self.has_speech(audio, directory)? {
             return Ok(String::new());
         }
-        let stem = self.recognize(audio, directory, false)?;
-        let text = fs::read_to_string(stem.with_extension("txt")).map_err(|e| {
-            format!(
-                "Local backend did not produce a complete UTF-8 result: {e}. Log: {}",
-                directory.join("whisper.log").display()
-            )
-        })?;
-        Ok(text.trim().to_string())
+        if let Some(result) = self.host_result(|host| host.transcribe(&audio.path)) {
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) => {
+                    return self
+                        .recognize_cli(audio, directory, false)
+                        .and_then(|stem| read_cli_text(&stem, directory))
+                        .map_err(|fallback| {
+                            format!("{error}; the CLI fallback also failed: {fallback}")
+                        });
+                }
+            }
+        }
+        let stem = self.recognize_cli(audio, directory, false)?;
+        read_cli_text(&stem, directory)
     }
 
     fn transcribe_segment(
@@ -234,7 +375,30 @@ impl LocalTranscriber for Whisper {
         if !self.has_speech(audio, directory)? {
             return Ok(Vec::new());
         }
-        let stem = self.recognize(audio, directory, true)?;
+        if let Some(result) = self.host_result(|host| host.transcribe_segment(&audio.path)) {
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) => {
+                    return self
+                        .recognize_cli(audio, directory, true)
+                        .and_then(|stem| crate::whisper_timing::read(&stem.with_extension("json")))
+                        .map_err(|fallback| {
+                            format!("{error}; the CLI fallback also failed: {fallback}")
+                        });
+                }
+            }
+        }
+        let stem = self.recognize_cli(audio, directory, true)?;
         crate::whisper_timing::read(&stem.with_extension("json"))
     }
+}
+
+fn read_cli_text(stem: &Path, directory: &Path) -> AppResult<String> {
+    let text = fs::read_to_string(stem.with_extension("txt")).map_err(|e| {
+        format!(
+            "Local backend did not produce a complete UTF-8 result: {e}. Log: {}",
+            directory.join("whisper.log").display()
+        )
+    })?;
+    Ok(text.trim().to_string())
 }

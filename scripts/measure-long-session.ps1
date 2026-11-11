@@ -8,7 +8,8 @@ param(
     [long]$SpoolBytes = 9600440,
     [string]$Model = '',
     [string]$Engine = '',
-    [string]$VadModel = ''
+    [string]$VadModel = '',
+    [ValidateSet('host', 'cli')][string]$Backend = 'host'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -45,6 +46,7 @@ $metadata = [ordered]@{
     vad_model = $VadModel
     vad_sha256 = (Get-FileHash -LiteralPath $VadModel -Algorithm SHA256).Hash
     engine = $Engine
+    backend = $Backend
     seconds = $Seconds
     threads = $Threads
     delay_ms = $DelayMs
@@ -58,7 +60,7 @@ $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Outpu
 $arguments = @(
     '--input', ('"{0}"' -f $InputWav), '--runtime', ('"{0}"' -f $runtime),
     '--engine', ('"{0}"' -f $Engine), '--model', ('"{0}"' -f $Model),
-    '--vad-model', ('"{0}"' -f $VadModel), '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+    '--vad-model', ('"{0}"' -f $VadModel), '--backend', $Backend, '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     '--threads', $Threads, '--delay-ms', $DelayMs, '--spool-bytes', $SpoolBytes
 )
 # Windows PowerShell rebuilds a case-insensitive environment dictionary when it
@@ -110,6 +112,13 @@ try {
         terminal = $terminal.terminal
         recognized_segments = $terminal.recognized_segments
         stop_to_result_seconds = $terminal.stop_to_result_seconds
+        stop_to_result_ms = $terminal.timing_stop_to_result_ms
+        finalize_ms = $terminal.timing_finalize_ms
+        recognition_ms = $terminal.timing_recognition_ms
+        last_window_wait_ms = $terminal.timing_last_window_wait_ms
+        last_window_inference_ms = $terminal.timing_last_window_inference_ms
+        preparation_ms = $terminal.preparation_ms
+        backend = $terminal.backend
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'exit.json') -Encoding UTF8
     if ($terminal.phase -ne 'Result' -or $terminal.terminal -ne $true) {
         throw "Long-session harness did not reach a complete result; inspect $stdout and $stderr"

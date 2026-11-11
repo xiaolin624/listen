@@ -4,6 +4,7 @@ param(
     [string]$Engine = '',
     [string]$Model = '',
     [string]$VadModel = '',
+    [ValidateSet('host', 'cli')][string]$Backend = 'host',
     [switch]$Hidden,
     [ValidateSet('', 'start', 'stop', 'toggle', 'show', 'quit')][string]$Control = ''
 )
@@ -34,7 +35,7 @@ function ConvertTo-QuotedWindowsPath([string]$Path) {
     # A trailing backslash must be doubled before the closing command-line quote.
     '"' + ([IO.Path]::GetFullPath($Path) -replace '(\\+)$', '$1$1') + '"'
 }
-$launchArguments = @('--engine', (ConvertTo-QuotedWindowsPath $Engine), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--runtime', (ConvertTo-QuotedWindowsPath $Runtime))
+$launchArguments = @('--engine', (ConvertTo-QuotedWindowsPath $Engine), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--runtime', (ConvertTo-QuotedWindowsPath $Runtime), '--backend', $Backend)
 if ($Hidden) { $launchArguments += '--hidden' }
 $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -WindowStyle Hidden -PassThru
 Write-Output "Listen PID: $($process.Id)"
