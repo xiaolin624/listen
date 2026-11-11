@@ -1,5 +1,6 @@
-//! Native editors selected from the real foreground thread's keyboard focus.
-//! No clipboard, keyboard injection, focus changes, or submit patterns are used.
+//! Editors selected from the real foreground thread through UI Automation.
+//! Selection is fixed when capture starts. Output uses only `ValuePattern.SetValue`;
+//! no clipboard, keyboard injection, focus changes, or submit patterns are used.
 
 use crate::{AppResult, Target, TargetSelection};
 use std::{
@@ -9,76 +10,91 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
         Foundation::{HANDLE, HWND},
-        System::Com::{
-            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        System::{
+            Com::{
+                CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+            },
+            Ole::{SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound},
         },
         UI::{
             Accessibility::{
-                CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationElement,
-                IUIAutomationValuePattern, SetWinEventHook, UIA_EditControlTypeId,
-                UIA_ValuePatternId, UnhookWinEvent,
+                CUIAutomation8, HWINEVENTHOOK, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+                IUIAutomationTextPattern, IUIAutomationValuePattern, SetWinEventHook,
+                UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId, UnhookWinEvent,
             },
             WindowsAndMessaging::*,
         },
     },
-    core::{BSTR, PCWSTR},
+    core::{BSTR, Interface, PCWSTR},
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Chromium applies `ValuePattern.SetValue` on its UI thread after the call returns.
+/// Confirmation waits for the new accessible value; the write itself is never repeated.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const CONFIRM_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_ANCESTORS: usize = 64;
 
 pub struct NativeTargets;
 
+/// The foreground window, its root, and the keyboard focus observed when capture started.
+/// UIA is only touched from the dedicated MTA thread that receives this value.
 struct Focus {
-    hwnd: usize,
+    window: usize,
     root: usize,
     process: u32,
     thread: u32,
-    identity: Identity,
+    focus: usize,
+    identity: RootIdentity,
 }
 
 static NEXT_SELECTION: AtomicUsize = AtomicUsize::new(1);
 
-/// A per-selection window property closes the gap before the MTA binds UIA.
-/// A replacement HWND has no matching property, even when its numeric value is reused.
-struct Identity {
+/// A per-selection property on the root window supplements the UIA runtime identity.
+/// It proves that a numerically reused window is not the selected window. A browser's
+/// whole DOM lives under one HWND, so this is never the only identity check.
+struct RootIdentity {
     hwnd: usize,
     name: Vec<u16>,
-    token: usize,
+    token: Option<usize>,
 }
 
-impl Identity {
-    fn stamp(hwnd: HWND) -> AppResult<Self> {
+impl RootIdentity {
+    fn stamp(hwnd: HWND) -> Self {
         let token = NEXT_SELECTION.fetch_add(1, Ordering::Relaxed);
         let name = format!("Listen.NativeTarget.{}.{token}", std::process::id())
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        unsafe {
-            SetPropW(hwnd, PCWSTR(name.as_ptr()), Some(HANDLE(token as *mut _)))
-                .map_err(|e| format!("Cannot prove the selected target's identity: {e}"))?;
-        }
-        Ok(Self {
+        // Cross-process properties can be refused by UIPI. The runtime ID, window
+        // ownership and ancestry checks still identify the focused element in that case.
+        let applied =
+            unsafe { SetPropW(hwnd, PCWSTR(name.as_ptr()), Some(HANDLE(token as *mut _))).is_ok() };
+        Self {
             hwnd: hwnd.0 as usize,
             name,
-            token,
-        })
+            token: applied.then_some(token),
+        }
     }
 
     fn matches(&self) -> bool {
+        let Some(token) = self.token else {
+            return true;
+        };
         unsafe {
-            GetPropW(HWND(self.hwnd as *mut _), PCWSTR(self.name.as_ptr())).0 as usize == self.token
+            GetPropW(HWND(self.hwnd as *mut _), PCWSTR(self.name.as_ptr())).0 as usize == token
         }
     }
 }
 
-impl Drop for Identity {
+impl Drop for RootIdentity {
     fn drop(&mut self) {
-        if self.matches() {
+        if self.token.is_some() && self.matches() {
             // Remove only this selection's property, never a replacement window's data.
             unsafe {
                 let _ = RemovePropW(HWND(self.hwnd as *mut _), PCWSTR(self.name.as_ptr()));
@@ -89,22 +105,25 @@ impl Drop for Identity {
 
 impl TargetSelection for NativeTargets {
     fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
-        let Some(focus) = foreground_edit()? else {
+        let Some(focus) = foreground_focus()? else {
             return Ok(None);
         };
         let (requests, receive) = mpsc::channel();
         let (ready, initialized) = mpsc::channel();
         thread::spawn(move || {
             // UIA objects are created, used and released in this one windowless MTA.
-            let result = NativeEditor::bind(focus);
-            let editor = match result {
-                Ok(editor) => editor,
+            let editor = match NativeEditor::bind(focus) {
+                Ok(Some(editor)) => editor,
+                Ok(None) => {
+                    let _ = ready.send(Ok(None));
+                    return;
+                }
                 Err(error) => {
                     let _ = ready.send(Err(error));
                     return;
                 }
             };
-            if ready.send(Ok(())).is_err() {
+            if ready.send(Ok(Some(()))).is_err() {
                 return;
             }
             loop {
@@ -125,12 +144,17 @@ impl TargetSelection for NativeTargets {
                 }
             }
         });
-        response(initialized)?;
-        Ok(Some(Box::new(NativeTarget { requests })))
+        match response(initialized)? {
+            Some(()) => Ok(Some(Box::new(NativeTarget { requests }))),
+            None => Ok(None),
+        }
     }
 }
 
-fn foreground_edit() -> AppResult<Option<Focus>> {
+/// Reads the actual foreground window and its keyboard focus without changing either.
+/// No control class filter is applied: UIA decides whether the focused element is a
+/// writable editor. The selected foreground window is fixed here and never re-selected.
+fn foreground_focus() -> AppResult<Option<Focus>> {
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.0.is_null() {
@@ -141,6 +165,10 @@ fn foreground_edit() -> AppResult<Option<Focus>> {
         if thread == 0 || process == std::process::id() {
             return Ok(None);
         }
+        let root = GetAncestor(foreground, GA_ROOT);
+        if root.0.is_null() {
+            return Ok(None);
+        }
         let mut info = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
@@ -148,33 +176,26 @@ fn foreground_edit() -> AppResult<Option<Focus>> {
         GetGUIThreadInfo(thread, &mut info)
             .map_err(|e| format!("Cannot inspect the foreground selection: {e}"))?;
         let focus = info.hwndFocus;
-        let root = GetAncestor(foreground, GA_ROOT);
         if focus.0.is_null() || GetAncestor(focus, GA_ROOT) != root {
             return Ok(None);
         }
         let mut focused_process = 0;
         let focused_thread = GetWindowThreadProcessId(focus, Some(&mut focused_process));
-        if focused_process != process || focused_thread != thread {
+        if focused_thread == 0 || focused_process != process {
             return Ok(None);
         }
-        let mut class = [0; 256];
-        let length = GetClassNameW(focus, &mut class) as usize;
-        let class = String::from_utf16_lossy(&class[..length]).to_ascii_lowercase();
-        // These are control capabilities, not application types selected by the user.
-        if class != "edit" && !class.starts_with("richedit") {
-            return Ok(None);
-        }
-        let identity = Identity::stamp(focus)?;
+        let identity = RootIdentity::stamp(root);
         GetGUIThreadInfo(thread, &mut info)
             .map_err(|e| format!("Cannot confirm the foreground selection: {e}"))?;
-        if GetForegroundWindow() != foreground || info.hwndFocus != focus || !identity.matches() {
+        if GetForegroundWindow() != foreground || info.hwndFocus != focus {
             return Ok(None);
         }
         Ok(Some(Focus {
-            hwnd: focus.0 as usize,
+            window: foreground.0 as usize,
             root: root.0 as usize,
             process,
             thread,
+            focus: focus.0 as usize,
             identity,
         }))
     }
@@ -286,17 +307,20 @@ fn pump_events() {
 struct NativeEditor {
     focus: Focus,
     element: IUIAutomationElement,
-    pattern: IUIAutomationValuePattern,
+    value: IUIAutomationValuePattern,
+    text: Option<IUIAutomationTextPattern>,
+    automation: IUIAutomation,
+    runtime_id: Vec<i32>,
     // Field order releases UIA references and the hook before leaving COM.
     _hook: LifetimeHook,
     _com: Com,
 }
 
 impl NativeEditor {
-    fn bind(focus: Focus) -> AppResult<Self> {
+    fn bind(focus: Focus) -> AppResult<Option<Self>> {
         unsafe {
             if !focus.identity.matches() {
-                return Err("The selected target was destroyed before binding".into());
+                return Err("The selected target window was replaced before binding".into());
             }
             CoInitializeEx(None, COINIT_MULTITHREADED)
                 .ok()
@@ -304,7 +328,7 @@ impl NativeEditor {
             let com = Com;
             LIFETIME.with(|state| {
                 state.set(LifetimeState {
-                    target: focus.hwnd,
+                    target: focus.focus,
                     root: focus.root,
                     invalid: false,
                 });
@@ -315,75 +339,180 @@ impl NativeEditor {
                 None,
                 Some(destroyed),
                 focus.process,
-                focus.thread,
+                0,
                 WINEVENT_OUTOFCONTEXT,
             );
             if hook.0.is_null() {
-                return Err("Cannot track the lifetime of the selected native target".into());
+                return Err("Cannot track the lifetime of the selected target".into());
             }
             let hook = LifetimeHook(hook);
-            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-                .map_err(|e| format!("Cannot initialize native target access: {e}"))?;
-            let element = automation
-                .ElementFromHandle(HWND(focus.hwnd as *mut _))
-                .map_err(|e| format!("Cannot bind the selected native editor: {e}"))?;
-            let pattern = element
-                .GetCurrentPatternAs(UIA_ValuePatternId)
-                .map_err(|e| format!("The selected editor has no supported value writer: {e}"))?;
+            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_ALL)
+                .map_err(|e| format!("Cannot initialize target access: {e}"))?;
+            // UIA pattern methods set focus by default. Listen must not move focus away
+            // from whatever the user selected or typed into after capture started.
+            let automation2: IUIAutomation2 = automation
+                .cast()
+                .map_err(|e| format!("Cannot configure target access: {e}"))?;
+            automation2
+                .SetAutoSetFocus(false)
+                .map_err(|e| format!("Cannot configure target access: {e}"))?;
+
+            // The selection is only valid while the same foreground thread still owns
+            // keyboard focus. A later window/focus change never re-selects a target.
+            if GetForegroundWindow() != HWND(focus.window as *mut _) {
+                return Ok(None);
+            }
+            let mut info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            GetGUIThreadInfo(focus.thread, &mut info)
+                .map_err(|e| format!("Cannot confirm the selected target: {e}"))?;
+            if info.hwndFocus != HWND(focus.focus as *mut _)
+                || GetAncestor(info.hwndFocus, GA_ROOT) != HWND(focus.root as *mut _)
+            {
+                return Ok(None);
+            }
+
+            let element = match automation.GetFocusedElement() {
+                Ok(element) => element,
+                Err(_) => return Ok(None),
+            };
+            if element.CurrentProcessId().map_err(|e| e.to_string())? as u32 != focus.process {
+                return Ok(None);
+            }
+            if element.CurrentControlType().map_err(|e| e.to_string())? != UIA_EditControlTypeId {
+                // A focused document, button, address bar or other control is not an
+                // automatically writable editor; it must fall back to the copy box.
+                return Ok(None);
+            }
+            belongs_to_root(&automation, &element, &focus)?;
+            let value = match element.GetCurrentPatternAs(UIA_ValuePatternId) {
+                Ok(pattern) => pattern,
+                Err(error) => {
+                    return Err(format!(
+                        "The selected editor has no supported value writer: {error}"
+                    ));
+                }
+            };
+            let text = element.GetCurrentPatternAs(UIA_TextPatternId).ok();
+            let runtime_id = runtime_id(&element)?;
             let editor = Self {
                 focus,
                 element,
-                pattern,
+                value,
+                text,
+                automation,
+                runtime_id,
                 _hook: hook,
                 _com: com,
             };
             editor.validate()?;
-            Ok(editor)
+            Ok(Some(editor))
         }
     }
 
     fn validate(&self) -> AppResult<()> {
         pump_events();
-        if LIFETIME.with(|state| state.get().invalid) || !self.focus.identity.matches() {
+        if LIFETIME.with(|state| state.get().invalid) {
             return Err(
                 "The original target was destroyed; replacement controls are not used".into(),
             );
         }
+        if !self.focus.identity.matches() {
+            return Err(
+                "The original target window was replaced; replacement controls are not used".into(),
+            );
+        }
         unsafe {
-            let hwnd = HWND(self.focus.hwnd as *mut _);
+            let root = HWND(self.focus.root as *mut _);
             let mut process = 0;
-            let thread = GetWindowThreadProcessId(hwnd, Some(&mut process));
-            if !IsWindow(Some(hwnd)).as_bool()
-                || process != self.focus.process
+            let thread = GetWindowThreadProcessId(root, Some(&mut process));
+            if !IsWindow(Some(root)).as_bool()
                 || thread != self.focus.thread
+                || process != self.focus.process
             {
-                return Err("The original target is no longer available".into());
+                return Err("The original target window is no longer available".into());
             }
-            let result = (|| -> windows::core::Result<bool> {
-                Ok(self.element.CurrentNativeWindowHandle()? == hwnd
-                    && self.element.CurrentProcessId()? as u32 == self.focus.process
-                    && self.element.CurrentControlType()? == UIA_EditControlTypeId
-                    && self.element.CurrentIsEnabled()?.as_bool()
-                    && !self.element.CurrentIsPassword()?.as_bool()
-                    && !self.pattern.CurrentIsReadOnly()?.as_bool())
-            })();
-            match result {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    Err("The original target is not an enabled writable native editor".into())
-                }
-                Err(error) => Err(format!("Cannot validate the original target: {error}")),
+            let focus = HWND(self.focus.focus as *mut _);
+            let mut focused_process = 0;
+            let focused_thread = GetWindowThreadProcessId(focus, Some(&mut focused_process));
+            if !IsWindow(Some(focus)).as_bool()
+                || focused_thread == 0
+                || focused_process != self.focus.process
+            {
+                return Err(
+                    "The original target was destroyed; replacement controls are not used".into(),
+                );
             }
         }
+        let observed = runtime_id(&self.element)
+            .map_err(|_| "The original target is no longer available".to_string())?;
+        if observed != self.runtime_id {
+            return Err(
+                "The original target was rebuilt; replacement controls are not used".into(),
+            );
+        }
+        let state = unsafe {
+            let control_type = self
+                .element
+                .CurrentControlType()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?;
+            let enabled = self
+                .element
+                .CurrentIsEnabled()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool();
+            let password = self
+                .element
+                .CurrentIsPassword()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool();
+            let read_only = self
+                .value
+                .CurrentIsReadOnly()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                .as_bool();
+            let process = self
+                .element
+                .CurrentProcessId()
+                .map_err(|e| format!("Cannot validate the original target: {e}"))?
+                as u32;
+            (
+                control_type == UIA_EditControlTypeId,
+                enabled,
+                password,
+                read_only,
+                process,
+            )
+        };
+        let (editable, enabled, password, read_only, process) = state;
+        if !editable || !enabled || password || read_only || process != self.focus.process {
+            return Err("The original target is not an enabled writable editor".into());
+        }
+        belongs_to_root(&self.automation, &self.element, &self.focus)
     }
 
     fn content(&self) -> AppResult<String> {
         self.validate()?;
         unsafe {
-            self.pattern
-                .CurrentValue()
-                .map(|value| value.to_string())
-                .map_err(|e| format!("Cannot read the latest target draft: {e}"))
+            match self.value.CurrentValue() {
+                Ok(value) => Ok(value.to_string()),
+                Err(value_error) => {
+                    let Some(text) = &self.text else {
+                        return Err(format!(
+                            "Cannot read the latest target draft: {value_error}"
+                        ));
+                    };
+                    let range = text
+                        .DocumentRange()
+                        .map_err(|e| format!("Cannot read the latest target draft: {e}"))?;
+                    range
+                        .GetText(-1)
+                        .map(|value| value.to_string())
+                        .map_err(|e| format!("Cannot read the latest target draft: {e}"))
+                }
+            }
         }
     }
 
@@ -396,14 +525,92 @@ impl NativeEditor {
         let normalized = replacement.replace("\r\n", "\n").replace('\n', "\r\n");
         self.validate()?;
         unsafe {
-            self.pattern
+            self.value
                 .SetValue(&BSTR::from(normalized.as_str()))
                 .map_err(|e| format!("Target output failed or is unconfirmed: {e}"))?;
         }
-        let observed = self.content()?;
-        if observed.replace("\r\n", "\n") != replacement.replace("\r\n", "\n") {
-            return Err("The complete target output could not be confirmed".into());
+        let expected = replacement.replace("\r\n", "\n");
+        let deadline = Instant::now() + CONFIRM_TIMEOUT;
+        loop {
+            let observed = self.content()?.replace("\r\n", "\n");
+            if observed == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("The complete target output could not be confirmed".into());
+            }
+            thread::sleep(CONFIRM_INTERVAL);
         }
-        Ok(())
+    }
+}
+
+/// Confirms that the focused element lives inside the window selected at capture start.
+/// Chromium exposes page editors without a native window handle, so the nearest ancestor
+/// window is checked instead of relying on the HWND that hosts the whole page.
+fn belongs_to_root(
+    automation: &IUIAutomation,
+    element: &IUIAutomationElement,
+    focus: &Focus,
+) -> AppResult<()> {
+    unsafe {
+        let walker = automation
+            .ControlViewWalker()
+            .map_err(|e| format!("Cannot inspect the selected target: {e}"))?;
+        let mut current = element.clone();
+        for _ in 0..MAX_ANCESTORS {
+            match current.CurrentNativeWindowHandle() {
+                Ok(hwnd) if !hwnd.0.is_null() => {
+                    let mut process = 0;
+                    let thread = GetWindowThreadProcessId(hwnd, Some(&mut process));
+                    if thread == 0 || !IsWindow(Some(hwnd)).as_bool() {
+                        return Err("The original target window is no longer available".into());
+                    }
+                    if process != focus.process
+                        || GetAncestor(hwnd, GA_ROOT) != HWND(focus.root as *mut _)
+                    {
+                        return Err(
+                            "The selected editor no longer belongs to the foreground window".into(),
+                        );
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+            match walker.GetParentElement(&current) {
+                Ok(parent) => current = parent,
+                Err(_) => break,
+            }
+        }
+    }
+    Err("Cannot confirm that the selected editor belongs to the foreground window".into())
+}
+
+/// UIA runtime IDs identify a live element, not a window whose native handle value may be
+/// reused. The provider hands out a one-dimensional SAFEARRAY of integers per element.
+fn runtime_id(element: &IUIAutomationElement) -> AppResult<Vec<i32>> {
+    unsafe {
+        let array = element
+            .GetRuntimeId()
+            .map_err(|e| format!("Cannot identify the selected editor: {e}"))?;
+        if array.is_null() {
+            return Err("The selected editor has no runtime identity".into());
+        }
+        let result = (|| -> windows::core::Result<Vec<i32>> {
+            let lower = SafeArrayGetLBound(array, 1)?;
+            let upper = SafeArrayGetUBound(array, 1)?;
+            let mut values = Vec::new();
+            for index in lower..=upper {
+                let mut value = 0_i32;
+                SafeArrayGetElement(array, &index, &mut value as *mut _ as *mut _)?;
+                values.push(value);
+            }
+            Ok(values)
+        })();
+        let _ = SafeArrayDestroy(array);
+        let values = result.map_err(|e| format!("Cannot identify the selected editor: {e}"))?;
+        if values.is_empty() {
+            return Err("The selected editor has no runtime identity".into());
+        }
+        Ok(values)
     }
 }
