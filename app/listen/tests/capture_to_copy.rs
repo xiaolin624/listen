@@ -121,6 +121,74 @@ fn hotkey_start_stop_delivers_complete_copyable_current_result_and_removes_tempo
     );
 }
 
+struct NoSpeechModel;
+impl LocalTranscriber for NoSpeechModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, _audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        Ok(" \r\n\t".into())
+    }
+}
+
+#[test]
+fn no_valid_speech_reports_no_speech_and_keeps_the_previous_copyable_result() {
+    let runtime = Runtime::new();
+    let previous = "原来的完整转写。\nReview the API response before sending.";
+    fs::write(runtime.0.join("current-result.txt"), previous).unwrap();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.snapshot().phase == Phase::Processing {
+        assert!(Instant::now() < deadline);
+        app.poll();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let result = app.snapshot();
+    assert_eq!(result.phase, Phase::NoSpeech);
+    assert!(result.detail.contains("No valid speech"), "{result:?}");
+    assert_eq!(result.text, previous);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        previous
+    );
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        !fs::read_dir(&runtime.0)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_dir()),
+        "successful no-speech recognition must clean its audio"
+    );
+    app.dispatch(Control::Stop);
+    assert_eq!(app.snapshot().text, previous);
+}
+
+#[test]
+fn no_speech_without_a_previous_result_leaves_the_fallback_empty_and_allows_another_capture() {
+    let runtime = Runtime::new();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::NoSpeech);
+    assert!(result.text.is_empty());
+    assert!(!runtime.0.join("current-result.txt").exists());
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    app.dispatch(Control::Toggle);
+    assert!(await_phase(&mut app, Phase::NoSpeech).text.is_empty());
+}
+
 struct FailedModel;
 impl LocalTranscriber for FailedModel {
     fn check_ready(&self) -> AppResult<()> {
@@ -403,6 +471,31 @@ fn hotkey_binds_original_editor_and_appends_complete_result_to_its_latest_draft(
         result.text,
         "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
     );
+}
+
+#[test]
+fn no_speech_never_appends_empty_lines_or_generated_text_to_a_bound_target() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: Some(0),
+        drafts: ["原有草稿".into(), "另一个输入框".into()],
+        available: [true; 2],
+        unconfirmed: false,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+    app.dispatch(Control::Start);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Stop);
+    let result = await_phase(&mut app, Phase::NoSpeech);
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "另一个输入框"]);
+    assert_eq!(result.delivery, None);
+    assert!(result.text.is_empty());
 }
 
 #[test]

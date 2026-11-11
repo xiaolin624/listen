@@ -1,0 +1,1249 @@
+{
+  "recorded_on": "2026-11-11",
+  "scope": "offline synthetic WAV comparison; not real WASAPI capture or meeting accuracy",
+  "engine_version": "whisper.cpp v1.8.2 CPU",
+  "engine_sha256": "dc1648751878e91acb5cfaa69bd85cff64ede44497a108844ad9d4f106cb14e8",
+  "vad_cli_sha256": "92ddb93ad372210519ec02184037f4e4e986c6a88a1a0d0f78524becf58c56cf",
+  "voices": {
+    "zh-CN": "Microsoft Huihui Desktop",
+    "en-US": "Microsoft Zira Desktop"
+  },
+  "models": {
+    "base": {
+      "file": "ggml-base.bin",
+      "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+      "bytes": 147951465
+    },
+    "small": {
+      "file": "ggml-small.bin",
+      "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+      "bytes": 487601967
+    },
+    "vad": {
+      "file": "ggml-silero-v5.1.2.bin",
+      "sha256": "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+      "bytes": 885098
+    }
+  },
+  "selected_default": {
+    "model": "ggml-small.bin",
+    "vad_model": "ggml-silero-v5.1.2.bin",
+    "language": "zh",
+    "threads": 6,
+    "decoder": [
+      "-ng",
+      "-bs",
+      "5",
+      "-bo",
+      "5",
+      "-tp",
+      "0",
+      "-tpi",
+      "0.2",
+      "-nth",
+      "0.6",
+      "-lpt",
+      "-1",
+      "-et",
+      "2.4",
+      "-nt",
+      "-otxt"
+    ],
+    "vad_presence_only": [
+      "-vt",
+      "0.5",
+      "-vp",
+      "30",
+      "-vo",
+      "0.1",
+      "-np"
+    ],
+    "chinese_output": "preserve original decoder script; no semantic correction or summary",
+    "prompt": null
+  },
+  "samples": [
+    {
+      "id": "mandarin",
+      "kind": "speech",
+      "reference": "这段语音只在本机处理，不会上传到云端。请保留完整的发言内容，由我检查以后手动发送。",
+      "sha256": "24c9e42cefdee60ed47709bcca5b0910eda07745b132ceddb913d73f0fee0520",
+      "audio_seconds": 10.795
+    },
+    {
+      "id": "mixed-technical",
+      "kind": "speech",
+      "reference": "我们用 Rust 实现音频采集，通过 WASAPI loopback 获取声音。模型在本机运行，使用 CPU 和 CUDA 进行对照。",
+      "sha256": "ae41cf44c8c9bde78949757abaf103d2e0d7c02e9b963270dfa594fb7fa55e40",
+      "audio_seconds": 19.215
+    },
+    {
+      "id": "english-numbers",
+      "kind": "speech",
+      "reference": "The API uses Rust, Windows, Whisper, CPU and GPU. Version one point eight point two. Port eight zero eight zero. Retry three times, then wait two seconds.",
+      "sha256": "ece5856fdcaeced16b284652cd1260a28146015810008334cc904e1507696ca0",
+      "audio_seconds": 14.01
+    },
+    {
+      "id": "homophones",
+      "kind": "speech",
+      "reference": "请确认本机的音频设置。本季的项目已经完成。不要把本机写成本季。",
+      "sha256": "b2a3bbf80fbe4144e3d59c6388a77c2a27b030f6838fee77ff17b81e2c1468c7",
+      "audio_seconds": 8.695
+    },
+    {
+      "id": "multiline",
+      "kind": "speech",
+      "reference": "第一段，保留原来的草稿，不要自动发送。\nSecond line: review the API response.\n第三段，端口是八零八零，重试三次，等待两秒。",
+      "sha256": "39605efac4d64a03fa8b524da9fe4ccce5656862a885641db0bead33b4d6b950",
+      "audio_seconds": 15.325
+    },
+    {
+      "id": "silence",
+      "kind": "silence",
+      "reference": "",
+      "sha256": "190415015d40eef0cd797e1b59ffe00846b01873050b12d44b3a216de3faa2a9",
+      "audio_seconds": 8.0
+    },
+    {
+      "id": "instrumental",
+      "kind": "instrumental",
+      "reference": "",
+      "sha256": "6bf32c8534e00e5a43467ca01496bba88682aaabfca519b11b3a0cf4a70859c9",
+      "audio_seconds": 12.0
+    },
+    {
+      "id": "notification",
+      "kind": "notification",
+      "reference": "",
+      "sha256": "c476f426d116791fe6e9218a544565ad0feac6379e66615762d010a83abfe801",
+      "audio_seconds": 8.0
+    }
+  ],
+  "measurements": [
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 2.116,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "mixed-technical",
+      "transcript": "我們用:RUST 實現音頻採集通過或取聲音:模型在本金運行使用:CPU 合Cuda 進行對照",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 2.088,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.48080.Retry 3 times, then wait 2 seconds.",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 2.076,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 2.174,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 2.194,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "silence",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.047,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "instrumental",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.06,
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "profile": "selected",
+      "sample": "notification",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.049,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 6.536,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "mixed-technical",
+      "transcript": "我们用\"Rust\"实现音频采集 通过\"Waze up high loop back\"获取声音模型在本纪运行 使用\"CPU\"和\"Cuda\"进行对照",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 6.987,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.Port 8080.Retry 3 times, then wait 2 seconds.",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 7.617,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 7.363,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第二段,覆蓋 API 回應。第三段,端口是 8080,重視三次,等待兩秒。",
+      "speech_detected": true,
+      "wall_seconds_including_model_load": 7.901,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "silence",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.062,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "instrumental",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.067,
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "profile": "selected",
+      "sample": "notification",
+      "transcript": "",
+      "speech_detected": false,
+      "wall_seconds_including_model_load": 0.054,
+      "decode_error": null
+    }
+  ],
+  "other_experiments": [
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "mixed-technical",
+      "transcript": "我們用:RUST 實現音頻採集通過或取聲音:模型在本金運行使用:CPU 合Cuda 進行對照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.48080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "silence",
+      "transcript": "你不要再想我了",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "instrumental",
+      "transcript": "(字幕:J Chong)",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "baseline",
+      "sample": "notification",
+      "transcript": "(字幕:J Chong)",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "mixed-technical",
+      "transcript": "我们用《rust》实现音频采集通过《ways up i loop back》或取声音《模型》在本季运行使用《CPU》和《Cuda》进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.48080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "silence",
+      "transcript": "我以为你疯了我以为你疯了我以为你疯了",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "instrumental",
+      "transcript": "宝贝",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "notification",
+      "transcript": "貓子",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "mixed-technical",
+      "transcript": "我们用《rust》实现音频采集通过《ways up i loop back》或取声音《模型》在本季运行使用《CPU》和《Cuda》进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.48080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "silence",
+      "transcript": "我以为你疯了我以为你疯了我以为你疯了",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "instrumental",
+      "transcript": "宝贝",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "strict-no-speech",
+      "sample": "notification",
+      "transcript": "貓子",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "mandarin",
+      "transcript": "这段语音只在本基处理不会上传道云端。请保留完整的发言内容,由我检查以后手动发送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "mixed-technical",
+      "transcript": "我们用RUST 实现音频采疾通过或取声音模型在本金运行使用CPU 合Cuda 进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU. Version 1.8.2. Port 8080. Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "homophones",
+      "transcript": "请确认本季的音频设置本季的项目已经完成不要把本季写成本季",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "multiline",
+      "transcript": "第一段保留原来的草稿不要自动发送第3段 端口是8080 重视3次等待2秒",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "silence",
+      "transcript": "《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《《",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "instrumental",
+      "transcript": "词字幕作曲",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": false,
+      "profile": "simplified-prompt",
+      "sample": "notification",
+      "transcript": "祝福",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理不會上傳導雲端,請保留完整的發言內容,由我檢查以後首動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "mixed-technical",
+      "transcript": "RUST 实现音频采集通过或许声音模型在本金运行使用CPU 可Cuda 进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "english-numbers",
+      "transcript": "the API uses Rust, Windows, Whisper, CPU, and GPU.version 1.8.2.48080.3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "homophones",
+      "transcript": "请确认本期的音频设置,本期的项目已经完成,不要把本期写成本期。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "multiline",
+      "transcript": "第一段保留原來的草稿不要自動發送第3段 端口是8080 重視3次等待2秒",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-baseline",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理不會上傳導雲端,請保留完整的發言內容,由我檢查以後首動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "mixed-technical",
+      "transcript": "我們用。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "english-numbers",
+      "transcript": "the API uses Rust, Windows, Whisper, CPU, and GPU.version 1.8.2.48080.3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "homophones",
+      "transcript": "请确认本期的音频设置,本期的项目已经完成,不要把本期写成本期。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "multiline",
+      "transcript": "第一段保留原來的草稿不要自動發送第3段 端口是8080 重視3次等待2秒",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-vad",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "vad-no-fallback",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "mixed-technical",
+      "transcript": "我們用:RUST 實現音頻採集通過或取聲音:模型在本金運行使用:CPU 合Cuda 進行對照",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU. Version 1.8.2. Port 8080. Retry 3 times. Then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "silence",
+      "transcript": "you",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "instrumental",
+      "transcript": "[Music]",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "notification",
+      "transcript": "(bells chiming)",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-decode",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "greedy",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本基處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "mixed-technical",
+      "transcript": "Rust, 实现音频采集,通过,或取声音,模型在本金运行,使用, CPU, 和, CUDA,进行对照,",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "english-numbers",
+      "transcript": "The API uses RUST, Windows, Whisper, CPU, and GPU.Version 1.8.2.48080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第三段,端口是8080,重視3次,等待2秒。",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "silence",
+      "transcript": "字幕:J Chong",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "instrumental",
+      "transcript": "CAPI loopback, CPU, CUDA, API, Windows, Whisper.",
+      "decode_error": null
+    },
+    {
+      "model": "base",
+      "artifact_folder": "cpu-technical",
+      "gate": false,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "notification",
+      "transcript": "Rust, WASAPI loopback, CPU, CUDA, API, Windows, Whisper.",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "mixed-technical",
+      "transcript": "我们用\"Rust\"实现音频采集 通过\"Waze up high loop back\"获取声音模型在本纪运行 使用\"CPU\"和\"Cuda\"进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU and GPU. version 1.8.2 port 8080 retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第二段,覆蓋 API 回應。第三段,端口是 8080,重視三次,等待兩秒。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-gate",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "auto",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "mixed-technical",
+      "transcript": "我们用\"Rust\"实现音频采集 通过\"Waze up high loop back\"获取声音模型在本纪运行 使用\"CPU\"和\"Cuda\"进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.Port 8080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第二段,覆蓋 API 回應。第三段,端口是 8080,重視三次,等待兩秒。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-context",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "mixed-technical",
+      "transcript": "我们用Rust实现音频采集,通过或取声音模型在本纪运行,使用和进行对照",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.Port 8080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "homophones",
+      "transcript": "请确认本机的音频设置。本机的项目已经完成。不要把本机写成本机。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "multiline",
+      "transcript": "第一段,保留原來的草稿,不要自動發送。第二段,覆蓄 API response。第三段,端口是8080,重視三次,等待兩秒。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "no-fallback",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "mandarin",
+      "transcript": "這段語音只在本機處理,不會上傳到雲端。請保留完整的發言內容,由我檢查以後手動發送。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "mixed-technical",
+      "transcript": "我們用Rust實現音頻採集,通過 WASAPI loopback獲取聲音模型在本機運行,使用CPU和 CUDA進行對照",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "english-numbers",
+      "transcript": "The API uses Rust, Windows, Whisper, CPU, and GPU.Version 1.8.2.Port 8080.Retry 3 times, then wait 2 seconds.",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "homophones",
+      "transcript": "请确认本级的音频设置。本级的项目已经完成。不要把本级写成本级。",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "multiline",
+      "transcript": "第一段,保留原来的草稿,不要自动发送第二段,Review the API response第三段,端口是8080,重视三次,等待两秒",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "silence",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "instrumental",
+      "transcript": "",
+      "decode_error": null
+    },
+    {
+      "model": "small",
+      "artifact_folder": "small-cpu-decode",
+      "gate": true,
+      "chinese_prompt_argument_encoding_verified": null,
+      "profile": "technical-vocabulary",
+      "sample": "notification",
+      "transcript": "",
+      "decode_error": null
+    }
+  ],
+  "real_capture_acceptance": "not run in this implementation worktree",
+  "additional_failures": [
+    {
+      "profile": "base-greedy",
+      "sample": "mixed-technical",
+      "artifact": "quality-issue-9/cpu-decode/greedy-mixed-technical.txt",
+      "failure": "invalid UTF-8; initial experiment stopped rather than deliver damaged text"
+    }
+  ]
+}
