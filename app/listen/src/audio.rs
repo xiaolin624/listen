@@ -207,7 +207,8 @@ fn capture_error(
     error: &windows::core::Error,
 ) -> String {
     let reason = if error.code() == AUDCLNT_E_DEVICE_INVALIDATED {
-        "was removed or became invalid (AUDCLNT_E_DEVICE_INVALIDATED)".to_string()
+        "was removed, became invalid, or the default route changed (AUDCLNT_E_DEVICE_INVALIDATED)"
+            .to_string()
     } else if error.code() == AUDCLNT_E_SERVICE_NOT_RUNNING {
         "lost the Windows audio service (AUDCLNT_E_SERVICE_NOT_RUNNING)".to_string()
     } else {
@@ -382,7 +383,7 @@ fn capture(
                             "The default multimedia render endpoint changed during capture but the new endpoint could not be identified ({error}); capture stopped; received audio is retained and this capture is incomplete."
                         )
                     })?;
-                    if current.id != endpoint.id {
+                    if !current.id.eq_ignore_ascii_case(&endpoint.id) {
                         return Err(route_changed_message(&endpoint, &current));
                     }
                 }
