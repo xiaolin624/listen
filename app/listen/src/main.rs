@@ -2,7 +2,10 @@
 
 mod gui;
 
-use listen::{audio::WasapiPlayback, whisper::Whisper};
+use listen::{
+    audio::WasapiPlayback,
+    whisper::{Backend, Whisper},
+};
 use std::{env, path::PathBuf};
 
 pub struct Config {
@@ -13,6 +16,7 @@ pub struct Config {
     language: String,
     threads: usize,
     hidden: bool,
+    backend: Backend,
 }
 
 enum LaunchAction {
@@ -21,7 +25,7 @@ enum LaunchAction {
     Help,
 }
 
-const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.\nOnly that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nThe engine package must include vad-speech-segments.exe.\nControl running application: --control <start|stop|toggle|retry|cleanup|show|quit>\nRetry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.\nResults are copyable in the application. Messages are never sent automatically.";
+const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.\nOnly that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --backend <host|cli> --hidden\n--backend host (default) loads the same model once in this process and decodes each window in a fresh state; if that is unavailable Listen falls back to the whisper.cpp CLI and says so. --backend cli keeps one CLI process per window.\nThe engine package must include vad-speech-segments.exe. No cloud service is used.\nControl running application: --control <start|stop|toggle|retry|cleanup|show|quit>\nRetry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.\nResults are copyable in the application. Messages are never sent automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
@@ -38,6 +42,7 @@ fn parse() -> Result<LaunchAction, String> {
         language: "zh".into(),
         threads: 6,
         hidden: false,
+        backend: Backend::ModelHost,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -63,6 +68,13 @@ fn parse() -> Result<LaunchAction, String> {
             "--vad-model" => config.vad_model = PathBuf::from(value),
             "--runtime" => config.runtime = PathBuf::from(value),
             "--language" => config.language = value,
+            "--backend" => {
+                config.backend = match value.as_str() {
+                    "host" => Backend::ModelHost,
+                    "cli" => Backend::Cli,
+                    _ => return Err("--backend must be host or cli".into()),
+                };
+            }
             "--threads" => {
                 config.threads = value
                     .parse()

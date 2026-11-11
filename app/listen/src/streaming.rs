@@ -12,6 +12,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 pub const SAMPLE_RATE: u64 = 16_000;
@@ -79,6 +80,21 @@ struct AudioSegment {
     samples: usize,
     overlap_samples: usize,
     final_segment: bool,
+    queued_at: Instant,
+}
+
+/// Timing for the last recognition window the worker actually decoded. The wait
+/// is the time the window sat in the bounded queue; inference is the local
+/// decoder call. Together they separate backlog from the final window's work.
+pub(crate) struct RecognitionTiming {
+    pub wait_ms: u64,
+    pub inference_ms: u64,
+    pub windows: usize,
+}
+
+pub(crate) struct RecognitionOutcome {
+    pub text: String,
+    pub timing: RecognitionTiming,
 }
 
 pub struct SegmentStream {
@@ -240,6 +256,7 @@ impl SegmentedAudioWriter {
             samples: self.samples,
             overlap_samples: self.config.overlap_samples,
             final_segment,
+            queued_at: Instant::now(),
         };
         let pending = self.progress.pending.fetch_add(1, Ordering::Relaxed) + 1;
         self.progress
@@ -372,7 +389,7 @@ fn merge_segments(directory: &Path, segments: &[PathBuf]) -> AppResult<PathBuf> 
 
 pub(crate) struct RecognitionWorker {
     pub progress: Arc<Progress>,
-    worker: JoinHandle<AppResult<String>>,
+    worker: JoinHandle<AppResult<RecognitionOutcome>>,
 }
 impl RecognitionWorker {
     pub fn start(
@@ -408,7 +425,7 @@ impl RecognitionWorker {
         });
         Self { progress, worker }
     }
-    pub fn finish(self) -> AppResult<String> {
+    pub fn finish(self) -> AppResult<RecognitionOutcome> {
         self.worker.join().map_err(|_| {
             "Local segment recognition worker panicked; received audio and checkpoint retained"
                 .to_string()
@@ -420,12 +437,22 @@ fn recognize(
     stream: SegmentStream,
     transcriber: Arc<dyn LocalTranscriber>,
     directory: PathBuf,
-) -> AppResult<String> {
+) -> AppResult<RecognitionOutcome> {
     let mut committed = String::new();
     let mut tail = String::new();
+    let mut last_timing = RecognitionTiming {
+        wait_ms: 0,
+        inference_ms: 0,
+        windows: 0,
+    };
     while let Ok(segment) = stream.receiver.recv() {
+        let wait_ms = segment.queued_at.elapsed().as_millis() as u64;
         let workspace = segment.audio.path.parent().unwrap();
+        let started = Instant::now();
         let spans = transcriber.transcribe_segment(&segment.audio, workspace)?;
+        last_timing.wait_ms = wait_ms;
+        last_timing.inference_ms = started.elapsed().as_millis() as u64;
+        last_timing.windows += 1;
         // Overlapped windows share ownership at the middle of the overlap. Hold the
         // latest trailing half until another window arrives or capture actually stops.
         let begin = if segment.start_sample == 0 {
@@ -474,5 +501,8 @@ fn recognize(
         stream.progress.recognized.fetch_add(1, Ordering::Relaxed);
     }
     committed.push_str(&tail);
-    Ok(committed.trim().into())
+    Ok(RecognitionOutcome {
+        text: committed.trim().into(),
+        timing: last_timing,
+    })
 }

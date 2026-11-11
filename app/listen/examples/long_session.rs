@@ -133,6 +133,12 @@ impl LocalTranscriber for DelayedModel {
     fn check_ready(&self) -> AppResult<()> {
         self.inner.check_ready()
     }
+    fn prepare(&self) -> Option<std::sync::mpsc::Receiver<AppResult<String>>> {
+        self.inner.prepare()
+    }
+    fn backend_note(&self) -> Option<String> {
+        self.inner.backend_note()
+    }
     fn transcribe(&self, audio: &CapturedAudio, directory: &Path) -> AppResult<String> {
         thread::sleep(self.delay);
         self.inner.transcribe(audio, directory)
@@ -157,12 +163,13 @@ fn run() -> AppResult<()> {
     let mut delay_ms = 0u64;
     let mut threads = 6usize;
     let mut interval = 5.0f64;
+    let mut backend = listen::whisper::Backend::ModelHost;
     let mut config = SegmentConfig::default();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "long_session --input <16k-mono-PCM16.wav> --runtime <directory> --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
+                "long_session --input <16k-mono-PCM16.wav> --runtime <directory> --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--backend host|cli] [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
             );
             return Ok(());
         }
@@ -175,6 +182,13 @@ fn run() -> AppResult<()> {
             "--engine" => engine = Some(PathBuf::from(value)),
             "--model" => model = Some(PathBuf::from(value)),
             "--vad-model" => vad_model = Some(PathBuf::from(value)),
+            "--backend" => {
+                backend = match value.as_str() {
+                    "host" => listen::whisper::Backend::ModelHost,
+                    "cli" => listen::whisper::Backend::Cli,
+                    _ => return Err("--backend must be host or cli".into()),
+                }
+            }
             "--seconds" => seconds = value.parse().map_err(|_| "Invalid --seconds")?,
             "--threads" => threads = value.parse().map_err(|_| "Invalid --threads")?,
             "--delay-ms" => delay_ms = value.parse().map_err(|_| "Invalid --delay-ms")?,
@@ -204,16 +218,43 @@ fn run() -> AppResult<()> {
         config,
     };
     let transcriber = DelayedModel {
-        inner: Whisper {
-            executable: engine.ok_or("--engine is required")?,
-            model: model.ok_or("--model is required")?,
-            vad_model: vad_model.ok_or("--vad-model is required")?,
-            language: "zh".into(),
+        inner: Whisper::with_backend(
+            engine.ok_or("--engine is required")?,
+            model.ok_or("--model is required")?,
+            vad_model.ok_or("--vad-model is required")?,
+            "zh".into(),
             threads,
-        },
+            backend,
+        ),
         delay: Duration::from_millis(delay_ms),
     };
     let mut app = Application::new(Arc::new(tape), Arc::new(transcriber), runtime, Ok(()));
+    // First-use preparation is deliberately not reported as Ready. The harness
+    // waits for the same state the GUI shows before it starts a capture.
+    let preparation_started = Instant::now();
+    loop {
+        app.poll();
+        let state = app.snapshot();
+        if state.phase != Phase::Preparing {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "phase": format!("{:?}", state.phase),
+                    "preparation_ms": state.timing.preparation_ms,
+                    "backend": state.backend,
+                    "detail": state.detail,
+                })
+            );
+            if state.phase == Phase::Failure {
+                return Err("Local model preparation failed; inspect the JSON record".into());
+            }
+            break;
+        }
+        if preparation_started.elapsed() > Duration::from_secs(120) {
+            return Err("Local model preparation did not finish within 120 seconds".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     let start = Instant::now();
     let mut stopped = None;
     let mut next_report = Duration::ZERO;
@@ -228,7 +269,10 @@ fn run() -> AppResult<()> {
         if state.phase == Phase::Processing && stopped.is_none() {
             stopped = Some(Instant::now());
         }
-        let terminal = !matches!(state.phase, Phase::Capturing | Phase::Processing);
+        let terminal = matches!(
+            state.phase,
+            Phase::Result | Phase::NoSpeech | Phase::Failure
+        );
         if start.elapsed() >= next_report || terminal {
             println!(
                 "{}",
@@ -245,6 +289,16 @@ fn run() -> AppResult<()> {
                     "terminal": terminal, "result_characters": state.text.chars().count(),
                     "detail": state.detail,
                     "retained_audio": state.retained_audio,
+                    "backend": state.backend,
+                    "preparation_ms": state.timing.preparation_ms,
+                    "timing_stop_to_result_ms": state.timing.stop_to_result_ms,
+                    "timing_finalize_ms": state.timing.finalize_ms,
+                    "timing_recognition_ms": state.timing.recognition_ms,
+                    "timing_last_window_wait_ms": state.timing.last_window_wait_ms,
+                    "timing_last_window_inference_ms": state.timing.last_window_inference_ms,
+                    "timing_save_ms": state.timing.save_ms,
+                    "timing_delivery_ms": state.timing.delivery_ms,
+                    "timing_recognition_windows": state.timing.recognition_windows,
                 })
             );
             next_report = start.elapsed() + Duration::from_secs_f64(interval);

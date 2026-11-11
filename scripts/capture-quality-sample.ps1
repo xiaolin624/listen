@@ -21,12 +21,23 @@ $Runtime = [IO.Path]::GetFullPath($Runtime)
 $statusPath = Join-Path $Runtime 'status.txt'
 $resultPath = Join-Path $Runtime 'current-result.txt'
 if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) { throw "Running Listen must use this runtime: $Runtime" }
-$initialStatus = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8
+$initialStatus = [IO.File]::ReadAllText($statusPath)
 if ($initialStatus -notmatch '(?m)^process_id=(\d+)\r?$') { throw 'Rebuild and start Listen so this runtime identifies its live process.' }
 $listenProcess = Get-Process -Id ([int]$Matches[1]) -ErrorAction Stop
 $expectedBinary = [IO.Path]::GetFullPath((Join-Path $projectRoot 'app\listen\target\release\listen.exe'))
 if ($listenProcess.ProcessName -ne 'listen' -or $listenProcess.Path -ine $expectedBinary) { throw 'The runtime belongs to a different process or build.' }
 if ($initialStatus -match '^phase=(Capturing|Processing)') { throw 'Finish the current Listen session before this acceptance run.' }
+if ($initialStatus -match '^phase=Preparing') {
+    # First-use model preparation must finish before the hotkey path accepts a
+    # capture; never treat a preparing model as ready.
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    do {
+        Start-Sleep -Milliseconds 100
+        $initialStatus = [IO.File]::ReadAllText($statusPath)
+        if ($initialStatus -match '^phase=Failure') { throw $initialStatus }
+        if ([DateTime]::UtcNow -gt $deadline) { throw 'Listen did not finish preparing its local model within 120 seconds.' }
+    } until ($initialStatus -notmatch '^phase=Preparing')
+}
 $manifest = Get-Content -LiteralPath (Join-Path $Corpus 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $fixture = $manifest.samples | Where-Object id -eq $Sample | Select-Object -First 1
 if (-not $fixture) { throw "Sample missing from manifest: $Sample" }
@@ -42,7 +53,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         Start-Sleep -Milliseconds 50
-        $status = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8
+        $status = [IO.File]::ReadAllText($statusPath)
         if ($status -match '^phase=Failure') { throw $status }
         if ([DateTime]::UtcNow -gt $deadline) { throw 'Listen did not enter Capturing in this runtime.' }
     } until ($status -match '^phase=Capturing')
@@ -54,18 +65,26 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 100
-        $status = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8
+        $status = [IO.File]::ReadAllText($statusPath)
         if ([DateTime]::UtcNow -gt $deadline) { throw 'Timed out waiting for local recognition; inspect Listen without deleting its audio.' }
     } until ($status -match '^phase=(Result|NoSpeech|Failure)')
     $stopwatch.Stop()
     $after = if (Test-Path -LiteralPath $resultPath) { [IO.File]::ReadAllText($resultPath) } else { '' }
     $null = New-Item -ItemType Directory -Force -Path $Output
+    $timing = [ordered]@{}
+    foreach ($name in @('preparation', 'stop_to_result', 'finalize', 'recognition', 'last_window_wait', 'last_window_inference', 'save', 'delivery')) {
+        if ($status -match ('(?m)^timing_' + $name + '_ms=(\d+)')) { $timing.Add($name + '_ms', [long]$Matches[1]) }
+    }
+    $backend = ''
+    if ($status -match '(?m)^backend=(.*)$') { $backend = $Matches[1] }
     $evidence = [ordered]@{
         sample = $Sample; reference = $fixture.reference; fixture_sha256 = $fixture.sha256
         phase_and_detail = $status; transcript = $after
         previous_result_unchanged = ($before -ceq $after)
         seconds_after_stop = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 3)
         elapsed_seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 3)
+        backend = $backend
+        timing = $timing
         real_wasapi_capture = $true; playback_source = 'System.Media.SoundPlayer'
         desktop_hotkey_tested = $false; target_or_clipboard_readback_tested = $false
     }

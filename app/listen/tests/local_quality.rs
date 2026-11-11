@@ -4,7 +4,7 @@
 
 use listen::{
     AppResult, Application, CapturedAudio, Control, Phase, PlaybackAudio, Recording,
-    whisper::Whisper,
+    whisper::{Backend, Whisper},
 };
 use std::{
     fs,
@@ -56,6 +56,23 @@ fn configured_path(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("Set {name}; see docs/issue-9-verification.md"))
 }
 
+fn await_ready(app: &mut Application) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        app.poll();
+        let state = app.snapshot();
+        if state.phase != Phase::Preparing {
+            assert_eq!(state.phase, Phase::Ready, "{state:?}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "preparation timed out: {state:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 #[ignore = "requires explicit local engine/model and the generated quality corpus"]
 fn non_speech_audio_never_replaces_the_previous_transcript_with_generated_speech() {
@@ -85,16 +102,18 @@ fn verify_no_speech(sample: &str) {
     };
     let mut app = Application::new(
         playback,
-        Arc::new(Whisper {
-            executable: configured_path("LISTEN_WHISPER"),
-            model: configured_path("LISTEN_MODEL"),
-            vad_model: configured_path("LISTEN_VAD_MODEL"),
-            language: "zh".into(),
-            threads: 6,
-        }),
+        Arc::new(Whisper::with_backend(
+            configured_path("LISTEN_WHISPER"),
+            configured_path("LISTEN_MODEL"),
+            configured_path("LISTEN_VAD_MODEL"),
+            "zh".into(),
+            6,
+            Backend::ModelHost,
+        )),
         directory.clone(),
         Ok(()),
     );
+    await_ready(&mut app);
     app.dispatch(Control::Start);
     assert_eq!(
         app.snapshot().phase,
@@ -136,16 +155,18 @@ fn english_technical_words_and_spoken_numbers_reach_the_copyable_result() {
         Arc::new(FixturePlayback(
             configured_path("LISTEN_QUALITY_CORPUS").join("english-numbers.wav"),
         )),
-        Arc::new(Whisper {
-            executable: configured_path("LISTEN_WHISPER"),
-            model: configured_path("LISTEN_MODEL"),
-            vad_model: configured_path("LISTEN_VAD_MODEL"),
-            language: "zh".into(),
-            threads: 6,
-        }),
+        Arc::new(Whisper::with_backend(
+            configured_path("LISTEN_WHISPER"),
+            configured_path("LISTEN_MODEL"),
+            configured_path("LISTEN_VAD_MODEL"),
+            "zh".into(),
+            6,
+            Backend::ModelHost,
+        )),
         directory.clone(),
         Ok(()),
     );
+    await_ready(&mut app);
     app.dispatch(Control::Start);
     assert_eq!(
         app.snapshot().phase,
