@@ -8,8 +8,10 @@ use std::{
 
 #[cfg(windows)]
 pub mod audio;
+pub mod streaming;
 #[cfg(windows)]
 pub mod whisper;
+use streaming::{CaptureProgress, RecognitionWorker, SegmentStream};
 
 pub type AppResult<T> = Result<T, String>;
 
@@ -20,6 +22,12 @@ pub trait PlaybackAudio: Send + Sync {
 
 pub trait Recording: Send {
     fn finish(self: Box<Self>) -> AppResult<CapturedAudio>;
+    fn take_segments(&mut self) -> Option<SegmentStream> {
+        None
+    }
+    fn progress(&self) -> Option<CaptureProgress> {
+        None
+    }
     fn failure(&self) -> Option<String> {
         None
     }
@@ -30,10 +38,28 @@ pub struct CapturedAudio {
     pub description: String,
 }
 
+pub struct TimedText {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
 /// A local executable/model boundary; there is no remote fallback.
 pub trait LocalTranscriber: Send + Sync {
     fn check_ready(&self) -> AppResult<()>;
     fn transcribe(&self, audio: &CapturedAudio, directory: &Path) -> AppResult<String>;
+    fn transcribe_segment(
+        &self,
+        audio: &CapturedAudio,
+        directory: &Path,
+    ) -> AppResult<Vec<TimedText>> {
+        let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
+        Ok(vec![TimedText {
+            start_ms: 0,
+            end_ms: wav.duration() as u64 * 1000 / wav.spec().sample_rate as u64,
+            text: self.transcribe(audio, directory)?,
+        }])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +84,7 @@ pub struct Snapshot {
     pub detail: String,
     pub text: String,
     pub retained_audio: Vec<PathBuf>,
+    pub progress: CaptureProgress,
 }
 
 /// The application boundary used by both global hotkey and complete-flow tests.
@@ -67,6 +94,8 @@ pub struct Application {
     transcriber: Arc<dyn LocalTranscriber>,
     runtime: PathBuf,
     recording: Option<Box<dyn Recording>>,
+    recognition: Option<RecognitionWorker>,
+    progress: Option<Arc<streaming::Progress>>,
     session: Option<PathBuf>,
     completion: Option<mpsc::Receiver<AppResult<(String, String)>>>,
     control_error: Option<String>,
@@ -90,11 +119,14 @@ impl Application {
                 detail: initial_error.unwrap_or_else(|| "Ready. Ctrl+Alt+R starts playback capture. Closing the window keeps Listen in the tray.".into()),
                 text: fs::read_to_string(runtime.join("current-result.txt")).unwrap_or_default(),
                 retained_audio: Vec::new(),
+                progress: CaptureProgress::default(),
             },
             audio,
             transcriber,
             runtime,
             recording: None,
+            recognition: None,
+            progress: None,
             session: None,
             completion: None,
             control_error,
@@ -125,6 +157,15 @@ impl Application {
                     fs::create_dir(&directory).map_err(|e| e.to_string())?;
                     self.session = Some(directory.clone());
                     self.recording = Some(self.audio.start(&directory)?);
+                    if let Some(stream) = self.recording.as_mut().unwrap().take_segments() {
+                        self.progress = Some(stream.progress.clone());
+                        self.recognition = Some(RecognitionWorker::start(
+                            stream,
+                            self.transcriber.clone(),
+                            directory,
+                        ));
+                    }
+                    self.snapshot.progress = CaptureProgress::default();
                     Ok::<_, String>(())
                 })();
                 match result {
@@ -140,16 +181,24 @@ impl Application {
                 let recording = self.recording.take().unwrap();
                 let directory = self.session.clone().unwrap();
                 let transcriber = self.transcriber.clone();
+                let recognition = self.recognition.take();
                 let (tx, rx) = mpsc::channel();
                 self.completion = Some(rx);
                 self.snapshot.phase = Phase::Processing;
                 self.snapshot.detail = "Processing locally; no messages are sent.".into();
                 thread::spawn(move || {
-                    let result = recording.finish().and_then(|audio| {
-                        transcriber
+                    let captured = recording.finish();
+                    let recognized = recognition.map(|worker| worker.finish());
+                    let result = match (captured, recognized) {
+                        (Ok(audio), Some(result)) => result.map(|text| (text, audio.description)),
+                        (Ok(audio), None) => transcriber
                             .transcribe(&audio, &directory)
-                            .map(|text| (text, audio.description))
-                    });
+                            .map(|text| (text, audio.description)),
+                        (Err(capture), Some(Err(recognition))) => {
+                            Err(format!("{recognition}; {capture}"))
+                        }
+                        (Err(error), _) => Err(error),
+                    };
                     let _ = tx.send(result);
                 });
             }
@@ -173,10 +222,38 @@ impl Application {
     }
 
     pub fn poll(&mut self) {
+        if let Some(progress) = self.progress.as_ref().map(|p| p.snapshot()).or_else(|| {
+            self.recording
+                .as_ref()
+                .and_then(|recording| recording.progress())
+        }) {
+            self.snapshot.progress = progress;
+        }
+        if self.snapshot.phase == Phase::Capturing && self.recognition.is_some() {
+            let p = &self.snapshot.progress;
+            self.snapshot.detail = format!(
+                "Capturing playback and recognizing locally; no subtitles. {:.1} s received; {} recognition windows pending, {} completed; {} bytes audio on disk; {} samples audio in memory.{}",
+                p.received_samples as f64 / streaming::SAMPLE_RATE as f64,
+                p.pending_segments,
+                p.recognized_segments,
+                p.spool_bytes,
+                p.buffered_samples,
+                if p.pending_segments > 1 {
+                    " Recognition backlog is growing; bounded spool pressure will interrupt capture with recoverable audio."
+                } else {
+                    ""
+                }
+            );
+        }
         if let Some(error) = self
             .recording
             .as_ref()
             .and_then(|recording| recording.failure())
+            .or_else(|| {
+                self.recognition
+                    .as_ref()
+                    .and_then(|worker| worker.progress.failure())
+            })
         {
             self.dispatch(Control::Stop);
             self.snapshot.detail = format!("{error}; finalizing partial audio for recovery.");
@@ -215,13 +292,18 @@ impl Application {
 
     fn fail(&mut self, error: String) {
         if let Some(directory) = &self.session {
-            if let Ok(entries) = fs::read_dir(directory) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|extension| extension == "wav")
-                        && !self.snapshot.retained_audio.contains(&path)
-                    {
-                        self.snapshot.retained_audio.push(path);
+            let mut pending = vec![directory.clone()];
+            while let Some(directory) = pending.pop() {
+                if let Ok(entries) = fs::read_dir(directory) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            pending.push(path);
+                        } else if path.extension().is_some_and(|extension| extension == "wav")
+                            && !self.snapshot.retained_audio.contains(&path)
+                        {
+                            self.snapshot.retained_audio.push(path);
+                        }
                     }
                 }
             }
@@ -240,6 +322,18 @@ impl Application {
                     .join(", ")
             )
         };
+        if let Some(path) = self
+            .session
+            .as_ref()
+            .map(|directory| directory.join("partial-result.txt"))
+        {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if !text.is_empty() {
+                    self.snapshot.text = text;
+                    self.snapshot.detail.push_str(&format!(". Incomplete recoverable text is in the fallback box and {}. This is not a completed transcription.", path.display()));
+                }
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
