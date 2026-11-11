@@ -52,6 +52,7 @@ $metadata = [ordered]@{
     audio_boundary = 'substituted playback device, looping real PCM with wall-clock pacing; no audio output'
     production_path = 'Application::dispatch -> production segmented writer -> actual VAD/Whisper -> complete fallback result'
     resource_sampling = '3 second samples of harness and direct child processes; observed peaks can miss short child lifetimes; GPU is global device usage'
+    success_criterion = 'the harness terminal NDJSON record reports phase Result with terminal true'
 }
 $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'metadata.json') -Encoding UTF8
 $arguments = @(
@@ -60,6 +61,16 @@ $arguments = @(
     '--vad-model', ('"{0}"' -f $VadModel), '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     '--threads', $Threads, '--delay-ms', $DelayMs, '--spool-bytes', $SpoolBytes
 )
+# Windows PowerShell rebuilds a case-insensitive environment dictionary when it
+# redirects a child, so an inherited block holding both HTTP_PROXY and http_proxy
+# makes Start-Process fail before the harness starts. Drop the case duplicates once.
+$duplicates = [Environment]::GetEnvironmentVariables().Keys |
+    Group-Object { $_.ToUpperInvariant() } | Where-Object { $_.Count -gt 1 }
+foreach ($group in $duplicates) {
+    foreach ($name in $group.Group) {
+        if ($name -cne $group.Group[0]) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+    }
+}
 $process = Start-Process -FilePath $exe -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 $process.Id | Set-Content -LiteralPath (Join-Path $OutputDirectory 'process-id.txt') -Encoding ASCII
 $gpu = Get-Command nvidia-smi -ErrorAction SilentlyContinue
@@ -67,14 +78,19 @@ try {
     while (-not $process.HasExited) {
         $ids = @($process.Id)
         $ids += @(Get-CimInstance Win32_Process -Filter ('ParentProcessId = {0}' -f $process.Id) -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessId })
-        $observed = @(Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object {
-            [ordered]@{ id = $_.Id; name = $_.ProcessName; working_set = $_.WorkingSet64; private_bytes = $_.PrivateMemorySize64; cpu_seconds = $_.CPU }
-        })
+        $observed = @()
+        $totalWorking = [long]0
+        $totalPrivate = [long]0
+        foreach ($item in @(Get-Process -Id $ids -ErrorAction SilentlyContinue)) {
+            $observed += [ordered]@{ id = $item.Id; name = $item.ProcessName; working_set = $item.WorkingSet64; private_bytes = $item.PrivateMemorySize64; cpu_seconds = $item.CPU }
+            $totalWorking += $item.WorkingSet64
+            $totalPrivate += $item.PrivateMemorySize64
+        }
         $record = [ordered]@{
             utc = [DateTime]::UtcNow.ToString('o')
             processes = $observed
-            total_working_set = ($observed | Measure-Object -Property working_set -Sum).Sum
-            total_private_bytes = ($observed | Measure-Object -Property private_bytes -Sum).Sum
+            total_working_set = $totalWorking
+            total_private_bytes = $totalPrivate
         }
         if ($gpu) {
             $record.gpu = @(& $gpu.Source --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>$null)
@@ -84,9 +100,26 @@ try {
         $process.Refresh()
     }
     $process.WaitForExit()
-    [ordered]@{ finished_utc = [DateTime]::UtcNow.ToString('o'); exit_code = $process.ExitCode } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'exit.json') -Encoding UTF8
-    if ($process.ExitCode -ne 0) { throw "Long-session harness failed ($($process.ExitCode)); inspect $stdout and $stderr" }
+    # Windows PowerShell does not expose ExitCode for a redirected Start-Process
+    # child, so decide from the harness's own terminal record and keep stderr.txt
+    # for the failure message.
+    $terminal = @(Get-Content -LiteralPath $stdout -Encoding UTF8 | Where-Object { $_ -match '^\{' })[-1] | ConvertFrom-Json
+    [ordered]@{
+        finished_utc = [DateTime]::UtcNow.ToString('o')
+        phase = $terminal.phase
+        terminal = $terminal.terminal
+        recognized_segments = $terminal.recognized_segments
+        stop_to_result_seconds = $terminal.stop_to_result_seconds
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'exit.json') -Encoding UTF8
+    if ($terminal.phase -ne 'Result' -or $terminal.terminal -ne $true) {
+        throw "Long-session harness did not reach a complete result; inspect $stdout and $stderr"
+    }
     Write-Output $OutputDirectory
 } finally {
+    # A failed sample loop must not leave the measurement running unattended.
+    if (-not $process.HasExited) {
+        try { $process.Kill() } catch { }
+        $process.WaitForExit()
+    }
     $process.Dispose()
 }
