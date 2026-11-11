@@ -8,20 +8,27 @@
 //! DLL and model paths configured at startup.
 //!
 //! Every function pointer and structure below is copied from whisper.cpp
-//! v1.8.2 `include/whisper.h`; `validate_layout` checks the loaded DLL's
-//! defaults before the host is used. A mismatch makes the caller fall back to
-//! the existing CLI path instead of guessing at an ABI.
+//! v1.8.2 `include/whisper.h`. The build is pinned by SHA-256 *before* any DLL
+//! function is called, then the loaded defaults are checked against the mirrored
+//! layout with `whisper_full_default_params_by_ref` (no by-value return). A
+//! mismatch makes the caller fall back to the existing CLI path instead of
+//! guessing at an ABI.
 #![cfg(windows)]
 
 use crate::{AppResult, TimedText, whisper_timing::TimedToken};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
+    fs,
     path::Path,
     ptr,
 };
 use windows::{
     Win32::{
         Foundation::{FreeLibrary, HMODULE},
+        Security::Cryptography::{
+            BCRYPT_ALG_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
+            BCryptCloseAlgorithmProvider, BCryptHash, BCryptOpenAlgorithmProvider,
+        },
         System::LibraryLoader::{GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW},
     },
     core::{PCSTR, PCWSTR, s},
@@ -153,7 +160,9 @@ type InitFromFileNoState =
 type InitState = unsafe extern "system" fn(*mut WhisperContext) -> *mut WhisperState;
 type FreeState = unsafe extern "system" fn(*mut WhisperState);
 type FreeContext = unsafe extern "system" fn(*mut WhisperContext);
-type FullDefaultParams = unsafe extern "system" fn(i32) -> FullParams;
+/// The pinned v1.8.2 build exports the by-reference accessor as well, so the host
+/// never relies on the size of a by-value return before the layout is validated.
+type FullDefaultParamsByRef = unsafe extern "system" fn(i32) -> *const FullParams;
 type FullWithState = unsafe extern "system" fn(
     *mut WhisperContext,
     *mut WhisperState,
@@ -175,7 +184,7 @@ struct Api {
     init_state: InitState,
     free_state: FreeState,
     free_context: FreeContext,
-    full_default_params: FullDefaultParams,
+    full_default_params: FullDefaultParamsByRef,
     full_with_state: FullWithState,
     n_segments: NSegmentsFromState,
     n_tokens: NTokensFromState,
@@ -207,8 +216,8 @@ impl Api {
             full_default_params: unsafe {
                 symbol(
                     module,
-                    s!("whisper_full_default_params"),
-                    "whisper_full_default_params",
+                    s!("whisper_full_default_params_by_ref"),
+                    "whisper_full_default_params_by_ref",
                 )?
             },
             full_with_state: unsafe {
@@ -275,19 +284,48 @@ pub(crate) struct ModelHost {
 // concurrently. The loaded model data is read-only after initialization.
 unsafe impl Send for ModelHost {}
 
+/// SHA-256 of the whisper.cpp v1.8.2 CPU `whisper.dll` that the mirrored
+/// structures and default values belong to. It is checked before the library is
+/// loaded or any export is called. A different build makes the caller use the CLI
+/// instead of handing it a structure whose layout is only assumed.
+const PINNED_WHISPER_DLL_SHA256: [u8; 32] = [
+    0x41, 0x55, 0xed, 0xb6, 0x86, 0x88, 0x10, 0xb5, 0x64, 0x23, 0xcb, 0x00, 0x89, 0xfe, 0xe8, 0x5f,
+    0x4e, 0x87, 0x39, 0xfb, 0x86, 0x05, 0x3b, 0x26, 0x9f, 0x4e, 0x7c, 0x63, 0x50, 0xec, 0x61, 0xff,
+];
+
+/// Why the in-process host is unavailable. A host-level problem (missing or
+/// unknown DLL, missing export) may still be recoverable through the CLI; a model
+/// that `whisper_init_from_file_with_params_no_state` rejects cannot be loaded by
+/// the CLI either, so it must not be reported as a working fallback.
+pub(crate) enum LoadFailure {
+    Host(String),
+    Model(String),
+}
+
 impl ModelHost {
     pub(crate) fn load(
         engine: &Path,
         model: &Path,
         threads: usize,
         language: &str,
-    ) -> AppResult<Self> {
+    ) -> Result<Self, LoadFailure> {
         let dll = engine.with_file_name("whisper.dll");
         if !dll.is_file() {
-            return Err(format!(
+            return Err(LoadFailure::Host(format!(
                 "The in-process model host library is missing: {}",
                 dll.display()
-            ));
+            )));
+        }
+        // Fail closed: validate the exact build before calling into it. Without
+        // this, `whisper_full_default_params_by_ref` or the by-value decode call
+        // could be handed a structure the DLL does not share.
+        let actual = sha256_file(&dll).map_err(LoadFailure::Host)?;
+        if actual != PINNED_WHISPER_DLL_SHA256 {
+            return Err(LoadFailure::Host(format!(
+                "The local whisper.dll does not match the pinned whisper.cpp v1.8.2 CPU build (expected SHA-256 {}, found {}); refusing the in-process model host",
+                hex(&PINNED_WHISPER_DLL_SHA256),
+                hex(&actual)
+            )));
         }
         let dll_wide = wide(&dll.to_string_lossy());
         let module = unsafe {
@@ -298,10 +336,10 @@ impl ModelHost {
             )
         }
         .map_err(|e| {
-            format!(
+            LoadFailure::Host(format!(
                 "Cannot load the in-process model host {}: {e}",
                 dll.display()
-            )
+            ))
         })?;
         let api = match unsafe { Api::load(module) } {
             Ok(api) => api,
@@ -309,29 +347,29 @@ impl ModelHost {
                 unsafe {
                     let _ = FreeLibrary(module);
                 }
-                return Err(error);
+                return Err(LoadFailure::Host(error));
             }
         };
-        // Validate the struct layout against the DLL before passing anything by
-        // value. A mismatched header would otherwise corrupt the stack.
-        let defaults = unsafe { (api.full_default_params)(1) };
-        let expected = defaults.strategy == 1
-            && defaults.n_max_text_ctx == 16_384
-            && defaults.beam_size == 5
-            && (defaults.grammar_penalty - 100.0).abs() < 1e-6
-            && (defaults.thold_pt - 0.01).abs() < 1e-6
-            && (defaults.temperature_inc - 0.2).abs() < 1e-6;
-        if !expected {
+        // The DLL is pinned, but still verify that the layout we mirror reports the
+        // documented v1.8.2 defaults. This catches a build identity mistake before
+        // a by-value decode call.
+        let match_result = match defaults_for(&api, 1) {
+            Ok(defaults) if layout_matches(&defaults) => Ok(()),
+            Ok(_) | Err(_) => Err(()),
+        };
+        if let Err(()) = match_result {
             unsafe {
                 let _ = FreeLibrary(module);
             }
-            return Err(
-                "The local whisper.dll build does not match the expected v1.8.2 parameter layout; refusing the in-process model host".into(),
-            );
+            return Err(LoadFailure::Host(
+                "The local whisper.dll build does not match the expected v1.8.2 parameter layout; refusing the in-process model host"
+                    .into(),
+            ));
         }
         let model_wide = model.to_string_lossy();
-        let model_c = CString::new(model_wide.as_bytes())
-            .map_err(|_| "The local model path contains an embedded NUL".to_string())?;
+        let model_c = CString::new(model_wide.as_bytes()).map_err(|_| {
+            LoadFailure::Host("The local model path contains an embedded NUL".into())
+        })?;
         let context_params = ContextParams {
             use_gpu: false,
             flash_attn: true,
@@ -350,18 +388,19 @@ impl ModelHost {
             unsafe {
                 let _ = FreeLibrary(module);
             }
-            return Err(format!(
+            return Err(LoadFailure::Model(format!(
                 "The local model host could not load the model: {}",
                 model.display()
-            ));
+            )));
         }
         Ok(Self {
             _module: module,
             api,
             context,
             threads: threads as i32,
-            language: CString::new(language)
-                .map_err(|_| "The configured language contains an embedded NUL".to_string())?,
+            language: CString::new(language).map_err(|_| {
+                LoadFailure::Host("The configured language contains an embedded NUL".into())
+            })?,
         })
     }
 
@@ -383,8 +422,8 @@ impl ModelHost {
         Ok(StateGuard { host: self, state })
     }
 
-    fn params(&self, token_timestamps: bool) -> FullParams {
-        let mut params = unsafe { (self.api.full_default_params)(1) };
+    fn params(&self, token_timestamps: bool) -> AppResult<FullParams> {
+        let mut params = defaults_for(&self.api, 1)?;
         params.n_threads = self.threads;
         params.language = self.language.as_ptr();
         params.no_context = true;
@@ -398,12 +437,12 @@ impl ModelHost {
         params.logprob_thold = -1.0;
         params.no_speech_thold = 0.6;
         params.suppress_nst = false;
-        params
+        Ok(params)
     }
 
     fn run_plain(&mut self, pcm: &[f32]) -> AppResult<String> {
         let state = self.state()?;
-        let params = self.params(false);
+        let params = self.params(false)?;
         let result = unsafe {
             (self.api.full_with_state)(
                 self.context,
@@ -424,7 +463,7 @@ impl ModelHost {
 
     fn run_timed(&mut self, pcm: &[f32]) -> AppResult<Vec<TimedText>> {
         let state = self.state()?;
-        let params = self.params(true);
+        let params = self.params(true)?;
         let result = unsafe {
             (self.api.full_with_state)(
                 self.context,
@@ -510,6 +549,131 @@ impl ModelHost {
     }
 }
 
+/// Reads the DLL's defaults by reference. The pinned v1.8.2 build exports this
+/// accessor; it avoids assuming the size of a by-value return before the layout
+/// check has run.
+fn defaults_for(api: &Api, strategy: i32) -> AppResult<FullParams> {
+    let pointer = unsafe { (api.full_default_params)(strategy) };
+    if pointer.is_null() {
+        return Err("The local whisper.dll returned no default parameters".into());
+    }
+    // The library is pinned by SHA-256, so this pointer names a FullParams of the
+    // mirrored layout. Copying it does not call into the unverified ABI.
+    Ok(unsafe { ptr::read(pointer) })
+}
+
+fn close(actual: f32, expected: f32) -> bool {
+    (actual - expected).abs() < 1e-6
+}
+
+/// Checks the documented v1.8.2 defaults before any by-value decode call. This is
+/// defense in depth after the DLL hash check: a wrongly identified build must be
+/// rejected, not interpreted as a compatible ABI.
+fn layout_matches(defaults: &FullParams) -> bool {
+    defaults.strategy == 1
+        && defaults.n_threads == 4
+        && defaults.n_max_text_ctx == 16_384
+        && defaults.offset_ms == 0
+        && defaults.duration_ms == 0
+        && !defaults.translate
+        && defaults.no_context
+        && !defaults.no_timestamps
+        && !defaults.single_segment
+        && !defaults.print_special
+        && defaults.print_progress
+        && !defaults.print_realtime
+        && defaults.print_timestamps
+        && !defaults.token_timestamps
+        && close(defaults.thold_pt, 0.01)
+        && close(defaults.thold_ptsum, 0.01)
+        && defaults.max_len == 0
+        && !defaults.split_on_word
+        && defaults.max_tokens == 0
+        && !defaults.debug_mode
+        && defaults.audio_ctx == 0
+        && !defaults.tdrz_enable
+        && defaults.suppress_regex.is_null()
+        && defaults.initial_prompt.is_null()
+        && !defaults.carry_initial_prompt
+        && defaults.prompt_tokens.is_null()
+        && defaults.prompt_n_tokens == 0
+        && !defaults.detect_language
+        && defaults.suppress_blank
+        && !defaults.suppress_nst
+        && defaults.temperature == 0.0
+        && close(defaults.max_initial_ts, 1.0)
+        && close(defaults.length_penalty, -1.0)
+        && close(defaults.temperature_inc, 0.2)
+        && close(defaults.entropy_thold, 2.4)
+        && close(defaults.logprob_thold, -1.0)
+        && close(defaults.no_speech_thold, 0.6)
+        && defaults.greedy_best_of == -1
+        && defaults.beam_size == 5
+        && close(defaults.beam_patience, -1.0)
+        && defaults.new_segment_callback.is_null()
+        && defaults.new_segment_callback_user_data.is_null()
+        && defaults.progress_callback.is_null()
+        && defaults.progress_callback_user_data.is_null()
+        && defaults.encoder_begin_callback.is_null()
+        && defaults.encoder_begin_callback_user_data.is_null()
+        && defaults.abort_callback.is_null()
+        && defaults.abort_callback_user_data.is_null()
+        && defaults.logits_filter_callback.is_null()
+        && defaults.logits_filter_callback_user_data.is_null()
+        && defaults.grammar_rules.is_null()
+        && defaults.n_grammar_rules == 0
+        && defaults.i_start_rule == 0
+        && close(defaults.grammar_penalty, 100.0)
+        && !defaults.vad
+        && defaults.vad_model_path.is_null()
+        && close(defaults.vad_threshold, 0.5)
+        && defaults.vad_min_speech_duration_ms == 250
+        && defaults.vad_min_silence_duration_ms == 100
+        && defaults.vad_max_speech_duration_s >= 3.4e38
+        && defaults.vad_speech_pad_ms == 30
+        && close(defaults.vad_samples_overlap, 0.1)
+}
+
+fn sha256_file(path: &Path) -> AppResult<[u8; 32]> {
+    let bytes = fs::read(path).map_err(|e| {
+        format!(
+            "Cannot read the in-process model host for hash verification {}: {e}",
+            path.display()
+        )
+    })?;
+    let mut algorithm = BCRYPT_ALG_HANDLE(ptr::null_mut());
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
+            &mut algorithm,
+            BCRYPT_SHA256_ALGORITHM,
+            PCWSTR::null(),
+            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
+        )
+    };
+    if status.0 < 0 {
+        return Err(format!(
+            "Cannot start SHA-256 verification of the local whisper.dll (NTSTATUS {:#x})",
+            status.0 as u32
+        ));
+    }
+    let mut digest = [0u8; 32];
+    let status = unsafe { BCryptHash(algorithm, None, &bytes, &mut digest) };
+    unsafe {
+        let _ = BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    if status.0 < 0 {
+        return Err(format!(
+            "Cannot hash the local whisper.dll (NTSTATUS {:#x})",
+            status.0 as u32
+        ));
+    }
+    Ok(digest)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
 impl Drop for ModelHost {
     fn drop(&mut self) {
         unsafe { (self.api.free_context)(self.context) };
@@ -553,4 +717,63 @@ fn read_pcm(path: &Path) -> AppResult<Vec<f32>> {
                 .map_err(|e| format!("The local model host cannot decode the captured WAV: {e}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "listen-host-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn sha256_of_a_known_payload_is_the_standard_digest() {
+        let directory = temp_dir("sha");
+        let path = directory.join("payload.bin");
+        fs::write(&path, b"abc").unwrap();
+        let digest = sha256_file(&path).unwrap();
+        assert_eq!(
+            hex(&digest),
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unknown_whisper_dll_is_rejected_before_any_call() {
+        let directory = temp_dir("pin");
+        let engine = directory.join("whisper-cli.exe");
+        let dll = directory.join("whisper.dll");
+        let model = directory.join("model.bin");
+        fs::write(&dll, b"not the pinned whisper.cpp build").unwrap();
+        fs::write(&model, b"ggml").unwrap();
+        let error = match ModelHost::load(&engine, &model, 1, "zh") {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown DLL must be rejected before any call"),
+        };
+        let detail = match &error {
+            LoadFailure::Host(detail) => detail,
+            LoadFailure::Model(detail) => panic!("expected a host failure, got: {detail}"),
+        };
+        assert!(detail.contains("does not match the pinned"), "{detail}");
+        assert!(detail.contains("SHA-256"), "{detail}");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_layout_check_is_not_vacuous() {
+        let zeroed: FullParams = unsafe { std::mem::zeroed() };
+        assert!(!layout_matches(&zeroed));
+    }
 }

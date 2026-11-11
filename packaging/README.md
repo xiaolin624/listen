@@ -42,7 +42,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 ## 缺少文件时会怎样
 
 - **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：`启动 Listen.cmd` 会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
-- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：启动器会提示引擎不完整；如果直接运行 `listen.exe`，启动状态为 `Failure`，并写明缺失的路径或“backend is unavailable; check its adjacent DLLs”。
+- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：启动器只检查前两个程序文件是否存在并给出提示；如果相邻 DLL 缺失，`listen.exe` 启动后进入 `Failure`，写明 `backend is unavailable; check its adjacent DLLs`。启动器本身不会预先校验每个相邻 DLL。
 - **缺少模型、模型为空或不是 ggml 格式**：启动状态为 `Failure`，写明 `Local model is unavailable (...)` 或 `Local model is not a whisper.cpp ggml model`。补齐模型后重新启动即可。
 - **默认多媒体播放设备不可用**：开始采集时进入 `Failure`，写明无法选择默认多媒体渲染端点；不会打开麦克风，也不会自动改用其他设备。
 - 包内 `engine\` 已放入引擎实际需要的 `whisper.dll`、`ggml.dll`、`ggml-cpu.dll`、`ggml-base.dll`、`vad-speech-segments.exe` 以及 Microsoft VC++ 运行库 DLL；`SDL2.dll`、`whisper-server.exe` 等无关程序没有打包。
@@ -60,7 +60,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 
 - 自动追加要求目标通过 UI Automation 暴露**可写的 Value 模式**，且焦点在开始时能绑定到该编辑区。只读、禁用、密码框、没有 Value 模式的控件或无法确认身份的目标会进入备用文本框。
 - 浏览器 `contenteditable` 的 `ValuePattern.SetValue` **不会派发 `input`/`change` 事件**，原有富文本结构会被拍平。React/Vue 等受控编辑器可能在下一次重绘时覆盖写入；Listen 只能确认写入当时可访问值已写入并读回。
-- 有些受控编辑器（例如部分聊天输入框）暴露 Value 模式但会静默丢弃写入。这类编辑区只有在**停止时目标窗口仍是前台、焦点仍是原目标**时才会走粘贴降级：读出真实草稿、只追加、用全选复制校验。降级会短暂借用系统剪贴板（结束后恢复文本；原来不是文本时只能清空），只发送 `Ctrl+A/V/C` 和方向键，**从不发送 Enter**。目标不在前台或校验不通过时仍进入备用文本框。
+- 有些受控编辑器（例如部分聊天输入框）暴露 Value 模式但会静默丢弃写入。这类编辑区只有在**停止时目标窗口仍是前台、焦点仍是原目标**时才会走粘贴降级：读出真实草稿、只追加、用全选复制校验；每个按键前都会重新校验前台/焦点。降级会短暂借用系统剪贴板，结束后恢复文本；**如果剪贴板里是文件/图片等非文本内容或无法安全读取，降级不会运行也不会清空剪贴板**，完整结果进入备用文本框并说明原因。降级只发送 `Ctrl+A/V/C` 和方向键，**从不发送 Enter**。目标不在前台、焦点变化或校验不通过时仍进入备用文本框。
 - **Codex 桌面端等没有专门适配**：如果它不通过标准可写 Value 模式暴露输入区，Listen 不会猜测控件或注入发送，结果会进入备用文本框。没有按应用白名单/黑名单分流。
 - UIA 读取、检查和写入不是跨进程原子事务；在最后检查和写入之间发生的并发编辑仍可能造成“可能已部分写入”的提示。失败后只做诊断读回，不自动重试、不回滚。
 - 目标有长度上限时会截断。Listen 会检测稳定前缀，明确报告“只保存了 N/M 个字符，不是完整交付”，并在备用文本框保留完整结果；不会把截断报告成成功。
@@ -77,7 +77,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 | `runtime\latency.jsonl` | 每次采集的准备/收尾/识别/保存/交付耗时；不含音频 |
 | `runtime\` 下本次会话临时目录 | 采集音频与本地后端日志；成功后删除，失败时保留以便人工处理 |
 
-确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。
+确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时窗口会提供“重试本地识别”和“清理失败音频”按钮（`--control retry|cleanup` 走同一入口）；只有“尚未成功消费任何识别窗口”的采集可以整段重试，长会话已有窗口成功后的失败只保留检查点文本和剩余音频路径，状态会明确说明。
 
 ## 版本与验证
 
@@ -85,4 +85,4 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - 源码：<https://github.com/xiaolin624/listen>
 - 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交和是否包含模型。
 - 端到端验证、延迟、长会话和已知限制见仓库 `docs/issue-11-verification.md` 与 `docs/issue-11-release-notes.md`。
-- 本机断网封禁复验由主会话补做；包内三个二进制没有网络导入，运行期只加载本机模块。
+- 本机断网封禁复验仍未完成；包内三个二进制没有网络导入，运行期只加载本机模块。静态/运行期证据见仓库 `docs/issue-11-verification.md`，不能替代系统级强制禁网实测。

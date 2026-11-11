@@ -178,11 +178,23 @@ try {
         }
     }
 
-    $control = New-ControlProcess 'quit'
+    $control = $null
     try {
-        if (-not $control.WaitForExit(10000) -or $control.ExitCode -ne 0) { throw 'The packaged Listen did not accept --control quit.' }
+        $control = New-ControlProcess 'quit'
+        if (-not $control.WaitForExit(10000)) {
+            throw 'The packaged Listen control process did not exit within 10 seconds.'
+        }
+        if ($control.ExitCode -ne 0) { throw ('The packaged Listen did not accept --control quit (exit ' + $control.ExitCode + ').') }
     }
-    finally { $control.Dispose() }
+    finally {
+        if ($null -ne $control) {
+            if (-not $control.HasExited) {
+                try { $control.Kill() } catch { }
+                try { $control.WaitForExit(5000) } catch { }
+            }
+            $control.Dispose()
+        }
+    }
     if (-not $app.WaitForExit(10000)) { throw 'Packaged Listen did not exit after --control quit.' }
     $quitOk = ($app.ExitCode -eq 0)
     if (-not $quitOk) { throw ('Packaged Listen exited with ' + $app.ExitCode + '.') }

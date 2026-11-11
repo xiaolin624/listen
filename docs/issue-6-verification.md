@@ -63,8 +63,6 @@ cd E:\luyin\.worktrees\issue-6
 
 ## 60 分钟长时测量
 
-## 60 分钟长时测量
-
 ```powershell
 .\scripts\measure-long-session.ps1 -InputWav E:\luyin\.artifacts\issue-6-smoke\loop-96s.wav `
   -OutputDirectory E:\luyin\.artifacts\issue-6-measure -ToolsRoot E:\luyin\.tools -Seconds 3600

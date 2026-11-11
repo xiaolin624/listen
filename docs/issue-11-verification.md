@@ -6,8 +6,8 @@
 
 ## 结论摘要
 
-- 交付目录 `dist\Listen-0.1.0\` 可直接运行：`启动 Listen.cmd` 双击启动，使用包内 `engine\`、`models\` 和本地 `runtime\`，不需要先跑开发脚本或独立推理命令。包含模型时 17 个文件、493,270,493 字节；不包含模型时 16 个文件、约 4.6 MiB，并按包内 README 放入模型。
-- 同一个包内 `listen.exe` 完成：真实耳机 WASAPI 采集、真实 small+Silero 本地识别、原生 EDIT 与 Chrome textarea/contenteditable 追加、备用文本框、只读/容量截断/目标失效/写入未确认回退、识别失败重试与清理、设备切换中断、600 秒长会话与资源受压。
+- 交付目录 `dist\Listen-0.1.0\` 可直接运行：`启动 Listen.cmd` 双击启动，使用包内 `engine\`、`models\` 和本地 `runtime\`，不需要先跑开发脚本或独立推理命令。包含模型时 manifest 记录 17 个交付文件、493,270,493 字节；不包含模型时 16 个交付文件、约 4.6 MiB，并按包内 README 放入模型。清单之外另有 `manifest.json` 本身和用于安全重建的 `.listen-package` 标记。
+- 同一个包内 `listen.exe` 完成：真实耳机 WASAPI 采集、真实 small+Silero 本地识别、原生 EDIT 与 Chrome textarea/contenteditable 追加、备用文本框、只读/容量截断/目标失效/写入未确认回退、识别失败重试与清理、设备切换中断。**600 秒长会话与资源受压不是包内 `listen.exe` 的界面流程**：它们由同一源码的测试 harness `app\listen\target\release\examples\long_session.exe`（用 `Tape` 替换播放设备、不打开音频设备、不操作桌面）+ 包内 engine/model 测量，见下文“600 秒长会话与资源”。
 - 状态序列观测到 `Preparing → Ready → Capturing → Processing → Result`；首次启动到 Ready 的模型准备为 618 ms（进程启动/轮询后约 1.1 秒）。同包首次/后续停止→结果 6674/6652 ms，没有额外的“准备后首次识别”冷启动。
 - 600 秒会话：22 个识别窗口、停止→结果 **6921 ms**、峰值积压 **1**、结束 spool **0 字节**；资源峰值/平均见下表。不是 60 分钟，也不是产品时长上限。
 - 真实识别质量仍保留已知错误（繁体/标点、`WASAPI loopback`→`Waze up high loop back`、`本季`→`本机`、英文句被译写等）；不宣称任意会议逐字零错误。
@@ -183,7 +183,7 @@
 
 ## 600 秒长会话与资源
 
-使用现有 `scripts\measure-long-session.ps1`，输入为 #6 的 96.04 秒固定样本循环（SHA-256 `9F710689...1E3F`），静默墙钟回放 600 秒；引擎/模型/VAD 全部指向**包内**文件；生产分段、真实 VAD/Whisper、同一 `Application::dispatch`，不开音频设备、不操作桌面。输出 `.artifacts\issue-11\long\600\`。
+使用现有 `scripts\measure-long-session.ps1`，它固定运行 `app\listen\target\release\examples\long_session.exe`（同一源码的 harness，用 `Tape` 替换播放设备，**不打开音频设备、不操作桌面**），不是包内 `listen.exe`；输入为 #6 的 96.04 秒固定样本循环（SHA-256 `9F710689...1E3F`），静默墙钟回放 600 秒；引擎/模型/VAD 全部指向**包内**文件；生产分段、真实 VAD/Whisper、同一 `Application::dispatch`。输出 `.artifacts\issue-11\long\600\`。因此这里的 600 秒/资源数字是“harness + 包内引擎/模型”的测量，**不能当作包内交付应用在真实耳机上的 600 秒应用入口验收**，也不满足 T10 AC7 的严格字面要求。
 
 | 观测 | 结果 |
 | --- | --- |
@@ -371,3 +371,41 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 - 运行期：同一次打包运行中，三个进程共加载 **57 个模块，没有网络模块**。
 
 **未完成项（如实记录）**：本会话尝试用提权防火墙临时封禁包内三个二进制，但 UAC 提权被取消（`The operation was canceled by the user`），所以**打包产物没有在系统级强制禁网下运行过**。此前 `9faa9c3` 的强制禁网验收覆盖的是同一套采集与识别源码；#10 之后新增的进程内 host 只加载 `whisper.dll`，该 DLL 同样没有任何网络导入。如果要对这个包做同等强度的禁网验收，需要在有人在场时批准一次提权，然后用与 `.artifacts\offline-firewall-helper-package.ps1` 相同的步骤重跑。
+## 最终整体审查后的修复与回归（2026-11-12）
+
+本节的数字来自本工作树 `implement/final-review-fixes`（基线 `041019d`，修复提交 `87a75cf`）的离线锁定 release 构建和提交后重新打包的 `dist\Listen-0.1.0\`（含模型；`manifest.json` 记录 `git_commit=87a75cf…`、`git_dirty_at_package_time=false`）。证据在 `.artifacts/final-review-fixes\`。
+
+### 自动测试
+
+- `capture_to_copy` **27 passed / 1 ignored**；`long_sessions` **11 passed**（新增 speech→silence→speech 尾部保留、已识别窗口后失败的范围说明）；`device_routing` 4、`latency_and_preparation` 4、`model_readiness` 2、lib unit tests 16；合计 **64 passed / 3 ignored**。`-Task CheckFormat` 通过；`-Task Build` 离线锁定 release 构建通过；提交后 `package-listen.ps1 -IncludeModels` + `verify-listen-package.ps1` 通过（`Preparing`→`Ready`，`start_to_state_ms=1839`，`control_quit_ok=true`）。
+- RED/GREEN：SP-01 的旧 `paste_output` 逻辑输出 `Append { text: "第一行\n第二行\n今天轉寫" }`（整段原草稿重复），修复后输出 `Append { text: "今天轉寫" }`；SP-03 旧代码输出 `开始第三段`，修复后 `开始尾部第三段`；SP-05 旧 `prepare()` 对损坏 host 返回 `Ok`、CLI backend 返回 `None`，修复后都返回明确 `Err`/Failure。原始日志见 `.artifacts/final-review-fixes/red-sp01.log`、`red-sp03.log`、`red-sp05.log` 与对应 GREEN 运行。
+
+### 真实桌面回归（包内 `listen.exe`，真实 WASAPI/模型/焦点）
+
+| 场景 | 结果 | 证据 |
+| --- | --- | --- |
+| 原生 EDIT 首次/后续追加 | PASS；停止→结果 6.746 / 6.784 s；原文+采集中编辑+转写只追加一次；无目标/目标销毁均完整回退、不误写 | `accept-core\core-evidence.json`、`accept-core.log` |
+| 只读、容量 40 截断、静默写入且目标失焦 | PASS；只读不写；容量只保存 39/51 字符并明确“不是完整交付”；失焦时不发粘贴按键，完整回退 | `accept-fallbacks\fallback-evidence.json`、`accept-fallbacks.log` |
+| 识别失败→重试仍失败→换回真实 CLI→重试成功→清理→无效重试 | PASS；失败的同一 WAV 保留并可重试；修复后不重放成功；目标只追加一次；清理后不调用识别 | `accept-retry\retry-evidence.json`、`accept-retry.log`；驱动为适应新的真实就绪检查，fake engine 增加了“零帧 WAV 加载验证”分支，并用 `--backend cli` 强制走被测 CLI |
+| DeepSeek Harness 粘贴降级（SP-01/SP-02 端到端） | PASS；已知多行草稿 `SP01-FINAL-REVIEW-DRAFT-7F3A` 在最终输入框中出现 **1** 次，转写出现 **1** 次，最终内容逐字等于草稿+换行+转写；`phase=Result`、`detail` 为完整追加 | `accept-harness\harness-draft-evidence.json`、`accept-harness.log`。Harness 的 UIA 可访问值为 LF，不触发 CRLF 分支；CRLF 分支由 `target::tests` 的真实 RED/GREEN 覆盖 |
+| 粘贴序列中途焦点离开（SP-06） | PASS（安全中止）；受控原生 EDIT 在 `Ctrl+A/C` 后把焦点移到同进程窗体，工具检测到后 **未发送 `Ctrl+V`**（`v_keys=0`、`paste_calls=0`），目标不变、完整结果进入备用文本框 | `accept-paste-crlf\paste-crlf-evidence.json`、`accept-paste-crlf.log` |
+| `--control` 失败不弹模态 | 未运行实例时 `listen.exe --control stop` 在 **66 ms** 内以退出码 1 结束，stderr 为 `Listen control failed: Listen is not running`，无对话框、无残留进程 | `.artifacts/final-review-fixes/control-failure.txt` |
+
+### 就绪与模型加载（SP-05/S-01）
+
+- 损坏模型（保留 `ggml` magic，内容随机）：真实 `listen.exe` 进入 `Failure`，detail 为 `The configured local model could not be loaded by the whisper.cpp CLI: ... exit code: 0xc0000409 ... this is not a claim of readiness`；进程未崩溃，无虚假 `Ready`。
+- host-only 失败（另一构建的 `whisper.dll`，SHA-256 不符）+ CLI 可加载：`Ready`，backend 明确写 `resident local model is unavailable ... CLI was verified ...`，`timing_preparation_ms=1117`。
+- 默认 host 正常路径：`timing_preparation_ms=1453`（外部观察 1711 ms）。这比本记录早先的 570–712 ms 增加了一次性 CLI 模型加载验证；识别路径未变，但**旧 0.62 s 准备时间不再适用于当前构建**。
+- `whisper.dll` 在 `LoadLibrary`/任何导出调用前按 SHA-256 固定校验；默认参数改为 `whisper_full_default_params_by_ref` 并校验 40 余个字段。单测 `an_unknown_whisper_dll_is_rejected_before_any_call`、`sha256_of_a_known_payload_is_the_standard_digest`、`the_layout_check_is_not_vacuous`。
+
+### 打包清理（S-07）与控制脚本（SP-12）
+
+- `package-listen.ps1` 删除目标前要求目录内有 `Listen` 的 `manifest.json` 或 `.listen-package` 标记；对含用户文件的 `Listen-notes` 目录拒绝删除并保留文件，对上一次生成的 Listen 包可重复重建。证据：`s07-hostile.log`、`s07-owned1.log`、`s07-owned2.log`。
+- `verify-listen-package.ps1` 的 control 进程在超时后强制结束；`run-listen.ps1 -Control` 增加了 15 秒上限、stderr 输出和 `retry|cleanup` 参数；`--control` 失败不再弹出 `MessageBoxW`。
+
+### 仍未满足/未重跑
+
+- **SP-08 / T10 AC2**：打包产物**仍未**在系统级强制禁网下运行；本文只更新了静态/运行期证据的措辞，没有补做提权防火墙复验。#11 仍应保持 OPEN。
+- **SP-09 / T10 AC7**：600 秒/资源数字来自 `examples\long_session.exe` harness + 包内引擎/模型，不是包内 `listen.exe` 的界面流程；本记录和发布说明已按此改写，但 T10 AC7 的严格字面要求仍未被 harness 测量满足。
+- **SP-11 / T9 AC5**：真实会议软件并发流畅度仍未验证；本轮未新增会议软件负载。
+- **准备时间**：新增的真实模型加载验证使默认 host 准备从约 0.57–0.71 s 增至约 1.45 s；8 样本/600 秒的停止→结果数字是准备改动前构建的记录，识别路径未变，但若要引用当前构建的完整延迟，应重新跑一次延迟验收。

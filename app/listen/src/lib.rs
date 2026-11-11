@@ -223,6 +223,10 @@ enum Completion {
         directory: PathBuf,
         retry: Option<RetainedCapture>,
         timing: Timing,
+        /// Why an automatic local retry cannot cover this failure even though some
+        /// audio remains on disk. Shown to the user instead of silently omitting
+        /// the retry action.
+        retry_scope: Option<String>,
     },
 }
 
@@ -531,6 +535,7 @@ impl Application {
                                 directory,
                                 retry: None,
                                 timing,
+                                retry_scope: None,
                             });
                             return;
                         }
@@ -564,16 +569,16 @@ impl Application {
                         // has their audio on disk, so its checkpoint stays a partial
                         // result instead of pretending the remaining windows are whole.
                         Err(error) => {
+                            let recognized_segments = progress
+                                .as_ref()
+                                .map(|progress| progress.snapshot().recognized_segments)
+                                .unwrap_or(0);
                             let retained = if audio.path.is_file() {
                                 Some(CapturedAudio {
                                     path: audio.path.clone(),
                                     description: audio.description.clone(),
                                 })
-                            } else if streaming
-                                && progress.as_ref().is_some_and(|progress| {
-                                    progress.snapshot().recognized_segments == 0
-                                })
-                            {
+                            } else if streaming && recognized_segments == 0 {
                                 streaming::retained_audio_path(&directory).ok().map(|path| {
                                     CapturedAudio {
                                         path,
@@ -588,12 +593,27 @@ impl Application {
                                 directory: directory.clone(),
                                 target,
                             });
+                            // A streamed session whose earlier windows were already
+                            // recognized and released cannot be retried as a whole.
+                            // Say so explicitly; the remaining audio paths are still
+                            // listed by `fail` for manual recovery.
+                            let retry_scope = if retry.is_none()
+                                && streaming
+                                && recognized_segments > 0
+                            {
+                                Some(format!(
+                                    "This capture was partially recognized before the failure ({recognized_segments} window(s) had been checkpointed). Those windows' audio was released after recognition, so automatic local retry is only offered when no recognition window has completed; it is not offered here. The recognized prefix above is incomplete, and the remaining audio paths are listed for manual recovery."
+                                ))
+                            } else {
+                                None
+                            };
                             timing.stop_to_result_ms = Some(elapsed_ms(stop_at));
                             Completion::Failed {
                                 error,
                                 directory,
                                 retry,
                                 timing,
+                                retry_scope,
                             }
                         }
                         // Silence and non-speech leave the previous result and every
@@ -740,6 +760,7 @@ impl Application {
                         directory,
                         retry: Some(retry),
                         timing,
+                        retry_scope: None,
                     }
                 }
                 Ok(text) if text.trim().is_empty() => Completion::Finished(Completed {
@@ -775,6 +796,7 @@ impl Application {
                             directory,
                             retry: Some(retry),
                             timing,
+                            retry_scope: None,
                         }
                     }
                 },
@@ -952,6 +974,7 @@ impl Application {
                 directory,
                 retry,
                 timing,
+                retry_scope,
             } => {
                 let retryable = retry.is_some();
                 self.retry = retry;
@@ -961,6 +984,9 @@ impl Application {
                 self.fail(Some(&directory), error);
                 if retryable {
                     self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the fallback text box is used if it is no longer valid.");
+                } else if let Some(scope) = retry_scope {
+                    self.snapshot.detail.push_str("\n");
+                    self.snapshot.detail.push_str(&scope);
                 }
             }
         }

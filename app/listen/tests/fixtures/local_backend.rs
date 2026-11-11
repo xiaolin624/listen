@@ -12,6 +12,14 @@ fn main() {
     let value = |key: &str| args[args.iter().position(|a| a == key).unwrap() + 1].clone();
     let path = PathBuf::from(value("-f"));
     let wav = fs::read(path).unwrap();
+    if wav.len() <= 44 {
+        // The readiness check feeds a zero-frame WAV: the real v1.8.2 CLI loads
+        // the model (printing its timing line) and then exits 0 after failing to
+        // read frames. Emulate that without encoding.
+        eprintln!("whisper_print_timings:     load time = 1.00 ms");
+        eprintln!("error: failed to read the frames of the audio data");
+        return;
+    }
     let first_sample = i16::from_le_bytes([wav[44], wav[45]]);
     let stem = PathBuf::from(value("-of"));
     let (text, tokens): (&str, Vec<(&[u8], u64, u64)>) = match first_sample {

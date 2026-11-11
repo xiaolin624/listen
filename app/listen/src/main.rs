@@ -102,6 +102,10 @@ fn parse() -> Result<LaunchAction, String> {
 }
 
 fn main() {
+    // A control invocation is part of a script or another automation. It must
+    // never block on a modal dialog: report the failure on stderr and use the exit
+    // code. Interactive launch errors keep the existing visible message.
+    let control_mode = env::args().any(|argument| argument == "--control");
     let result = match parse() {
         Ok(LaunchAction::Run(config)) => gui::run(config),
         Ok(LaunchAction::Control(control)) => gui::control(&control),
@@ -110,12 +114,26 @@ fn main() {
             Ok(())
         }
         Err(error) => {
+            if control_mode {
+                control_error(&error);
+                std::process::exit(2);
+            }
             gui::show_error(&error);
             std::process::exit(2);
         }
     };
     if let Err(error) = result {
+        if control_mode {
+            control_error(&error);
+            std::process::exit(1);
+        }
         gui::show_error(&error);
         std::process::exit(1);
     }
+}
+
+/// Writes a control failure without assuming a console or a valid stderr handle.
+fn control_error(message: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "Listen control failed: {message}");
 }

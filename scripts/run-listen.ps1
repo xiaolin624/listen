@@ -6,7 +6,7 @@ param(
     [string]$VadModel = '',
     [ValidateSet('host', 'cli')][string]$Backend = 'host',
     [switch]$Hidden,
-    [ValidateSet('', 'start', 'stop', 'toggle', 'show', 'quit')][string]$Control = ''
+    [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'quit')][string]$Control = ''
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -15,8 +15,30 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
     throw 'Build first with .\scripts\build-listen.ps1.'
 }
 if ($Control) {
-    $process = Start-Process -FilePath $binary -ArgumentList @('--control', $Control) -WindowStyle Hidden -Wait -PassThru
-    if ($process.ExitCode -ne 0) { throw "Listen control failed ($($process.ExitCode))" }
+    # A control invocation must never hang on a modal dialog. The application
+    # reports control failures on stderr and a non-zero exit code; enforce a bound
+    # and kill a wedged control process instead of waiting forever.
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $binary
+    $info.Arguments = '--control ' + $Control
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { }
+            throw "Listen control '$Control' did not exit within 15 seconds."
+        }
+        $stderr = $process.StandardError.ReadToEnd().Trim()
+        if ($process.ExitCode -ne 0) {
+            throw "Listen control failed ($($process.ExitCode)): $stderr"
+        }
+        if ($stderr) { Write-Output $stderr }
+    }
+    finally {
+        $process.Dispose()
+    }
     return
 }
 $commonGit = & git -C $projectRoot rev-parse --path-format=absolute --git-common-dir
