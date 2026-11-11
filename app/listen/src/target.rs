@@ -25,7 +25,8 @@ use windows::{
             Accessibility::{
                 CUIAutomation8, HWINEVENTHOOK, IUIAutomation, IUIAutomation2, IUIAutomationElement,
                 IUIAutomationTextPattern, IUIAutomationValuePattern, SetWinEventHook,
-                UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId, UnhookWinEvent,
+                UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
+                UIA_ValuePatternId, UnhookWinEvent,
             },
             WindowsAndMessaging::*,
         },
@@ -149,6 +150,14 @@ impl TargetSelection for NativeTargets {
             None => Ok(None),
         }
     }
+}
+
+/// UIA reports a native multiline EDIT (and some rich editors) as `Document`, while
+/// single-line edits, browser text areas and contenteditable regions are `Edit`.
+/// Both can carry a writable Value pattern, so writability is decided by the pattern
+/// and its read-only state, never by the control type class alone.
+fn writable_editor_type(control_type: i32) -> bool {
+    control_type == UIA_EditControlTypeId.0 || control_type == UIA_DocumentControlTypeId.0
 }
 
 /// Reads the actual foreground window and its keyboard focus without changing either.
@@ -381,9 +390,9 @@ impl NativeEditor {
             if element.CurrentProcessId().map_err(|e| e.to_string())? as u32 != focus.process {
                 return Ok(None);
             }
-            if element.CurrentControlType().map_err(|e| e.to_string())? != UIA_EditControlTypeId {
-                // A focused document, button, address bar or other control is not an
-                // automatically writable editor; it must fall back to the copy box.
+            if !writable_editor_type(element.CurrentControlType().map_err(|e| e.to_string())?.0) {
+                // A focused document that is not an editor, a button, an address bar or
+                // another control must fall back to the copy box.
                 return Ok(None);
             }
             belongs_to_root(&automation, &element, &focus)?;
@@ -479,7 +488,7 @@ impl NativeEditor {
                 .map_err(|e| format!("Cannot validate the original target: {e}"))?
                 as u32;
             (
-                control_type == UIA_EditControlTypeId,
+                writable_editor_type(control_type.0),
                 enabled,
                 password,
                 read_only,

@@ -103,12 +103,37 @@ FINAL_TARGET 富文本原有草稿：Rust 123。\n第二行 draft。\n采集中�
 - **主动读取的范围**：UIA 读取、检查与 `SetValue` 不是跨进程原子事务；用户在最后检查与写入之间的并发编辑仍可能发生。写前会重新读取草稿并检查是否改变，但不声称覆盖所有并发编辑。
 - **没有真实 ASR**：本流程使用确定性播放与识别替身，因此不能把本记录的文本当作 whisper.cpp 的识别质量证据；识别质量见 [Issue #9 验证记录](issue-9-verification.md)。
 
+## 原生编辑区的回归与控件类型修正（2026-11-11 深夜补测）
+
+第一次真实 WASAPI 采集验收（8 个固定样本、原生 Win32 多行 EDIT 目标）暴露了本任务重写 `target.rs` 后的一处回归：**所有语音样本都进入了备用文本框**，状态的说明是 `No supported editable target was selected at capture start`。
+
+用同一套 `windows` COM 绑定写了临时探针（已删除）确认原因：UIA 把**原生多行 EDIT** 暴露成 `UIA_DocumentControlTypeId`（50030），而不是 `UIA_EditControlTypeId`（50004），但它同时提供可写的 `ValuePattern` 与 `TextPattern`、`IsReadOnly=false`。首版实现只接受 `Edit`，因此把原生多行编辑区误判为不可写。
+
+修正（`app/listen/src/target.rs` 的 `writable_editor_type`）：接受 `Edit` **或** `Document`，可写性仍由 `ValuePattern` 存在、`IsReadOnly=false`、`IsEnabled`、非密码框决定。整页 `Document`（Chrome 的 web area）本身是只读的，仍会被排除，所以放宽控制类型没有把"整页文档"变成目标。
+
+修正后同一驱动重跑 8 个样本全部符合预期：
+
+| 样本 | 阶段 | 目标追加 | 停止到结果 |
+| --- | --- | --- | --- |
+| mandarin | Result | 是 | 6.94 s |
+| mixed-technical | Result | 是 | 7.20 s |
+| english-numbers | Result | 是 | 6.72 s |
+| homophones | Result | 是 | 6.61 s |
+| multiline | Result | 是 | 7.10 s |
+| silence | NoSpeech | 否（目标不变） | 1.14 s |
+| instrumental | NoSpeech | 否（目标不变） | 1.14 s |
+| notification | NoSpeech | 否（目标不变） | 1.15 s |
+
+`automatic_send_count=0`、`enter_key_count=0`；目标文本逐次增长且与"旧文本 + 换行 + 本次转写"逐字一致（21→63→136→246→278→335 字）。这次运行同时是 **#3 原生目标路径在本任务重写后的真实回归**，也补上了本记录"原生桌面目标的新路径未验证"的缺口。
+
+驱动与证据：`E:\luyin\.artifacts\quality-live-driver\accept-quality-live.ps1`、`E:\luyin\.artifacts\quality-capture\live-evidence.json` 及每个样本的 `<sample>.json`。这是一次**真实 WASAPI 采集 + 真实 whisper.cpp** 的运行，目标由真实焦点选定，没有向工具传递任何窗口句柄。
+
 ## 尚未验证
 
 - **Codex 桌面端**：本机未发现已确认的 Codex 桌面 GUI 入口，只有 CLI；按任务要求没有用 CLI 冒充桌面端输入框。该项验收仍缺用户确认的实际样例。
 - **浏览器插件/扩展内的编辑区**：本轮验证的是普通 Chrome 页面中的 `contenteditable`；没有单独启动并验证某个扩展自己的输入区。它们若使用同一 Chromium UIA 暴露方式，理论上走同一路径，但缺少真实样例证据。
 - **受控 React/Vue 富文本编辑器**：夹具的 `#rich` 是非受控 `contenteditable`。受控组件在无 `input` 事件时是否覆盖、何时覆盖，尚未用真实页面验证。
-- **原生桌面目标的新路径**：`target.rs` 已重写，但本轮没有重新运行原生编辑区的完整桌面验收；#3 的真实桌面验收早于这次重写。自动化完整流程测试使用假目标，不覆盖真实原生 UIA 提供程序。建议在发布前补一次 #3 原生编辑区回归（不把 #3 的旧证据算作新实现的原生验证）。
+- **原生编辑区的路径**：已在上节用 8 个真实 WASAPI 样本回归通过（多行 EDIT 被 UIA 报成 `Document`，现在按可写 `ValuePattern` 判定）。单行 EDIT、RichEdit 及其他第三方 UIA 提供程序仍只有通用契约，没有逐个实测。
 - **真实 GUI 的备用文本框截图**：本记录通过 `detail.txt` / `transcript.txt` / `delivery.txt` 和夹具页面证明 Fallback 分支，没有重新截取 Listen 自身窗口；备用文本框和复制逻辑沿用 #2 已有测试。
 - **长时间/真实耳机采集**：不属于 #4；本任务的播放和异步线程边界与 #2/#9 一致。
 
