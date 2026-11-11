@@ -3,6 +3,7 @@ param(
     [string]$Runtime = '',
     [string]$Engine = '',
     [string]$Model = '',
+    [string]$VadModel = '',
     [switch]$Hidden,
     [ValidateSet('', 'start', 'stop', 'toggle', 'show', 'quit')][string]$Control = ''
 )
@@ -23,16 +24,17 @@ $repositoryRoot = Split-Path $commonGit -Parent
 if (-not $ToolsRoot) { $ToolsRoot = Join-Path $repositoryRoot '.tools' }
 if (-not $Runtime) { $Runtime = Join-Path $repositoryRoot '.artifacts\listen' }
 if (-not $Engine) { $Engine = Join-Path $ToolsRoot 'whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe' }
-if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-base.bin' }
+if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-small.bin' }
+if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
 # Start-Process joins ArgumentList; quote literal Windows paths containing spaces.
-foreach ($path in @($Engine, $Model, $Runtime)) {
+foreach ($path in @($Engine, $Model, $VadModel, $Runtime)) {
     if ($path.Contains('"')) { throw 'Paths must not contain a double quote.' }
 }
 function ConvertTo-QuotedWindowsPath([string]$Path) {
     # A trailing backslash must be doubled before the closing command-line quote.
     '"' + ([IO.Path]::GetFullPath($Path) -replace '(\\+)$', '$1$1') + '"'
 }
-$launchArguments = @('--engine', (ConvertTo-QuotedWindowsPath $Engine), '--model', (ConvertTo-QuotedWindowsPath $Model), '--runtime', (ConvertTo-QuotedWindowsPath $Runtime))
+$launchArguments = @('--engine', (ConvertTo-QuotedWindowsPath $Engine), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--runtime', (ConvertTo-QuotedWindowsPath $Runtime))
 if ($Hidden) { $launchArguments += '--hidden' }
 $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -WindowStyle Hidden -PassThru
 Write-Output "Listen PID: $($process.Id)"
