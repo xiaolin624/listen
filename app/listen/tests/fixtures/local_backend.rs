@@ -18,6 +18,7 @@ fn main() {
         1000 => ("开始跨段", vec![(&[0xe5, 0xbc], 0, 20), (&[0x80], 20, 40), ("始".as_bytes(), 40, 80), ("跨段".as_bytes(), 80, 100)]),
         2000 => ("跨段 Rust 收尾。", vec![("跨段".as_bytes(), 0, 30), (b" Rust", 30, 90), (" 收尾。".as_bytes(), 90, 100)]),
         3000 => (" Rust 收尾。", vec![(b" Rust", 0, 10), (" 收尾。".as_bytes(), 10, 40)]),
+        4000 => (" 收尾。", vec![(" 收尾。".as_bytes(), 80, 100)]),
         _ => panic!("unexpected deterministic playback sample"),
     };
     fs::write(stem.with_extension("txt"), text).unwrap();

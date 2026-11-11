@@ -283,11 +283,15 @@ fn capture(
             Ok(())
         })();
         let stopped = client.Stop().map_err(|e| e.to_string());
-        result?;
-        stopped?;
-        writer.finish(format!(
+        let finalized = writer.finish(format!(
                 "default-render/multimedia {endpoint}; {:.3} s, {rate} Hz/{channels} ch/{bits} bit; peak={peak:.5}; discontinuities={discontinuities}",
                 frames as f64 / rate as f64
-            ))
+            ));
+        result?;
+        stopped?;
+        // Silence and an idle render device are valid capture results. Only real
+        // device/packet/storage errors above are failures; speech detection owns
+        // the no-speech outcome and must not lose quiet valid speech here.
+        finalized
     }
 }

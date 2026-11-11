@@ -8,6 +8,7 @@ use std::{env, path::PathBuf};
 pub struct Config {
     engine: PathBuf,
     model: PathBuf,
+    vad_model: PathBuf,
     runtime: PathBuf,
     language: String,
     threads: usize,
@@ -20,7 +21,7 @@ enum LaunchAction {
     Help,
 }
 
-const HELP: &str = "Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nControl running application: --control <start|stop|toggle|show|quit>\nResults are copyable in the application. Messages are never sent automatically.";
+const HELP: &str = "Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nThe engine package must include vad-speech-segments.exe.\nControl running application: --control <start|stop|toggle|show|quit>\nResults are copyable in the application. Messages are never sent automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
@@ -31,7 +32,8 @@ fn parse() -> Result<LaunchAction, String> {
         .unwrap_or(env::current_dir().map_err(|e| e.to_string())?);
     let mut config = Config {
         engine: root.join(".tools/whisper-v1.8.2-cpu/bin/Release/whisper-cli.exe"),
-        model: root.join(".tools/models/ggml-base.bin"),
+        model: root.join(".tools/models/ggml-small.bin"),
+        vad_model: root.join(".tools/models/ggml-silero-v5.1.2.bin"),
         runtime: root.join(".artifacts/listen"),
         language: "zh".into(),
         threads: 6,
@@ -58,6 +60,7 @@ fn parse() -> Result<LaunchAction, String> {
             }
             "--engine" => config.engine = PathBuf::from(value),
             "--model" => config.model = PathBuf::from(value),
+            "--vad-model" => config.vad_model = PathBuf::from(value),
             "--runtime" => config.runtime = PathBuf::from(value),
             "--language" => config.language = value,
             "--threads" => {
@@ -73,7 +76,12 @@ fn parse() -> Result<LaunchAction, String> {
     }
     // Resolve once so changing the foreground application cannot change file interpretation.
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
-    for path in [&mut config.engine, &mut config.model, &mut config.runtime] {
+    for path in [
+        &mut config.engine,
+        &mut config.model,
+        &mut config.vad_model,
+        &mut config.runtime,
+    ] {
         if !path.is_absolute() {
             *path = cwd.join(&*path);
         }

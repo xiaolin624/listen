@@ -13,6 +13,8 @@ pub mod streaming;
 pub mod target;
 #[cfg(windows)]
 pub mod whisper;
+#[cfg(windows)]
+pub mod whisper_timing;
 use streaming::{CaptureProgress, RecognitionWorker, SegmentStream};
 
 pub type AppResult<T> = Result<T, String>;
@@ -84,6 +86,7 @@ pub enum Phase {
     Capturing,
     Processing,
     Result,
+    NoSpeech,
     Failure,
 }
 
@@ -113,7 +116,7 @@ pub struct Snapshot {
 struct Completed {
     text: String,
     description: String,
-    delivery: Delivery,
+    delivery: Option<Delivery>,
     detail: String,
     save_error: Option<String>,
 }
@@ -251,6 +254,17 @@ impl Application {
                         }
                         (Err(error), _) => Err(error),
                     }.and_then(|(text, description)| {
+                        // Silence and non-speech leave the previous result and every
+                        // target untouched; nothing is saved or appended for them.
+                        if text.trim().is_empty() {
+                            return Ok(Completed {
+                                text,
+                                description,
+                                delivery: None,
+                                detail: String::new(),
+                                save_error: None,
+                            });
+                        }
                         let save_error = fs::write(current_result, &text).err().map(|e| e.to_string());
                         let mut output_attempted = false;
                         let output = save_error.as_ref().map_or(Ok(()), |error| {
@@ -279,7 +293,7 @@ impl Application {
                                 (Delivery::Fallback, format!("{error}. The complete result is in the fallback text box. {advice}"))
                             }
                         };
-                        Ok(Completed { text, description, delivery, detail, save_error })
+                        Ok(Completed { text, description, delivery: Some(delivery), detail, save_error })
                     });
                     let _ = tx.send(result);
                 });
@@ -352,6 +366,22 @@ impl Application {
         };
         self.completion = None;
         match result {
+            Ok(completed) if completed.text.trim().is_empty() => {
+                // A completed no-speech session is not a new transcript. In particular,
+                // leave the previous copyable result and its on-disk copy untouched.
+                match fs::remove_dir_all(self.session.as_ref().unwrap()) {
+                    Ok(()) => {
+                        self.snapshot.phase = Phase::NoSpeech;
+                        self.snapshot.delivery = None;
+                        self.snapshot.detail = format!(
+                            "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {}", completed.description
+                        );
+                    }
+                    Err(error) => self.fail(format!(
+                        "No valid speech detected, but temporary audio could not be cleaned: {error}"
+                    )),
+                }
+            }
             Ok(completed) => {
                 let result = completed.save_error.map_or_else(
                     || {
@@ -361,7 +391,7 @@ impl Application {
                     Err,
                 );
                 self.snapshot.text = completed.text;
-                self.snapshot.delivery = Some(completed.delivery);
+                self.snapshot.delivery = completed.delivery;
                 match result {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Result;

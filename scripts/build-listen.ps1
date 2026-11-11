@@ -1,6 +1,6 @@
 param(
     [string]$ToolsRoot = '',
-    [ValidateSet('Build', 'BuildHarness', 'Test', 'Format', 'CheckFormat')][string]$Task = 'Build'
+    [ValidateSet('Build', 'BuildHarness', 'Test', 'Quality', 'Format', 'CheckFormat')][string]$Task = 'Build'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -23,6 +23,7 @@ switch ($Task) {
     'Build' { & $cargo build --offline --locked --release --manifest-path $manifest }
     'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session }
     'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture }
+    'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture }
     'Format' { & $cargo fmt --manifest-path $manifest }
     'CheckFormat' { & $cargo fmt --manifest-path $manifest --check }
 }

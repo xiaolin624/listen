@@ -278,7 +278,24 @@ impl RecognitionWorker {
         let progress = stream.progress.clone();
         let state = progress.clone();
         let worker = thread::spawn(move || {
-            let result = recognize(stream, transcriber, directory);
+            // A crashing local backend is a recoverable failure, not a silent stall.
+            // Report it at once so capture stops and its audio is retained.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recognize(stream, transcriber, directory)
+            }));
+            let result = match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .map(|reason| reason.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    Err(format!(
+                        "Local segment recognition worker panicked ({reason}); received audio and checkpoint retained"
+                    ))
+                }
+            };
             if let Err(error) = &result {
                 state.fail(error.clone());
             }
@@ -316,7 +333,12 @@ fn recognize(
         } else {
             segment.samples as u64 - segment.overlap_samples as u64 / 2
         };
-        tail.clear();
+        // A speech-free window must keep the trailing half held by the previous
+        // window: that text still needs another window to claim it, or the final
+        // tail to commit it. Clearing it here would erase already recognized words.
+        if !spans.is_empty() {
+            tail.clear();
+        }
         for TimedText {
             start_ms,
             end_ms,

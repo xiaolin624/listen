@@ -6,9 +6,10 @@ Windows 后台工具：先点击目标输入框，按 **Ctrl+Alt+R** 开始采�
 
 ## 本机准备与构建
 
-已准备的共享缓存放在仓库根目录 `.tools/`：Rust stable gnullvm 工具链、whisper.cpp v1.8.2 CPU 程序及其相邻 DLL、多语言 `ggml-base.bin` 模型。模型和运行库的来源及先前基准见 [实验依据](.scratch/meeting-transcription/verification-sources.md)。正式工具默认使用 CPU；实验的 CUDA 耗时不代表本工具的端到端性能。
+已准备的共享缓存放在仓库根目录 `.tools/`：Rust stable gnullvm 工具链、whisper.cpp v1.8.2 CPU 程序及其相邻 DLL。默认识别使用多语言 `ggml-small.bin` 和 `ggml-silero-v5.1.2.bin` 语音检测模型；引擎同目录须包含 `vad-speech-segments.exe`。首次准备缺少的模型时运行下面的显式下载/哈希校验脚本，之后可以离线构建和识别。模型选择、固定语料、残留错字与实际验证范围见 [本地质量基线](docs/issue-9-verification.md)。正式工具默认使用 CPU；实验的 CUDA 耗时不代表本工具的端到端性能。
 
 ```powershell
+.\scripts\prepare-quality-model.ps1
 .\scripts\build-listen.ps1
 .\scripts\run-listen.ps1
 ```
@@ -30,6 +31,7 @@ Windows 后台工具：先点击目标输入框，按 **Ctrl+Alt+R** 开始采�
 4. 再按 **Ctrl+Alt+R**，或在窗口中点“停止并转写”。`Processing` 表示正在本机处理，处理中再次操作会明确提示等待。
 5. `Result` 后，工具读取原目标的最新草稿，在末尾追加一次完整转写；非空草稿和转写之间加一个换行。采集中新增的草稿仍保留，成功追加不会切换前台窗口。由你检查并手动发送。
 6. 无有效目标、目标失效或无法确认写入时，工具打开备用文本框，保留完整结果。可选择文字按 Ctrl+C，或点“复制完整结果”。若提示写入未确认，先检查原目标是否已有全部或部分内容，再决定复制粘贴；工具不自动重试。成功追加后也可从托盘打开 Listen 查看或复制本次完整转写。
+7. `NoSpeech` 表示没有检测到有效语音：本次不追加任何文字或空行，保留上一次完整结果，清理本次临时音频。状态和托盘会明确提示，可以直接开始下一次采集。
 
 当前自动追加支持具备 UI Automation Value 模式的原生 Edit / RichEdit 控件；只读、禁用、密码框、权限不足及其他编辑区进入备用文本框。工具自动判断能力，不要求选择应用类型。网页、Codex 等通用编辑区适配在后续任务中扩展。窗口按钮和托盘的开始/停止操作仍可用；在 Listen 自身窗口开始时使用备用文本框。
 
@@ -47,7 +49,7 @@ Windows 后台工具：先点击目标输入框，按 **Ctrl+Alt+R** 开始采�
 | `status.txt` | 当前阶段、说明、当前结果文件及失败保留音频路径；不包含转写正文 |
 | 本次会话的临时目录 | 采集音频和本地后端诊断；成功后删除，失败时保留以便人工恢复 |
 
-成功转写并保存当前结果后才清理本次临时目录。识别进程启动失败、返回失败、播放设备中断、音频无法写入或无法保存结果时，显示 `Failure`，保留已生成的音频并给出路径。不会静默改用云端服务。后端错误的 `whisper.log` 位于同一临时目录。
+成功转写并保存当前结果后才清理本次临时目录；成功判定无语音也会清理本次目录，保留旧结果。语音检测或识别进程启动失败、返回失败、播放设备中断、音频无法写入或无法保存结果时，显示 `Failure`，保留已生成的音频并给出路径。不会静默改用云端服务。`vad.log`、`vad.txt` 和 `whisper.log` 位于同一临时目录。
 
 失败音频暂由用户人工处理；本任务没有加入重试/清理管理界面。可用已有 [本地基准脚本](scripts/benchmark-local-asr.py) 对保留的 WAV 重试。确认不再需要后，退出工具再删除状态中列出的本次临时目录。重启后旧的失败目录仍保留；当前窗口的失败路径只描述当前进程已遇到的失败。
 
@@ -56,14 +58,14 @@ Windows 后台工具：先点击目标输入框，按 **Ctrl+Alt+R** 开始采�
 ## 显式配置与集成操作
 
 ```powershell
-.\scripts\run-listen.ps1 -Engine E:\luyin\.tools\whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe -Model E:\luyin\.tools\models\ggml-base.bin -Runtime E:\luyin\.artifacts\listen -Hidden
+.\scripts\run-listen.ps1 -Engine E:\luyin\.tools\whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe -Model E:\luyin\.tools\models\ggml-small.bin -VadModel E:\luyin\.tools\models\ggml-silero-v5.1.2.bin -Runtime E:\luyin\.artifacts\listen -Hidden
 .\scripts\run-listen.ps1 -Control start
 .\scripts\run-listen.ps1 -Control stop
 .\scripts\run-listen.ps1 -Control show
 .\scripts\run-listen.ps1 -Control quit
 ```
 
-直接启动可执行文件还支持 `--engine <path> --model <path> --runtime <directory> --language <zh|auto|...> --threads <positive count> --hidden`。默认中文、6 个 CPU 线程。路径可包含空格。更换配置前先退出正在运行的实例。
+直接启动可执行文件还支持 `--engine <path> --model <path> --vad-model <path> --runtime <directory> --language <zh|auto|...> --threads <positive count> --hidden`。默认中文、6 个 CPU 线程，固定 5 beams / best of 5，温度 0 起、增量 0.2。语音检测只判定有无语音，识别使用原始完整音频。保留模型的繁简体和换行，不做摘要、同音纠正或语义改写。中英切换、专有名词、数字仍须检查。路径可包含空格。更换配置前先退出正在运行的实例。
 
 `listen.exe --control start|stop|toggle|show|quit` 向正在运行的工具发送应用内控制事件。`start/stop/toggle` 与全局快捷键和窗口按钮调用同一个 `Application::dispatch` 入口，实际集成仍使用正式 WASAPI 和本地引擎；没有注入测试音频、假识别结果或定时自动停止模式。`status.txt` 可用于等待阶段，`current-result.txt` 可用于比对完整文字；文件检查不能替代全局快捷键、可见文本框与复制操作的桌面验证。
 
@@ -72,10 +74,15 @@ Windows 后台工具：先点击目标输入框，按 **Ctrl+Alt+R** 开始采�
 ```powershell
 .\scripts\build-listen.ps1 -Task Test
 .\scripts\build-listen.ps1 -Task CheckFormat
+# 已准备模型后，可生成并验证固定本地语料；不会播放声音
+.\scripts\make-quality-corpus.ps1
+.\scripts\verify-local-quality.ps1
 ```
 
 行为测试只使用已确认的“一次开始→停止→转写→目标追加或备用结果/临时音频生命周期”边界。音频设备、本地模型和目标编辑区是可控外部依赖，正式热键与测试使用同一应用控制入口。确定的多行中英、数字和 emoji 结果用于检查原目标绑定、切窗、最新草稿、重复控制及错误回退。真实播放、模型和实际原生控件的集成证据与逻辑测试分开记录，见 [T1 验证记录](docs/issue-2-verification.md) 和 [T2 验证记录](docs/issue-3-verification.md)。
 
 没有加入固定分钟数上限。当前短音频版本逐包将音频写到磁盘，停止后交给本地 CLI 一次性识别；尚未实现长时间持续分段识别、受控识别积压和长期压力验证。普通 WAV 文件也有格式容量限制，达到存储格式容量或磁盘写入失败会明确报错并保留已写音频。这一版本不承诺长时间采集资源有界或所有耳机路由均已验证。
 
-尚未验证或交付：通用网页/桌面编辑区扩展、完整设备路由/切换策略、静音和非语音识别质量、长时间分段边界、模型选择与中文规范化、预加载/加速策略及数值性能承诺。原生自动追加的桌面验收与边界另见 T2 验证记录；已有 loopback 和 UIA 实验不等于这些后续任务已经完成。
+已建立普通话、中英技术词、数字、本机/本季、静音、无声乐旋律和提示音的固定本地质量基线；真实采集的新模型质量及强制禁网复验仍待完成。small 改善了部分遗漏，但同音、WASAPI 拼写及中英切换仍有明确错误，且比 base 消耗更多 CPU 时间。没有准确率或延迟数值承诺，详见 [T8 验证记录及重跑命令](docs/issue-9-verification.md)。
+
+尚未验证或交付：通用网页/桌面编辑区扩展、完整设备路由/切换策略、长时间分段边界、预加载/加速策略。原生自动追加的桌面验收与边界另见 T2 验证记录；已有 loopback 和 UIA 实验不等于这些后续任务已经完成。
