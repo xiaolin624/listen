@@ -1,11 +1,11 @@
 use listen::{
-    AppResult, Application, CapturedAudio, Control, LocalTranscriber, Phase, PlaybackAudio,
-    Recording,
+    AppResult, Application, CapturedAudio, Control, Delivery, LocalTranscriber, Phase,
+    PlaybackAudio, Recording, Target, TargetSelection,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -315,4 +315,241 @@ fn playback_open_error_never_claims_to_capture_and_preserves_the_device_error() 
     );
     app.dispatch(Control::Stop);
     assert_eq!(app.snapshot().phase, Phase::Failure);
+}
+
+struct Editors {
+    focused: Option<usize>,
+    drafts: [String; 2],
+    available: [bool; 2],
+    unconfirmed: bool,
+}
+
+struct Desktop(Arc<Mutex<Editors>>);
+struct BoundEditor {
+    editors: Arc<Mutex<Editors>>,
+    selected: usize,
+}
+
+impl TargetSelection for Desktop {
+    fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
+        Ok(self.0.lock().unwrap().focused.map(|selected| {
+            Box::new(BoundEditor {
+                editors: self.0.clone(),
+                selected,
+            }) as Box<dyn Target>
+        }))
+    }
+}
+
+impl Target for BoundEditor {
+    fn content(&mut self) -> AppResult<String> {
+        let desktop = self.editors.lock().unwrap();
+        if !desktop.available[self.selected] {
+            return Err("The original target was destroyed".into());
+        }
+        Ok(desktop.drafts[self.selected].clone())
+    }
+
+    fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
+        let mut desktop = self.editors.lock().unwrap();
+        if !desktop.available[self.selected] {
+            return Err("The original target was destroyed".into());
+        }
+        if desktop.drafts[self.selected] != expected {
+            return Err("The draft changed before output".into());
+        }
+        desktop.drafts[self.selected] = replacement.into();
+        if desktop.unconfirmed {
+            return Err("The complete target output could not be confirmed".into());
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn hotkey_binds_original_editor_and_appends_complete_result_to_its_latest_draft() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: Some(0),
+        drafts: ["原有草稿".into(), "另一个输入框".into()],
+        available: [true; 2],
+        unconfirmed: false,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.drafts[0] = "原有草稿\n采集中新增 Rust 123".into();
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        "原有草稿\n采集中新增 Rust 123\n第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(desktop.drafts[1], "另一个输入框");
+    assert!(result.detail.contains("appended"), "{result:?}");
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+}
+
+#[test]
+fn no_target_at_start_keeps_the_complete_fallback_and_does_not_retarget_later_focus() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: None,
+        drafts: ["原有草稿".into(), "后来获得焦点".into()],
+        available: [true; 2],
+        unconfirmed: false,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("No supported editable target"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        result.text
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "后来获得焦点"]);
+    assert!(result.retained_audio.is_empty());
+}
+
+#[test]
+fn destroyed_original_target_keeps_the_full_result_and_never_uses_a_replacement() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: Some(0),
+        drafts: ["原有草稿".into(), "旁边输入框".into()],
+        available: [true; 2],
+        unconfirmed: false,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.available[0] = false;
+        desktop.drafts[0] = "重建的相似输入框".into();
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("original target was destroyed"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["重建的相似输入框", "旁边输入框"]);
+}
+
+#[test]
+fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_the_append() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: Some(0),
+        drafts: ["原有草稿".into(), "旁边输入框".into()],
+        available: [true; 2],
+        unconfirmed: true,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(SlowModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    app.dispatch(Control::Stop);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("could not be confirmed"));
+    assert!(result.detail.contains("Check the original target"));
+    assert!(result.detail.contains("not retried automatically"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        result.text
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        "原有草稿\n第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+}
+
+#[test]
+fn result_storage_failure_keeps_the_complete_text_and_audio_without_writing_the_target() {
+    let runtime = Runtime::new();
+    fs::create_dir(runtime.0.join("current-result.txt")).unwrap();
+    let editors = Arc::new(Mutex::new(Editors {
+        focused: Some(0),
+        drafts: ["原有草稿".into(), "旁边输入框".into()],
+        available: [true; 2],
+        unconfirmed: false,
+    }));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Failure);
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert!(result.detail.contains("Could not save the current result"));
+    assert_eq!(result.retained_audio.len(), 1);
+    assert!(result.retained_audio[0].is_file());
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
 }
