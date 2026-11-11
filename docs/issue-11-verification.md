@@ -355,3 +355,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 | `feedback\` | 缺 libunwind / 缺引擎 DLL 的反馈 |
 
 本机截图只用于验收，不作为产品代码或会议历史提交。
+
+## 打包产物的本地运行与网络能力复核（2026-11-12，主会话补做）
+
+在没有启用防火墙的条件下，把**打包目录本身**（`dist\Listen-0.1.0`）跑了一遍完整真实流程：
+
+- 从包内启动：`Ready` 用时 0.838–0.886 秒，`backend` 为常驻模型，端点 `耳机 (WH-1000XM4)`；
+- 真实焦点选定的原生多行 EDIT 目标，真实 WASAPI 采集 8.08 秒已知语音，停止→结果 **7.16 / 7.30 秒**；
+- 目标最终内容恰为"原草稿 + 换行 + 转写"一份，发送计数 0、Enter 计数 0；
+- 证据：`.artifacts\issue-11-offline\offline-package-evidence.json`。
+
+网络能力复核（打包产物）：
+
+- PE 导入：`listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`、`engine\whisper.dll` 都**没有** `ws2_32`/`winhttp`/`wininet`/`urlmon`/`dnsapi`/`mswsock` 名称；
+- 运行期：同一次打包运行中，三个进程共加载 **57 个模块，没有网络模块**。
+
+**未完成项（如实记录）**：本会话尝试用提权防火墙临时封禁包内三个二进制，但 UAC 提权被取消（`The operation was canceled by the user`），所以**打包产物没有在系统级强制禁网下运行过**。此前 `9faa9c3` 的强制禁网验收覆盖的是同一套采集与识别源码；#10 之后新增的进程内 host 只加载 `whisper.dll`，该 DLL 同样没有任何网络导入。如果要对这个包做同等强度的禁网验收，需要在有人在场时批准一次提权，然后用与 `.artifacts\offline-firewall-helper-package.ps1` 相同的步骤重跑。
