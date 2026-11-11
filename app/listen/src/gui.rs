@@ -1,5 +1,5 @@
 use crate::{Config, WasapiPlayback, Whisper};
-use listen::{Application, Control, Phase, Snapshot};
+use listen::{Application, Control, Delivery, Phase, Snapshot, target::NativeTargets};
 use std::{cell::RefCell, fs, sync::Arc};
 use windows::{
     Win32::{
@@ -221,7 +221,8 @@ pub fn run(config: Config) -> Result<(), String> {
             }),
             config.runtime.clone(),
             registration,
-        );
+        )
+        .with_targets(Arc::new(NativeTargets));
         let mut state = Ui {
             app,
             hwnd,
@@ -330,6 +331,7 @@ impl Ui {
                     || last.detail != state.detail
                     || last.text != state.text
                     || last.retained_audio != state.retained_audio
+                    || last.delivery != state.delivery
             });
             if !changed {
                 return;
@@ -435,7 +437,11 @@ impl Ui {
                                 "Recognizing locally. Wait for the current result."
                             }
                             Phase::Result => {
-                                "Current result is available in the fallback text box. Copy and send manually."
+                                if state.delivery == Some(Delivery::Appended) {
+                                    "Appended to the original target. Review and send manually."
+                                } else {
+                                    "Check the original target, then use the complete fallback result."
+                                }
                             }
                             Phase::NoSpeech => {
                                 "No valid speech detected. Nothing was delivered; the previous result is unchanged."
@@ -449,7 +455,10 @@ impl Ui {
                 }
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &icon);
             }
-            if phase_changed && matches!(state.phase, Phase::Result | Phase::Failure) {
+            if phase_changed
+                && (state.phase == Phase::Failure
+                    || (state.phase == Phase::Result && state.delivery != Some(Delivery::Appended)))
+            {
                 self.show();
             }
             self.last = Some(state.clone());

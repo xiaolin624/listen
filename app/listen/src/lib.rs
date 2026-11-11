@@ -9,6 +9,8 @@ use std::{
 #[cfg(windows)]
 pub mod audio;
 #[cfg(windows)]
+pub mod target;
+#[cfg(windows)]
 pub mod whisper;
 
 pub type AppResult<T> = Result<T, String>;
@@ -36,6 +38,20 @@ pub trait LocalTranscriber: Send + Sync {
     fn transcribe(&self, audio: &CapturedAudio, directory: &Path) -> AppResult<String>;
 }
 
+/// The foreground editor boundary. Selection happens once, when capture starts.
+pub trait TargetSelection: Send + Sync {
+    fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>>;
+}
+
+/// A bound external editor. Replacing a value never sends keyboard or submit actions.
+pub trait Target: Send {
+    fn content(&mut self) -> AppResult<String>;
+    /// Replace only if the latest draft still equals `expected`, and return success
+    /// only after reading back the complete replacement. An error may mean output
+    /// happened partially; callers must retain the transcript and never retry it.
+    fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Ready,
@@ -53,12 +69,27 @@ pub enum Control {
     Toggle,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Appended,
+    Fallback,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub phase: Phase,
     pub detail: String,
     pub text: String,
     pub retained_audio: Vec<PathBuf>,
+    pub delivery: Option<Delivery>,
+}
+
+struct Completed {
+    text: String,
+    description: String,
+    delivery: Option<Delivery>,
+    detail: String,
+    save_error: Option<String>,
 }
 
 /// The application boundary used by both global hotkey and complete-flow tests.
@@ -69,8 +100,10 @@ pub struct Application {
     runtime: PathBuf,
     recording: Option<Box<dyn Recording>>,
     session: Option<PathBuf>,
-    completion: Option<mpsc::Receiver<AppResult<(String, String)>>>,
+    completion: Option<mpsc::Receiver<AppResult<Completed>>>,
     control_error: Option<String>,
+    targets: Option<Arc<dyn TargetSelection>>,
+    bound_target: AppResult<Option<Box<dyn Target>>>,
 }
 
 impl Application {
@@ -91,6 +124,7 @@ impl Application {
                 detail: initial_error.unwrap_or_else(|| "Ready. Ctrl+Alt+R starts playback capture. Closing the window keeps Listen in the tray.".into()),
                 text: fs::read_to_string(runtime.join("current-result.txt")).unwrap_or_default(),
                 retained_audio: Vec::new(),
+                delivery: None,
             },
             audio,
             transcriber,
@@ -99,7 +133,14 @@ impl Application {
             session: None,
             completion: None,
             control_error,
+            targets: None,
+            bound_target: Ok(None),
         }
+    }
+
+    pub fn with_targets(mut self, targets: Arc<dyn TargetSelection>) -> Self {
+        self.targets = Some(targets);
+        self
     }
 
     pub fn dispatch(&mut self, control: Control) {
@@ -110,6 +151,11 @@ impl Application {
         };
         match control {
             Control::Start if self.recording.is_none() && self.completion.is_none() => {
+                // Capture the actual selection before readiness checks or any UI feedback.
+                self.bound_target = self
+                    .targets
+                    .as_ref()
+                    .map_or(Ok(None), |targets| targets.focused_target());
                 let result = (|| {
                     if let Some(error) = &self.control_error {
                         return Err(format!("Global hotkey unavailable: {error}"));
@@ -131,25 +177,67 @@ impl Application {
                 match result {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Capturing;
+                        self.snapshot.delivery = None;
                         self.snapshot.detail =
                             "Capturing playback audio; press the hotkey again to stop.".into();
                     }
-                    Err(error) => self.fail(error),
+                    Err(error) => {
+                        self.bound_target = Ok(None);
+                        self.fail(error);
+                    }
                 }
             }
             Control::Stop if self.recording.is_some() => {
                 let recording = self.recording.take().unwrap();
                 let directory = self.session.clone().unwrap();
                 let transcriber = self.transcriber.clone();
+                let target = std::mem::replace(&mut self.bound_target, Ok(None));
+                let current_result = self.runtime.join("current-result.txt");
                 let (tx, rx) = mpsc::channel();
                 self.completion = Some(rx);
                 self.snapshot.phase = Phase::Processing;
                 self.snapshot.detail = "Processing locally; no messages are sent.".into();
                 thread::spawn(move || {
                     let result = recording.finish().and_then(|audio| {
-                        transcriber
-                            .transcribe(&audio, &directory)
-                            .map(|text| (text, audio.description))
+                        let text = transcriber.transcribe(&audio, &directory)?;
+                        if text.trim().is_empty() {
+                            return Ok(Completed {
+                                text,
+                                description: audio.description,
+                                delivery: None,
+                                detail: String::new(),
+                                save_error: None,
+                            });
+                        }
+                        let save_error = fs::write(current_result, &text).err().map(|e| e.to_string());
+                        let mut output_attempted = false;
+                        let output = save_error.as_ref().map_or(Ok(()), |error| {
+                            Err(format!("Could not save the current result: {error}"))
+                        }).and_then(|()| target).and_then(|target| {
+                            let Some(mut target) = target else {
+                                return Err("No supported editable target was selected at capture start".into());
+                            };
+                            let latest = target.content()?;
+                            let replacement = if latest.is_empty() {
+                                text.clone()
+                            } else {
+                                format!("{latest}\n{text}")
+                            };
+                            output_attempted = true;
+                            target.replace(&latest, &replacement)
+                        });
+                        let (delivery, detail) = match output {
+                            Ok(()) => (Delivery::Appended, "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into()),
+                            Err(error) => {
+                                let advice = if output_attempted {
+                                    "Check the original target before copying; output is not retried automatically."
+                                } else {
+                                    "Review and copy it to the intended input."
+                                };
+                                (Delivery::Fallback, format!("{error}. The complete result is in the fallback text box. {advice}"))
+                            }
+                        };
+                        Ok(Completed { text, description: audio.description, delivery: Some(delivery), detail, save_error })
                     });
                     let _ = tx.send(result);
                 });
@@ -194,14 +282,15 @@ impl Application {
         };
         self.completion = None;
         match result {
-            Ok((text, description)) if text.trim().is_empty() => {
+            Ok(completed) if completed.text.trim().is_empty() => {
                 // A completed no-speech session is not a new transcript. In particular,
                 // leave the previous copyable result and its on-disk copy untouched.
                 match fs::remove_dir_all(self.session.as_ref().unwrap()) {
                     Ok(()) => {
                         self.snapshot.phase = Phase::NoSpeech;
+                        self.snapshot.delivery = None;
                         self.snapshot.detail = format!(
-                            "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {description}"
+                            "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {}", completed.description
                         );
                     }
                     Err(error) => self.fail(format!(
@@ -209,16 +298,21 @@ impl Application {
                     )),
                 }
             }
-            Ok((text, description)) => {
-                let result = fs::write(self.runtime.join("current-result.txt"), &text)
-                    .and_then(|()| fs::remove_dir_all(self.session.as_ref().unwrap()));
-                self.snapshot.text = text;
+            Ok(completed) => {
+                let result = completed.save_error.map_or_else(
+                    || {
+                        fs::remove_dir_all(self.session.as_ref().unwrap())
+                            .map_err(|e| e.to_string())
+                    },
+                    Err,
+                );
+                self.snapshot.text = completed.text;
+                self.snapshot.delivery = completed.delivery;
                 match result {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Result;
-                        self.snapshot.detail = format!(
-                            "Current result is ready in the fallback text box. Review and copy it.\nPlayback: {description}"
-                        );
+                        self.snapshot.detail =
+                            format!("{}\nPlayback: {}", completed.detail, completed.description);
                     }
                     Err(error) => self.fail(format!(
                         "Could not save the current result or clean temporary audio: {error}"
