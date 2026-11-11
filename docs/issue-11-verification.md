@@ -6,7 +6,7 @@
 
 ## 结论摘要
 
-- 交付目录 `dist\Listen-0.1.0\` 可直接运行：`启动 Listen.cmd` 双击启动，使用包内 `engine\`、`models\` 和本地 `runtime\`，不需要先跑开发脚本或独立推理命令。包含模型时 17 个文件、493,270,493 字节；不包含模型时 16 个文件、约 4.6 MiB，并按包内 README 放入模型。
+- 交付目录 `dist\Listen-0.1.0\` 可直接运行：`启动 Listen.cmd` 双击启动，使用包内 `engine\`、`models\` 和本地 `runtime\`，不需要先跑开发脚本或独立推理命令。包含模型时 manifest 记录 17 个交付文件、493,270,493 字节；不包含模型时 16 个交付文件、约 4.6 MiB，并按包内 README 放入模型。清单之外另有 `manifest.json` 本身和用于安全重建的 `.listen-package` 标记。
 - 同一个包内 `listen.exe` 完成：真实耳机 WASAPI 采集、真实 small+Silero 本地识别、原生 EDIT 与 Chrome textarea/contenteditable 追加、备用文本框、只读/容量截断/目标失效/写入未确认回退、识别失败重试与清理、设备切换中断。**600 秒长会话与资源受压不是包内 `listen.exe` 的界面流程**：它们由同一源码的测试 harness `app\listen\target\release\examples\long_session.exe`（用 `Tape` 替换播放设备、不打开音频设备、不操作桌面）+ 包内 engine/model 测量，见下文“600 秒长会话与资源”。
 - 状态序列观测到 `Preparing → Ready → Capturing → Processing → Result`；首次启动到 Ready 的模型准备为 618 ms（进程启动/轮询后约 1.1 秒）。同包首次/后续停止→结果 6674/6652 ms，没有额外的“准备后首次识别”冷启动。
 - 600 秒会话：22 个识别窗口、停止→结果 **6921 ms**、峰值积压 **1**、结束 spool **0 字节**；资源峰值/平均见下表。不是 60 分钟，也不是产品时长上限。
@@ -373,11 +373,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 **未完成项（如实记录）**：本会话尝试用提权防火墙临时封禁包内三个二进制，但 UAC 提权被取消（`The operation was canceled by the user`），所以**打包产物没有在系统级强制禁网下运行过**。此前 `9faa9c3` 的强制禁网验收覆盖的是同一套采集与识别源码；#10 之后新增的进程内 host 只加载 `whisper.dll`，该 DLL 同样没有任何网络导入。如果要对这个包做同等强度的禁网验收，需要在有人在场时批准一次提权，然后用与 `.artifacts\offline-firewall-helper-package.ps1` 相同的步骤重跑。
 ## 最终整体审查后的修复与回归（2026-11-12）
 
-本节的数字来自本工作树 `implement/final-review-fixes`（基线 `041019d`）的离线锁定 release 构建和重新打包的 `dist\Listen-0.1.0\`（含模型，`manifest.json` 记录 `git_dirty_at_package_time=true`，因为修复尚未提交时打包；提交后未重新打包）。证据在 `.artifacts\final-review-fixes\`。
+本节的数字来自本工作树 `implement/final-review-fixes`（基线 `041019d`，修复提交 `87a75cf`）的离线锁定 release 构建和提交后重新打包的 `dist\Listen-0.1.0\`（含模型；`manifest.json` 记录 `git_commit=87a75cf…`、`git_dirty_at_package_time=false`）。证据在 `.artifacts/final-review-fixes\`。
 
 ### 自动测试
 
-- `capture_to_copy` **27 passed / 1 ignored**；`long_sessions` **11 passed**（新增 speech→silence→speech 尾部保留、已识别窗口后失败的范围说明）；`device_routing` 4、`latency_and_preparation` 4、`model_readiness` 2、lib unit tests 16；合计 **64 passed / 3 ignored**。`-Task CheckFormat` 通过；`-Task Build` 离线锁定 release 构建通过；`package-listen.ps1 -IncludeModels` + `verify-listen-package.ps1` 通过（`Preparing`→`Ready`，`start_to_state_ms=2025`，`control_quit_ok=true`）。
+- `capture_to_copy` **27 passed / 1 ignored**；`long_sessions` **11 passed**（新增 speech→silence→speech 尾部保留、已识别窗口后失败的范围说明）；`device_routing` 4、`latency_and_preparation` 4、`model_readiness` 2、lib unit tests 16；合计 **64 passed / 3 ignored**。`-Task CheckFormat` 通过；`-Task Build` 离线锁定 release 构建通过；提交后 `package-listen.ps1 -IncludeModels` + `verify-listen-package.ps1` 通过（`Preparing`→`Ready`，`start_to_state_ms=1839`，`control_quit_ok=true`）。
 - RED/GREEN：SP-01 的旧 `paste_output` 逻辑输出 `Append { text: "第一行\n第二行\n今天轉寫" }`（整段原草稿重复），修复后输出 `Append { text: "今天轉寫" }`；SP-03 旧代码输出 `开始第三段`，修复后 `开始尾部第三段`；SP-05 旧 `prepare()` 对损坏 host 返回 `Ok`、CLI backend 返回 `None`，修复后都返回明确 `Err`/Failure。原始日志见 `.artifacts/final-review-fixes/red-sp01.log`、`red-sp03.log`、`red-sp05.log` 与对应 GREEN 运行。
 
 ### 真实桌面回归（包内 `listen.exe`，真实 WASAPI/模型/焦点）
