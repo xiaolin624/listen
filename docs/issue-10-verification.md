@@ -20,13 +20,13 @@
 - 从 `whisper-cli.exe` 同目录加载 `whisper.dll`；只使用本机 DLL 与模型文件，不建立 socket、不启动服务进程、不导入网络 API。
 - `whisper_init_from_file_with_params_no_state` 加载模型一次；每次识别调用 `whisper_init_state` 创建**新的 decode state**，调用 `whisper_full_with_state`，然后 `whisper_free_state`。这避免了 `whisper-server` 复用同一 state 带来的请求间污染。
 - 参数与现有 CLI 完全一致：`beam_size=5`、`best_of=5`、`temperature=0`、`temperature_inc=0.2`、`no_speech_thold=0.6`、`entropy_thold=2.4`、`logprob_thold=-1`、`no_timestamps=true`、`no_context=true`、CPU 6 线程、`zh`。流式窗口额外使用 token 级时间戳（等价于 CLI 的 `-ojf`），并复用 `whisper_timing::build` 做 UTF-8 片段拼合与重叠归属。
-- `whisper_full_params` 按 v1.8.2 头文件逐字段镜像；编译期断言 64 位下大小为 304 字节，运行期在加载 DLL 后校验 `whisper_full_default_params` 的已知默认值（strategy、`n_max_text_ctx=16384`、`beam_size=5`、`thold_pt≈0.01`、`temperature_inc=0.2`、`grammar_penalty=100`）。不一致时拒绝使用常驻模型并回退 CLI，而不是猜测 ABI。
+- `whisper_full_params` 按 v1.8.2 头文件逐字段镜像；编译期断言 64 位下大小为 304 字节。运行期先按固定 SHA-256 校验 `whisper.dll` 是文档所述的 v1.8.2 CPU 构建（在 `LoadLibrary`/任何导出调用之前，哈希不符即拒绝常驻模型），再用 `whisper_full_default_params_by_ref`（按引用，避免按值返回的尺寸假设）读取默认值并校验 strategy、线程数、上下文、beam/greedy、温度、阈值、VAD 和回调等 40 余个字段。不一致时拒绝使用常驻模型并回退 CLI，而不是猜测 ABI。最终审查的 S-01 修复见文末。
 - 为避免 DLL 在进程退出阶段被卸载后访问已卸载代码，`ModelHost` 在 `whisper_free` 后**不调用 `FreeLibrary`**；模块由操作系统在进程结束时回收。这是有意的生命周期取舍，不影响识别结果。
 
 ### 2. 回退路径（`whisper.rs`）
 
-- `Whisper::prepare()` 在启动时后台加载常驻模型；成功时返回“模型已驻留、每窗新 state”的状态说明。
-- 加载失败（DLL 缺失、导出缺失、布局不匹配、模型损坏）时**不阻止采集**：`check_ready()` 已验证 CLI/VAD/模型文件可用，`prepare()` 返回明确的 CLI 回退说明，界面与 `status.txt` 显示 `Backend: … CLI …`，每个窗口走原 `whisper-cli.exe` 路径，音频不丢失。
+- `Whisper::prepare()` 在启动时后台执行一次**真实模型加载验证**（`whisper-cli` 用零帧 WAV 只加载模型不编码，`vad-speech-segments` 用短 WAV 加载 VAD 模型），再加载常驻模型或走 CLI。验证在子进程里进行，whisper.cpp 对损坏模型触发的断言不会终止 Listen。
+- 常驻模型不可用的分类：DLL 缺失/哈希不符/导出或布局不符属于 host-only 失败，只有 CLI 也**实际加载**了同一模型才显示 `Ready` + CLI 回退说明；模型本身加载失败（init 返回空或 CLI 验证失败）进入 `Failure`，不显示虚假就绪。最终审查的 SP-05 修复见文末。
 - 常驻模型在运行中失败时，当前窗口与后续窗口改用 CLI；`backend_note` 把失败原因写入状态，不静默切换，不把失败结果冒充成功。
 - `--backend cli` 可用于复现优化前路径；默认 `host`。
 
@@ -227,7 +227,7 @@
 - **GPU**：没有 CUDA 工具链，未编译/运行 GPU 版本；GPU 路径完全未验证。
 - **常驻模型 ABI**：结构体/导出按 v1.8.2 头文件镜像，并在运行期校验默认值；如果替换了不同版本/不同构建的 `whisper.dll`，可能拒绝并回退 CLI。没有对所有 whisper.cpp 构建做兼容性测试。
 - **DLL 生命周期**：退出时不 `FreeLibrary`，以避免已观察到的访问冲突；模块由 OS 回收。若未来需要在运行中反复加载/卸载，需要单独验证。
-- **回退路径**：启动时 DLL 缺失/布局不符会显示 CLI 回退（`prepare` 失败 → `Ready` + 明确 fallback note，有 fake 测试）；运行中 `whisper_full` 失败 → 当前窗口改走 CLI 的恢复**只有代码路径**，没有做真实故障注入；没有在真实设备上故意制造该故障。
+- **回退路径**：启动时 DLL 缺失/哈希或布局不符时，先由子进程真实加载模型；成功才显示 `Ready` + 明确 fallback note，失败则 `Failure`。模型损坏时不会进入虚假 `Ready`。运行中 `whisper_full` 失败 → 当前窗口改走 CLI 的恢复**只有代码路径**，没有做真实故障注入；没有在真实设备上故意制造该故障。
 - **目标交付**：真实采集使用任务自有原生 EDIT；没有覆盖所有编辑器/浏览器输入框。`delivery_ms` 随目标实现变化，不能当成固定 SLA。
 - **未覆盖**：物理拔插设备、会议软件独占模式、蓝牙免提/立体声切换、其他 Windows 版本、真实会议录音的分段边界质量。
 
@@ -254,3 +254,12 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File `
 ```
 
 原始证据在 `.artifacts\issue-10\`：`live-latency\live-host.json`、`live-latency\live-cli.json`、`quality-comparison.json`、`long-host-600\`、`window30\`、`pe-imports.txt`。这些目录和测量脚本不入库。
+
+## 最终整体审查后的修复（2026-11-12）
+
+- **S-01（fail-closed ABI）**：常驻模型 host 现在在 `LoadLibrary` 和任何导出调用之前校验 `whisper.dll` 的完整 SHA-256（固定为文档所述 v1.8.2 CPU 构建 `4155EDB6...0EC61FF`）；默认值改由 `whisper_full_default_params_by_ref` 按引用读取，并校验 40 余个字段，而不是只查 6 个默认值。哈希不符/布局不符属于 host-only 失败，只允许在 CLI 真实加载同一模型后回退；不会再按值调用未验证 DLL。测试：`whisper_host::tests::an_unknown_whisper_dll_is_rejected_before_any_call`、`sha256_of_a_known_payload_is_the_standard_digest`、`the_layout_check_is_not_vacuous`。
+- **SP-05（真实就绪）**：`prepare()` 先由子进程完成真实模型加载验证，再进入常驻模型或 CLI。实测：
+  - 损坏的 `ggml-small.bin`（前 4 字节仍是 `ggml` magic）：真实 release `listen.exe` 进入 `Failure`，detail 为 `The configured local model could not be loaded by the whisper.cpp CLI: ... exit code: 0xc0000409 ... this is not a claim of readiness`，**没有**虚假 `Ready`，进程也未崩溃（验证在子进程中进行）。
+  - host-only 失败 + CLI 可加载：用另一构建的 `whisper.dll`（哈希不符）作为 engine，真实 `listen.exe` 进入 `Ready`，backend 明确写“resident local model unavailable … CLI was verified …”，`timing_preparation_ms=1117`。
+  - 默认 host 正常路径：预热后 `Ready` 的准备时间为 **1453 ms**（外部观察 1711 ms），比本记录早先的 570–712 ms 增加了约 0.8 秒的一次性 CLI 模型加载验证。识别路径和解码参数未变；上文的停止→结果数字是这些 readiness 改动之前构建的记录，不应再用 0.62 秒声称当前构建的准备时间。
+- 测试：`tests/model_readiness.rs` 的两个用例在修复前分别因“旧 `prepare()` 对 host 失败直接 `Ok`”和“CLI backend 返回 `None` 直接 Ready”而 RED；修复后 GREEN。证据在 `.artifacts/final-review-fixes/`。

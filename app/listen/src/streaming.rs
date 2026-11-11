@@ -440,6 +440,10 @@ fn recognize(
 ) -> AppResult<RecognitionOutcome> {
     let mut committed = String::new();
     let mut tail = String::new();
+    // Absolute sample position where the window that produced `tail` ended. A
+    // later window that starts after this position cannot claim that text, so the
+    // tail is committed instead of being cleared.
+    let mut tail_end = 0u64;
     let mut last_timing = RecognitionTiming {
         wait_ms: 0,
         inference_ms: 0,
@@ -468,9 +472,17 @@ fn recognize(
         // A speech-free window must keep the trailing half held by the previous
         // window: that text still needs another window to claim it, or the final
         // tail to commit it. Clearing it here would erase already recognized words.
-        if !spans.is_empty() {
-            tail.clear();
+        // If a whole silent window passed, the next speech window no longer
+        // overlaps the held audio, so no window can claim it: commit it first.
+        if !tail.is_empty() {
+            if segment.start_sample > tail_end {
+                committed.push_str(&tail);
+                tail.clear();
+            } else if !spans.is_empty() {
+                tail.clear();
+            }
         }
+        let mut held_tail = false;
         for TimedText {
             start_ms,
             end_ms,
@@ -482,7 +494,13 @@ fn recognize(
                 committed.push_str(&text);
             } else if midpoint >= end {
                 tail.push_str(&text);
+                held_tail = true;
             }
+        }
+        if held_tail {
+            // Remember the audio end of the window that owns this tail, not the
+            // current window's end (a silent window does not extend the tail).
+            tail_end = segment.start_sample + segment.samples as u64;
         }
         let checkpoint = format!("{committed}{tail}");
         let staged = directory.join("partial-result.next");

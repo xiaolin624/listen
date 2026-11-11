@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -372,6 +372,8 @@ fn local_cli_timestamp_output_preserves_split_chinese_bytes_and_merges_only_the_
         runtime.0.join("flow"),
         Ok(()),
     );
+    // The CLI backend now verifies that the model really loads before Ready.
+    wait(&mut app, |s| s.phase == Phase::Ready);
     app.dispatch(Control::Start);
     let mut samples = vec![1000; 1280];
     samples.extend(vec![2000; 480]);
@@ -514,6 +516,121 @@ fn streaming_failure_retries_the_whole_retained_capture_without_repeating_the_ov
             .unwrap()
             .all(|entry| !entry.unwrap().path().is_dir()),
         "a successful streaming retry must clean its temporary audio"
+    );
+}
+
+#[test]
+fn speech_silence_speech_keeps_the_tail_held_by_the_first_window() {
+    // Window 1 ends with a word in the overlap tail; window 2 is completely
+    // silent; window 3 speaks again but starts after the tail's audio ended, so
+    // no later window can claim that word. It must be committed, not cleared.
+    struct HeldTail(AtomicUsize);
+    impl LocalTranscriber for HeldTail {
+        fn check_ready(&self) -> AppResult<()> {
+            Ok(())
+        }
+        fn transcribe(&self, _: &CapturedAudio, _: &Path) -> AppResult<String> {
+            unreachable!()
+        }
+        fn transcribe_segment(&self, _: &CapturedAudio, _: &Path) -> AppResult<Vec<TimedText>> {
+            match self.0.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(vec![
+                    TimedText {
+                        start_ms: 0,
+                        end_ms: 80,
+                        text: "开始".into(),
+                    },
+                    TimedText {
+                        start_ms: 1500,
+                        end_ms: 1590,
+                        text: "尾部".into(),
+                    },
+                ]),
+                1 => Ok(Vec::new()),
+                _ => Ok(vec![TimedText {
+                    start_ms: 200,
+                    end_ms: 300,
+                    text: "第三段".into(),
+                }]),
+            }
+        }
+    }
+
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback {
+            input: Mutex::new(Some(rx)),
+            config: config(),
+        }),
+        Arc::new(HeldTail(AtomicUsize::new(0))),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Start);
+    tx.send(vec![0; 4160]).unwrap();
+    wait(&mut app, |s| s.progress.recognized_segments == 3);
+    app.dispatch(Control::Stop);
+    let result = wait(&mut app, |s| s.phase == Phase::Result);
+    assert_eq!(result.text, "开始尾部第三段");
+}
+
+/// Recognizes the first window, then fails forever. The successful window's audio
+/// is released, so the whole capture can no longer be retried as one file.
+struct FirstWindowThenFailure(AtomicUsize);
+impl LocalTranscriber for FirstWindowThenFailure {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, _: &CapturedAudio, _: &Path) -> AppResult<String> {
+        unreachable!()
+    }
+    fn transcribe_segment(&self, _: &CapturedAudio, _: &Path) -> AppResult<Vec<TimedText>> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(vec![TimedText {
+                start_ms: 0,
+                end_ms: 80,
+                text: "开始".into(),
+            }])
+        } else {
+            Err("Local whisper.cpp recognition failed (exit code: 2)".into())
+        }
+    }
+}
+
+#[test]
+fn a_streaming_failure_after_a_recognized_window_explains_the_narrowed_retry_scope() {
+    let runtime = Runtime::new();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(Playback {
+            input: Mutex::new(Some(rx)),
+            config: config(),
+        }),
+        Arc::new(FirstWindowThenFailure(AtomicUsize::new(0))),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Start);
+    tx.send(vec![1000; 3200]).unwrap();
+    let failure = wait(&mut app, |s| s.phase == Phase::Failure);
+    assert!(
+        failure.detail.contains("partially recognized"),
+        "{failure:?}"
+    );
+    assert!(
+        failure.detail.contains(
+            "automatic local retry is only offered when no recognition window has completed"
+        ),
+        "{failure:?}"
+    );
+    assert!(
+        !failure.retry_available,
+        "the consumed window's audio no longer exists, so whole-capture retry is not offered: {failure:?}"
+    );
+    assert!(
+        !failure.retained_audio.is_empty(),
+        "the remaining unprocessed audio is still listed for manual recovery: {failure:?}"
     );
 }
 

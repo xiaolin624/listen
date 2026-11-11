@@ -98,10 +98,34 @@ if ($IncludeModels) {
 }
 
 if (Test-Path -LiteralPath $OutputDirectory) {
+    # Only remove a directory that this script created. The leaf-name check alone
+    # must never authorize deleting an unrelated "Listen-notes" or "Listen-backup".
+    $owned = $false
+    $manifestPath = Join-Path $OutputDirectory 'manifest.json'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $existing = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+            $owned = ([string]$existing.product -eq 'Listen')
+        }
+        catch { $owned = $false }
+    }
+    if (-not $owned) {
+        $markerPath = Join-Path $OutputDirectory '.listen-package'
+        if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+            try {
+                $owned = ([IO.File]::ReadAllText($markerPath).Trim() -eq ('Listen package ' + $Version))
+            }
+            catch { $owned = $false }
+        }
+    }
+    if (-not $owned) {
+        throw ('Refusing to remove ' + $OutputDirectory + ': it contains neither a Listen manifest nor a Listen package marker. Remove it manually if it is not a Listen package.')
+    }
     Remove-Item -LiteralPath $OutputDirectory -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $OutputDirectory 'engine') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $OutputDirectory 'models') | Out-Null
+[IO.File]::WriteAllText((Join-Path $OutputDirectory '.listen-package'), ('Listen package ' + $Version + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
 
 Copy-Item -LiteralPath $listen -Destination (Join-Path $OutputDirectory 'listen.exe')
 Copy-Item -LiteralPath $libunwind -Destination (Join-Path $OutputDirectory 'libunwind.dll')
@@ -142,6 +166,8 @@ $versionText = @(
 $entries = [Collections.Generic.List[object]]::new()
 foreach ($file in @(Get-ChildItem -LiteralPath $OutputDirectory -Recurse -File | Sort-Object FullName)) {
     if ($file.Name -eq 'manifest.json' -and $file.DirectoryName -eq $OutputDirectory) { continue }
+    # The package marker authorizes a later clean rebuild; it is not a delivered file.
+    if ($file.Name -eq '.listen-package' -and $file.DirectoryName -eq $OutputDirectory) { continue }
     $relative = $file.FullName.Substring($OutputDirectory.Length + 1)
     $entries.Add([ordered]@{
             path = $relative

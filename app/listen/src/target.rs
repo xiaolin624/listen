@@ -630,30 +630,42 @@ impl NativeEditor {
     fn paste_output(&self, expected: &str, replacement: &str) -> AppResult<()> {
         self.validate_identity()?;
         self.require_foreground_focus()?;
-        let backup = paste::ClipboardBackup::save();
-        let draft = paste::read_draft()?.replace("\r\n", "\n");
-        let wanted_text = replacement.replace("\r\n", "\n");
-        let known_prefix = if expected.is_empty() {
-            String::new()
-        } else {
-            format!("{expected}\n")
-        };
-        let payload = wanted_text
-            .strip_prefix(&known_prefix)
-            .map(str::to_string)
-            .unwrap_or_else(|| wanted_text.clone());
-        let separator = if draft.is_empty() { "" } else { "\n" };
-        paste::paste(&format!("{separator}{payload}"))?;
-        let observed = paste::read_back()?.replace("\r\n", "\n");
-        paste::collapse_to_end();
-        drop(backup);
-        let wanted = format!("{draft}{separator}{payload}");
-        if observed.trim_end() != wanted.trim_end() {
-            return Err(
-                "The complete target output could not be confirmed after the fallback write".into(),
-            );
+        // A provider may have applied the earlier `SetValue` after the confirmation
+        // window closed. Re-read before touching the clipboard or sending any key.
+        if normalized(&self.content()?).trim_end() == normalized(replacement).trim_end() {
+            return Ok(());
         }
-        Ok(())
+        // Never clear a clipboard whose previous content cannot be restored.
+        let backup = paste::ClipboardBackup::save()?;
+        let guard = || self.require_foreground_focus();
+        let draft = normalized(&paste::read_draft(&guard)?);
+        // The clipboard read used Ctrl+A, so leave the user with a caret even when
+        // no paste is needed. Every key event re-validates the bound target.
+        paste::collapse_to_end(&guard)?;
+        match plan_paste(expected, replacement, &draft)? {
+            // The real draft already contains the complete intended text (for
+            // example a late or normalized provider write). Pasting again would
+            // duplicate the transcript.
+            PastePlan::AlreadyComplete | PastePlan::NothingToAppend => {
+                drop(backup);
+                return Ok(());
+            }
+            PastePlan::Append { separator, text } => {
+                let payload = format!("{separator}{text}");
+                paste::paste(&payload, &guard)?;
+                let observed = normalized(&paste::read_back(&guard)?);
+                paste::collapse_to_end(&guard)?;
+                drop(backup);
+                let wanted = format!("{draft}{payload}");
+                if observed.trim_end() != wanted.trim_end() {
+                    return Err(
+                        "The complete target output could not be confirmed after the fallback write"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+        }
     }
     /// The fallback writer sends real key events, so it may only run while the bound
     /// editor itself still owns the foreground keyboard focus.
@@ -676,6 +688,82 @@ impl NativeEditor {
         }
         Ok(())
     }
+}
+
+/// Line endings are not part of the delivered text's meaning. Providers can report
+/// the same content as CRLF or LF, so every comparison and the payload calculation
+/// use this form.
+fn normalized(value: &str) -> String {
+    value.replace("\r\n", "\n")
+}
+
+/// What the fallback writer must do after reading the real draft. `expected` is
+/// the draft read before the UIA write, `replacement` is the complete intended
+/// value, and `draft` is the live value read through the clipboard.
+#[derive(Debug, PartialEq, Eq)]
+enum PastePlan {
+    /// The real draft already holds the complete intended value.
+    AlreadyComplete,
+    /// There is no transcript to append.
+    NothingToAppend,
+    /// Append `text` after the current draft, separated by `separator`.
+    Append {
+        separator: &'static str,
+        text: String,
+    },
+}
+
+/// Plans the fallback paste without trusting the un-normalized `expected` draft.
+/// The transcript is always recovered by stripping the *normalized* expected draft
+/// and its separator from the intended value; the live draft only decides whether a
+/// write already happened and which separator to use. This never appends the whole
+/// intended value when the target draft is not the expected one.
+fn plan_paste(expected: &str, replacement: &str, draft: &str) -> AppResult<PastePlan> {
+    let expected = normalized(expected);
+    let replacement = normalized(replacement);
+    let draft = normalized(draft);
+    if replacement.trim_end() == expected.trim_end() {
+        return Ok(PastePlan::NothingToAppend);
+    }
+    let appended = if expected.is_empty() {
+        replacement.as_str()
+    } else {
+        let prefix = format!("{expected}\n");
+        replacement.strip_prefix(&prefix).ok_or_else(|| {
+            "The intended target value does not start with the draft read at stop; the fallback writer refused to paste to avoid duplicating the original draft"
+                .to_string()
+        })?
+    };
+    if appended.trim().is_empty() {
+        return Ok(PastePlan::NothingToAppend);
+    }
+    if draft.trim_end() == replacement.trim_end() {
+        return Ok(PastePlan::AlreadyComplete);
+    }
+    let live = draft.trim_end();
+    let expected_trimmed = expected.trim_end();
+    if live == expected_trimmed {
+        return Ok(PastePlan::Append {
+            separator: if draft.is_empty() { "" } else { "\n" },
+            text: appended.to_string(),
+        });
+    }
+    // A capacity-limited provider can store a longer prefix of the intended value
+    // after the confirmation window closed. Appending after that partial value
+    // would exceed the same limit, so report it instead of pasting.
+    if live.len() > expected_trimmed.len() && replacement.trim_end().starts_with(live) {
+        return Err(format!(
+            "The original target accepted only {} of {} characters; the appended text was truncated",
+            live.chars().count(),
+            replacement.trim_end().chars().count()
+        ));
+    }
+    // The user or provider changed the draft after it was read. Keep that changed
+    // draft and append only the transcript, never a stale copy of the old draft.
+    Ok(PastePlan::Append {
+        separator: if draft.is_empty() { "" } else { "\n" },
+        text: appended.to_string(),
+    })
 }
 
 /// Confirms that the focused element lives inside the window selected at capture start.
@@ -746,5 +834,109 @@ fn runtime_id(element: &IUIAutomationElement) -> AppResult<Vec<i32>> {
             return Err("The selected editor has no runtime identity".into());
         }
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crlf_expected_never_repeats_the_original_draft() {
+        // A native multiline EDIT reports CRLF while the intended value is built
+        // from the same draft with a '\n' separator. The payload must be only the
+        // transcript, never the whole draft again.
+        let expected = "第一行\r\n第二行";
+        let replacement = "第一行\r\n第二行\n今天轉寫";
+        let draft = "第一行\r\n第二行";
+        assert_eq!(
+            plan_paste(expected, replacement, draft).unwrap(),
+            PastePlan::Append {
+                separator: "\n",
+                text: "今天轉寫".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_late_complete_write_is_confirmed_without_pasting_again() {
+        let expected = "原有草稿";
+        let replacement = "原有草稿\n今天轉寫";
+        // The provider applied the write after the 2 second confirmation window.
+        let draft = "原有草稿\r\n今天轉寫\r\n";
+        assert_eq!(
+            plan_paste(expected, replacement, draft).unwrap(),
+            PastePlan::AlreadyComplete
+        );
+    }
+
+    #[test]
+    fn an_empty_draft_gets_no_leading_separator() {
+        assert_eq!(
+            plan_paste("", "今天轉寫", "").unwrap(),
+            PastePlan::Append {
+                separator: "",
+                text: "今天轉寫".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_changed_draft_is_preserved_and_only_the_transcript_is_appended() {
+        // The user kept typing during the stop-to-result delay. The live draft is
+        // not the expected one; appending the stale expected draft would duplicate
+        // and would overwrite the edit.
+        assert_eq!(
+            plan_paste("原有草稿", "原有草稿\n今天轉寫", "原有草稿 plus later edit").unwrap(),
+            PastePlan::Append {
+                separator: "\n",
+                text: "今天轉寫".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_late_truncated_write_is_reported_instead_of_pasted() {
+        let error = plan_paste(
+            "capacity draft",
+            "capacity draft\nthe appended transcript",
+            "capacity draft\nthe app",
+        )
+        .unwrap_err();
+        assert!(error.contains("truncated"), "{error}");
+        assert!(error.contains("of"), "{error}");
+    }
+
+    #[test]
+    fn an_intended_value_that_does_not_contain_the_expected_draft_is_refused() {
+        let error =
+            plan_paste("expected draft", "unrelated replacement", "expected draft").unwrap_err();
+        assert!(error.contains("refused"), "{error}");
+    }
+
+    #[test]
+    fn line_endings_do_not_change_completion_judgement() {
+        assert_eq!(
+            plan_paste("a\r\nb", "a\r\nb\nc", "a\nb\r\nc").unwrap(),
+            PastePlan::AlreadyComplete
+        );
+        assert_eq!(
+            plan_paste("a\r\nb", "a\r\nb\nc", "a\r\nb").unwrap(),
+            PastePlan::Append {
+                separator: "\n",
+                text: "c".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_write_that_left_the_previous_content_unchanged_appends_the_transcript() {
+        assert_eq!(
+            plan_paste("old", "old\nnew", "old").unwrap(),
+            PastePlan::Append {
+                separator: "\n",
+                text: "new".into()
+            }
+        );
     }
 }

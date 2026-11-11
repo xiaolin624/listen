@@ -2,7 +2,10 @@
 //! (in-process `whisper.dll`, fresh decode state per request) with an explicit
 //! fallback to the one-shot `whisper-cli.exe`. No networking or alternative
 //! recognizer exists.
-use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText, whisper_host::ModelHost};
+use crate::{
+    AppResult, CapturedAudio, LocalTranscriber, TimedText,
+    whisper_host::{LoadFailure, ModelHost},
+};
 use std::{
     fs::{self, File},
     io::Read,
@@ -15,6 +18,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -233,7 +237,7 @@ impl Whisper {
         if self.backend == Backend::Cli || self.host_disabled.load(Ordering::Acquire) {
             return None;
         }
-        let mut guard = self.host.lock().unwrap();
+        let mut guard = self.host.lock().unwrap_or_else(|e| e.into_inner());
         let host = guard.as_mut()?;
         let result = run(host);
         drop(guard);
@@ -247,43 +251,73 @@ impl Whisper {
     /// window is retried through the CLI path by the caller; no audio is lost.
     fn disable_host(&self, error: &str) {
         self.host_disabled.store(true, Ordering::Release);
-        *self.note.lock().unwrap() = Some(format!(
+        *self.note.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
             "The resident local model failed ({error}); remaining windows use the whisper.cpp CLI, which reloads the model. No audio was lost."
         ));
-        self.host.lock().unwrap().take();
+        self.host.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
 impl LocalTranscriber for Whisper {
     fn prepare(&self) -> Option<mpsc::Receiver<AppResult<String>>> {
-        if self.backend == Backend::Cli {
-            return None;
-        }
         let (sender, receiver) = mpsc::channel();
         let host = self.host.clone();
         let note = self.note.clone();
         let disabled = self.host_disabled.clone();
         let executable = self.executable.clone();
         let model = self.model.clone();
+        let vad_model = self.vad_model.clone();
         let language = self.language.clone();
         let threads = self.threads;
+        let backend = self.backend;
         thread::spawn(move || {
+            // The model files are verified by a real whisper.cpp load *before* the
+            // in-process host touches them: whisper.cpp aborts the process on some
+            // corrupt models (GGML_ASSERT), so the host must never be the first
+            // reader of an unverified model. The CLI check runs in a child process,
+            // so a corrupt model becomes a reported Failure instead of a crash.
+            if let Err(error) = verify_models_with_cli(&executable, &model, &vad_model, &language) {
+                disabled.store(true, Ordering::Release);
+                let message = format!(
+                    "The configured local model could not be loaded by the whisper.cpp CLI: {error}. Capture is unavailable until the local model and backend are repaired; this is not a claim of readiness."
+                );
+                *note.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+                let _ = sender.send(Err(message));
+                return;
+            }
+            if backend == Backend::Cli {
+                // The CLI is the actual decoder in this mode; it just loaded both
+                // model files above, so readiness is no longer inferred from magic.
+                let message = "whisper.cpp CLI (one process per window; the model is reloaded each window; both local model files were load-verified).".to_string();
+                *note.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+                let _ = sender.send(Ok(message));
+                return;
+            }
             match ModelHost::load(&executable, &model, threads, &language) {
                 Ok(loaded) => {
-                    *host.lock().unwrap() = Some(loaded);
-                    let message = "Local model is loaded and resident in this process (CPU, no CUDA backend); every window decodes in a fresh state and no window waits to reload the model.".to_string();
-                    *note.lock().unwrap() = Some(message.clone());
+                    *host.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
+                    let message = "Local model is loaded and resident in this process (CPU, no CUDA backend); the model files were also load-verified by the local CLI, every window decodes in a fresh state and no window waits to reload the model.".to_string();
+                    *note.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
                     let _ = sender.send(Ok(message));
                 }
-                Err(error) => {
-                    // The CLI path was validated by check_ready. Keep capture
-                    // available, but state explicitly that every window will pay
-                    // the model load again rather than claiming a false warm state.
+                Err(LoadFailure::Model(error)) => {
+                    // The CLI loaded the same model during verification, so the model
+                    // itself is not the cause; do not pretend the backend is ready.
                     disabled.store(true, Ordering::Release);
                     let message = format!(
-                        "The resident local model is unavailable ({error}); Listen will use the whisper.cpp CLI for each window, which reloads the model and is slower. No audio is lost."
+                        "The local model could not be loaded by the resident host ({error}); the CLI loaded it during verification, so the local backend is inconsistent. Capture is unavailable until the local backend is repaired."
                     );
-                    *note.lock().unwrap() = Some(message.clone());
+                    *note.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+                    let _ = sender.send(Err(message));
+                }
+                Err(LoadFailure::Host(error)) => {
+                    // A host-only problem (missing/unknown DLL or export) is
+                    // recoverable through the CLI, which just loaded the model.
+                    disabled.store(true, Ordering::Release);
+                    let message = format!(
+                        "The resident local model is unavailable ({error}); the whisper.cpp CLI was verified to load the same local model, so Listen will use the CLI for each window. That reloads the model and is slower. No audio is lost."
+                    );
+                    *note.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
                     let _ = sender.send(Ok(message));
                 }
             }
@@ -292,7 +326,7 @@ impl LocalTranscriber for Whisper {
     }
 
     fn backend_note(&self) -> Option<String> {
-        self.note.lock().unwrap().clone()
+        self.note.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn check_ready(&self) -> AppResult<()> {
@@ -401,4 +435,117 @@ fn read_cli_text(stem: &Path, directory: &Path) -> AppResult<String> {
         )
     })?;
     Ok(text.trim().to_string())
+}
+
+/// Proves that the configured model files can actually be loaded by the local
+/// executables that will decode with them. The pinned v1.8.2 CLI loads the model
+/// and then fails to read the zero-frame WAV without encoding, which still exits 0;
+/// a corrupt or truncated model aborts before that point. The VAD model is loaded
+/// against a short valid WAV. The check runs in a private temporary directory and
+/// never writes into the user's runtime directory.
+fn verify_models_with_cli(
+    executable: &Path,
+    model: &Path,
+    vad_model: &Path,
+    language: &str,
+) -> AppResult<()> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "listen-model-check-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory)
+        .map_err(|e| format!("Cannot create a model verification directory: {e}"))?;
+    let result = (|| -> AppResult<()> {
+        let empty = directory.join("empty.wav");
+        write_probe_wav(&empty, &[])?;
+        let probe = directory.join("probe.wav");
+        write_probe_wav(&probe, &[0i16; 4_000])?;
+        let log_path = directory.join("model-check.log");
+        let log = File::create(&log_path)
+            .map_err(|e| format!("Cannot create the model verification log: {e}"))?;
+        let status = Command::new(executable)
+            .arg("-m")
+            .arg(model)
+            .arg("-f")
+            .arg(&empty)
+            .args(["-l", language, "-t", "1", "-nt", "-otxt", "-of"])
+            .arg(directory.join("stem"))
+            .arg("-ng")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .status()
+            .map_err(|e| {
+                format!(
+                    "Cannot run the local whisper.cpp executable for model verification ({}): {e}",
+                    executable.display()
+                )
+            })?;
+        let log_text = fs::read_to_string(&log_path).unwrap_or_default();
+        // The timing line is printed only after the model was loaded; the zero-frame
+        // audio failure then follows. Requiring it avoids treating an early CLI
+        // argument failure as a successful model load.
+        if !status.success() || !log_text.contains("load time") {
+            return Err(format!(
+                "the whisper.cpp executable did not load the model ({status}). Log: {}",
+                log_path.display()
+            ));
+        }
+        let vad_log_path = directory.join("vad-check.log");
+        let vad_output_path = directory.join("vad-check.txt");
+        let vad_log = File::create(&vad_log_path)
+            .map_err(|e| format!("Cannot create the VAD verification log: {e}"))?;
+        let vad_output = File::create(&vad_output_path)
+            .map_err(|e| format!("Cannot create the VAD verification output: {e}"))?;
+        let status = Command::new(executable.with_file_name("vad-speech-segments.exe"))
+            .args(["-vm"])
+            .arg(vad_model)
+            .arg("-f")
+            .arg(&probe)
+            .arg("-np")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(vad_output))
+            .stderr(Stdio::from(vad_log))
+            .status()
+            .map_err(|e| {
+                format!("Cannot run the local speech detector for model verification: {e}")
+            })?;
+        // The pinned VAD CLI writes its segment count to stdout (the same stream
+        // the application reads during normal speech detection).
+        let vad_text = fs::read_to_string(&vad_output_path).unwrap_or_default();
+        if !status.success() || !vad_text.contains("Detected") {
+            return Err(format!(
+                "the local speech detector did not load its model ({status}). Log: {}",
+                vad_log_path.display()
+            ));
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+fn write_probe_wav(path: &Path, samples: &[i16]) -> AppResult<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| format!("Cannot create a probe WAV: {e}"))?;
+    for &sample in samples {
+        writer
+            .write_sample(sample)
+            .map_err(|e| format!("Cannot write a probe WAV: {e}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| format!("Cannot finalize a probe WAV: {e}"))
 }
