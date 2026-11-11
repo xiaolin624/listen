@@ -18,13 +18,17 @@ use std::{
 struct Runtime(PathBuf);
 impl Runtime {
     fn new() -> Self {
+        // The wall clock alone is not unique: parallel tests can read the same
+        // tick, and one Runtime::drop would then delete another test's directory.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "listen-long-{}-{}",
+            "listen-long-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
