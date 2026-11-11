@@ -14,7 +14,15 @@ pub struct Config {
     hidden: bool,
 }
 
-fn parse() -> Result<Result<Config, String>, String> {
+enum LaunchAction {
+    Run(Config),
+    Control(String),
+    Help,
+}
+
+const HELP: &str = "Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nControl running application: --control <start|stop|toggle|show|quit>\nResults are copyable in the application. Messages are never sent automatically.";
+
+fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
     let root = executable
         .ancestors()
@@ -36,7 +44,7 @@ fn parse() -> Result<Result<Config, String>, String> {
             continue;
         }
         if arg == "--help" || arg == "-h" {
-            return Err("Listen: Ctrl+Alt+R starts/stops default multimedia playback capture.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --hidden\nControl running application: --control <start|stop|toggle|show|quit>\nResults are copyable in the application. Messages are never sent automatically.".into());
+            return Ok(LaunchAction::Help);
         }
         let value = args
             .next()
@@ -46,7 +54,7 @@ fn parse() -> Result<Result<Config, String>, String> {
                 if args.next().is_some() {
                     return Err("--control must be used on its own".into());
                 }
-                return Ok(Err(value));
+                return Ok(LaunchAction::Control(value));
             }
             "--engine" => config.engine = PathBuf::from(value),
             "--model" => config.model = PathBuf::from(value),
@@ -70,13 +78,17 @@ fn parse() -> Result<Result<Config, String>, String> {
             *path = cwd.join(&*path);
         }
     }
-    Ok(Ok(config))
+    Ok(LaunchAction::Run(config))
 }
 
 fn main() {
     let result = match parse() {
-        Ok(Ok(config)) => gui::run(config),
-        Ok(Err(control)) => gui::control(&control),
+        Ok(LaunchAction::Run(config)) => gui::run(config),
+        Ok(LaunchAction::Control(control)) => gui::control(&control),
+        Ok(LaunchAction::Help) => {
+            gui::show_help(HELP);
+            Ok(())
+        }
         Err(error) => {
             gui::show_error(&error);
             std::process::exit(2);

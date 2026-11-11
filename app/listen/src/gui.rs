@@ -56,12 +56,20 @@ fn fixed<const N: usize>(target: &mut [u16; N], value: &str) {
 }
 
 pub fn show_error(error: &str) {
+    show_message(error, MB_ICONERROR);
+}
+
+pub fn show_help(help: &str) {
+    show_message(help, MB_ICONINFORMATION);
+}
+
+fn show_message(message: &str, icon: MESSAGEBOX_STYLE) {
     unsafe {
         MessageBoxW(
             None,
-            PCWSTR(wide(error).as_ptr()),
+            PCWSTR(wide(message).as_ptr()),
             w!("Listen"),
-            MB_OK | MB_ICONERROR,
+            MB_OK | icon,
         );
     }
 }
@@ -477,6 +485,39 @@ impl Ui {
     }
 }
 
+unsafe fn show_tray_menu(hwnd: HWND) {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("显示当前结果"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, w!("开始 / 停止  Ctrl+Alt+R"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let _ = SetForegroundWindow(hwnd);
+        let selected = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            Some(0),
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        if selected.0 != 0 {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_COMMAND,
+                WPARAM(selected.0 as usize),
+                LPARAM(0),
+            );
+        }
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -530,41 +571,17 @@ unsafe extern "system" fn window_proc(
                     if matches!(lparam.0 as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK) {
                         state.show();
                     }
-                    if lparam.0 as u32 == WM_RBUTTONUP {
-                        if let Ok(menu) = CreatePopupMenu() {
-                            let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("显示当前结果"));
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                ID_TOGGLE,
-                                w!("开始 / 停止  Ctrl+Alt+R"),
-                            );
-                            let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
-                            let mut point = POINT::default();
-                            let _ = GetCursorPos(&mut point);
-                            let _ = SetForegroundWindow(hwnd);
-                            let selected = TrackPopupMenu(
-                                menu,
-                                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                point.x,
-                                point.y,
-                                Some(0),
-                                hwnd,
-                                None,
-                            );
-                            let _ = DestroyMenu(menu);
-                            if selected.0 != 0 {
-                                state.command(selected.0 as usize);
-                            }
-                            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-                        }
-                    }
                     true
                 }
                 _ => false,
             }
         });
         if handled {
+            if message == TRAY_MESSAGE && lparam.0 as u32 == WM_RBUTTONUP {
+                // Native menus dispatch hotkey, control and timer messages while open.
+                // Release the UI borrow before entering that nested message loop.
+                show_tray_menu(hwnd);
+            }
             LRESULT(0)
         } else {
             DefWindowProcW(hwnd, message, wparam, lparam)
