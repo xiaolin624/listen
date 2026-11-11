@@ -409,3 +409,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 - **SP-09 / T10 AC7**：600 秒/资源数字来自 `examples\long_session.exe` harness + 包内引擎/模型，不是包内 `listen.exe` 的界面流程；本记录和发布说明已按此改写，但 T10 AC7 的严格字面要求仍未被 harness 测量满足。
 - **SP-11 / T9 AC5**：真实会议软件并发流畅度仍未验证；本轮未新增会议软件负载。
 - **准备时间**：新增的真实模型加载验证使默认 host 准备从约 0.57–0.71 s 增至约 1.45 s；8 样本/600 秒的停止→结果数字是准备改动前构建的记录，识别路径未变，但若要引用当前构建的完整延迟，应重新跑一次延迟验收。
+
+## 最终交付包（审查修复后重建）
+
+审查修复合并后（`cab4ef5`），用 `scripts\package-listen.ps1 -IncludeModels -SkipBuild` 从干净工作树重建了交付包，并用 `scripts\verify-listen-package.ps1` 重新校验：17 个文件、493,311,730 字节（不含 manifest），`Preparing → Ready`，`start_to_state_ms = 2027`，`control_quit_ok = true`，哈希校验 17/17。证据：`.artifacts\issue-11\package\verify-20261112-033626.json`。
+
+**打包产物的系统级禁网复验仍未完成**：本会话两次尝试用提权防火墙临时封禁包内 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`，两次 UAC 提权都被取消（`The operation was canceled by the user`），没有规则被创建（残留 0 条）。因此"包内二进制在系统级隔离下运行"这一条仍缺实测。
+
+替代证据（强度更高，但不能冒充同一条测试）：
+
+- 包内 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`、`engine\whisper.dll` 都没有任何 `ws2_32`/`mswsock`/`winhttp`/`wininet`/`urlmon`/`dnsapi` 导入；**没有 `ws2_32`/`mswsock` 就无法建立任何出站连接**。
+- 打包产物的真实运行中，相关进程共加载 57 个模块，没有网络模块。
+- 同一套采集与识别源码在 `9faa9c3` 上做过一次**系统级强制禁网**的完整 8 样本验收并全部通过。
+
+如果要对这个包补做同等强度的验收，需要在有人在场时批准一次提权，然后用 `.artifacts\offline-firewall-helper-final-package.ps1` 的同一套步骤重跑，跑完立即删除规则。
