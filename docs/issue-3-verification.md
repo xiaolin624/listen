@@ -2,7 +2,7 @@
 
 范围：[T2：向预先选定的原生输入框追加转写文本](https://github.com/xiaolin624/listen/issues/3)。实现工作树 `E:\luyin\.worktrees\issue-3`，分支 `implement/issue-3-native-target`，开始基线与集成分支均为 `e4f93bf511d160cd356813bc1d8f50b41a0d0b63`。#2 已完成，本任务保留其采集、托盘、控制命令、备用文本框和复制行为。
 
-主流程已完成下述三条真实 Windows 桌面路径：原目标追加、开始无目标和原目标关闭。均通过实际点击、系统全局快捷键、真实 WASAPI 采集和本地 whisper.cpp 识别；没有向正式应用提供测试控件句柄。自动行为验证为 12/12 通过。规范与需求双轴审查结果将在本记录补充后再关闭任务。
+主流程已完成下述三条真实 Windows 桌面路径：原目标追加、开始无目标和原目标关闭。均通过实际点击、系统全局快捷键、真实 WASAPI 采集和本地 whisper.cpp 识别；没有向正式应用提供测试控件句柄。自动行为验证为 12/12 通过。规范与需求双轴审查及唯一 P3 重构的检查均已完成，#3 范围验收通过；任务仍待主流程记录结果后关闭。
 
 ## 自动行为验证与 RED → GREEN
 
@@ -42,6 +42,26 @@ UIA 的读取、检查和 `SetValue` 并非跨进程原子事务；同时发生�
 最终 `scripts/build-listen.ps1 -ToolsRoot E:\luyin\.tools -Task Test` 为 **12/12 通过**，同一脚本的 `-Task CheckFormat` 通过，`git diff --check` 通过。`-Task Build` 使用离线锁定依赖，release 构建通过（29.84 秒）；产物为本工作树的 `app\listen\target\release\listen.exe` 和相邻 `libunwind.dll`。以上行为测试不连接桌面，也不运行真实 WASAPI 或识别引擎。
 
 合并后主工作区也完成离线锁定依赖的 release 构建（25.17 秒），产物位于 `E:\luyin\app\listen\target\release\`。
+
+## 双轴代码审查与修复
+
+### Standards
+
+审查结果为 **0 项仓库规范硬性违规、1 项 P3 启发式问题**：目标生命周期的 `Cell<(usize, usize, bool)>` 通过位置表达原目标、根窗口和永久失效状态，属于可能的 Primitive Obsession，并非仓库规范违规。
+
+审查修复将其改为小型 `Copy` 类型 `LifetimeState`，保留 `Cell`，使用 `target`、`root`、`invalid` 命名字段。初始值、绑定时重置、销毁事件中永久失效的逻辑以及验证读取均保持原语义；未增加额外抽象。该 P3 已修复，没有剩余 Standards 发现。
+
+### Spec
+
+审查结果为 **0 项发现**。#3 范围内未发现遗漏、额外行为或错误实现：开始时取得真实焦点并固定原目标，输出前读取最新草稿，只追加一次；无目标、原目标销毁或写入未确认时保留完整备用结果，不重新选取目标，也不自动重试或发送。通用编辑区、更多异常输出、流式识别和模型质量工作仍属后续任务。
+
+### 审查修复验证
+
+修复工作树为 `E:\luyin\.worktrees\issue-3-review-fixes`，分支 `implement/issue-3-review-fixes`，开始基线为集成提交 `93db02dcfbee87083893f1359b7406434c018cdd`。本次是审查阶段的状态类型重构，没有为内部字段改名新增测试。
+
+修复前后均运行 `scripts/build-listen.ps1 -ToolsRoot E:\luyin\.tools -Task Test`，现有完整流程测试均 **12/12 通过**。修复后同一脚本的 `-Task CheckFormat`、离线锁定依赖的 `-Task Build` 及 `git diff --check` 均通过；release 构建耗时 29.50 秒，产物为该修复工作树的 `app\listen\target\release\listen.exe` 和相邻 `libunwind.dll`。
+
+本次修复检查未运行 GUI、音频采集或本地识别。真实桌面验收沿用下节主流程已经通过且截图已经目视检查的三条路径，不把本次自动检查记为新的桌面验收。
 
 ## 主流程真实 Windows 桌面验收
 

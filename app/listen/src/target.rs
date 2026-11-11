@@ -237,9 +237,20 @@ impl Drop for LifetimeHook {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LifetimeState {
+    target: usize,
+    root: usize,
+    invalid: bool,
+}
+
 thread_local! {
     // Native HWND and UIA runtime IDs can be reused after destruction. Never rebind.
-    static LIFETIME: Cell<(usize, usize, bool)> = const { Cell::new((0, 0, false)) };
+    static LIFETIME: Cell<LifetimeState> = const { Cell::new(LifetimeState {
+        target: 0,
+        root: 0,
+        invalid: false,
+    }) };
 }
 
 unsafe extern "system" fn destroyed(
@@ -253,12 +264,11 @@ unsafe extern "system" fn destroyed(
 ) {
     if object == OBJID_WINDOW.0 && child == CHILDID_SELF as i32 {
         LIFETIME.with(|state| {
-            let (target, root, invalid) = state.get();
-            state.set((
-                target,
-                root,
-                invalid || hwnd.0 as usize == target || hwnd.0 as usize == root,
-            ));
+            let mut lifetime = state.get();
+            lifetime.invalid = lifetime.invalid
+                || hwnd.0 as usize == lifetime.target
+                || hwnd.0 as usize == lifetime.root;
+            state.set(lifetime);
         });
     }
 }
@@ -292,7 +302,13 @@ impl NativeEditor {
                 .ok()
                 .map_err(|e| e.to_string())?;
             let com = Com;
-            LIFETIME.with(|state| state.set((focus.hwnd, focus.root, false)));
+            LIFETIME.with(|state| {
+                state.set(LifetimeState {
+                    target: focus.hwnd,
+                    root: focus.root,
+                    invalid: false,
+                });
+            });
             let hook = SetWinEventHook(
                 EVENT_OBJECT_DESTROY,
                 EVENT_OBJECT_DESTROY,
@@ -328,7 +344,7 @@ impl NativeEditor {
 
     fn validate(&self) -> AppResult<()> {
         pump_events();
-        if LIFETIME.with(|state| state.get().2) || !self.focus.identity.matches() {
+        if LIFETIME.with(|state| state.get().invalid) || !self.focus.identity.matches() {
             return Err(
                 "The original target was destroyed; replacement controls are not used".into(),
             );
