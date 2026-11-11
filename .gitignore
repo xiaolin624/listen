@@ -1,4 +1,5 @@
 .tools/
 .artifacts/
+.worktrees/
 **/target/
 __pycache__/
