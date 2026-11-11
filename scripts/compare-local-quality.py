@@ -14,6 +14,8 @@ import wave
 # Keep the selected profile in sync with Whisper::transcribe. The baseline is #2.
 PROFILES = {
     "baseline": [],
+    "selected": ["-bs", "5", "-bo", "5", "-tp", "0", "-tpi", "0.2",
+                 "-nth", "0.6", "-lpt", "-1", "-et", "2.4"],
     "no-fallback": ["-bs", "5", "-bo", "5", "-tp", "0", "-nf", "-sns"],
     "strict-no-speech": ["-bs", "5", "-bo", "5", "-tp", "0", "-nf", "-sns",
                          "-nth", "0.5", "-lpt", "0"],

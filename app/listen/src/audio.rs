@@ -289,9 +289,9 @@ fn capture(
         result?;
         stopped?;
         finalized?;
-        if frames == 0 || peak < 0.00001 {
-            return Err("No audible playback was captured. Check that the headphones are the Windows default multimedia playback device; audio was retained".into());
-        }
+        // Silence and an idle render device are valid capture results. Only real
+        // device/packet/storage errors above are failures; speech detection owns
+        // the no-speech outcome and must not lose quiet valid speech here.
         Ok(CapturedAudio {
             path: path.clone(),
             description: format!(

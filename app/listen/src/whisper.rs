@@ -22,6 +22,13 @@ impl Whisper {
     }
 
     fn has_speech(&self, audio: &CapturedAudio, directory: &Path) -> AppResult<bool> {
+        let wav = hound::WavReader::open(&audio.path)
+            .map_err(|e| format!("Cannot read captured WAV for local speech detection: {e}"))?;
+        // WASAPI can legitimately return no packets while the render device is idle.
+        // The standalone VAD CLI rejects a zero-frame WAV, so finish it explicitly.
+        if wav.len() == 0 {
+            return Ok(false);
+        }
         let output_path = directory.join("vad.txt");
         let log_path = directory.join("vad.log");
         let output =
