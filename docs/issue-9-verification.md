@@ -101,3 +101,27 @@ python scripts/compare-local-quality.py --engine E:\luyin\.tools\whisper-v1.8.2-
 记录写到 `.artifacts\quality-capture\<sample>.json`，含原文、输出、WAV 哈希、最终状态与停止后耗时。脚本核对运行目录的进程 ID 和当前工作树程序路径；不操作已在采集/处理中的会话。非语音必须 `NoSpeech` 且旧结果不变；失败保留音频，不自动清理失败数据。每份证据明确写出没有验证桌面热键、目标/剪贴板读回。仍须另行检查原目标和备用文本框全文、原草稿、未自动发送，再在系统强制禁网条件下重复；静态文件或单独 CLI 成功不能代替这些步骤。
 
 VAD 不是无误的语音证明：很短、很轻的发言可能被拒绝，复杂音乐/游戏音效可能误判。当前固定音乐/提示音样本没有覆盖全部非语音，更没有覆盖真实会议的噪声、口音、多人重叠与所有录音分段边界。这些限制和已知错字应随验收结果继续保留。
+
+## 强制禁网复验（2026-11-12）
+
+模型换成 small + Silero 之后补做的系统级禁网验收。本机没有第 #2 轮那个独立禁网桌面沙箱，本次改用**临时 Windows 防火墙出站封禁**：
+
+- 由一次提权进程为 `listen.exe`、`whisper-cli.exe`、`vad-speech-segments.exe` 各建一条 `Direction=Outbound / Action=Block / Profile=Any / Enabled=True` 的规则（规则状态记录在 `.artifacts\offline-firewall\rules-ready.json`）；
+- 在封禁生效期间跑完整流程：默认渲染设备上真实播放 8 个固定样本、真实 WASAPI loopback、真实 small + Silero、目标为真实桌面应用（DeepSeek Harness 输入框，由真实焦点选定）；
+- 跑完后由同一提权进程删除规则，并记录 `cleanup_complete: true`、`still_present: []`（`.artifacts\offline-firewall\rules-removed.json`），随后查询确认没有残留规则。
+
+结果（`.artifacts\quality-offline-harness\harness-evidence.json`）：
+
+| 样本 | 阶段 | 交付 |
+| --- | --- | --- |
+| mandarin / mixed-technical / english-numbers / homophones / multiline | `Result` | 逐字追加到目标输入框 |
+| silence / instrumental / notification | `NoSpeech` | 不写目标、旧结果与目标不变 |
+
+8 个样本全部符合预期，说明封禁条件下采集、本地识别和交付都正常，不存在云端回退。
+
+补充的静态与运行期证据：
+
+- `listen.exe`、`whisper-cli.exe`、`vad-speech-segments.exe` 的二进制里**没有**任何 `ws2_32/winhttp/wininet/urlmon/dnsapi/mswsock` 名称，即没有网络导入。
+- 在另一次真实采集流程中轮询三个进程实际加载的模块，共 56 个，**没有一个是网络模块**（`.artifacts\quality-offline\module-evidence.json`）。
+
+限制：本次封禁作用在这三个二进制上，不是物理断网；但两个二进制层面的事实（无网络导入、运行期无网络模块加载）说明正式路径本来就没有联网能力。防火墙规则已全部删除，机器网络设置未被修改。
