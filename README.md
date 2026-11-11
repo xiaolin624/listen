@@ -2,7 +2,7 @@
 
 Windows 后台工具：先点击目标编辑区，按 **Ctrl+Alt+R** 开始采集默认多媒体播放设备的声音，再按一次停止，在本机用 whisper.cpp 转写，将完整结果追加到原生或网页目标编辑区的最新草稿末尾。无法可靠写入时，在工具自己的**备用文本框**中查看和复制完整结果。工具不会自动发送消息，也不会把转写文本作为命令执行。
 
-已完成 [Issue #2](https://github.com/xiaolin624/listen/issues/2) 的采集到复制流程，并实现 [Issue #3](https://github.com/xiaolin624/listen/issues/3) 的原生目标绑定和 [Issue #4](https://github.com/xiaolin624/listen/issues/4) 的通用桌面/网页编辑区追加；真实桌面与浏览器验收分别见 [T2 验证记录](docs/issue-3-verification.md) 和 [T3 验证记录](docs/issue-4-verification.md)。[Issue #9](https://github.com/xiaolin624/listen/issues/9) 的本地模型与语音检测方案见 [质量基线](docs/issue-9-verification.md)，[Issue #6](https://github.com/xiaolin624/listen/issues/6) 的长时间分段采集与收尾见 [长会话验证记录](docs/issue-6-verification.md)。普通采集期间只显示状态，不持续生成字幕。
+已完成 [Issue #2](https://github.com/xiaolin624/listen/issues/2) 的采集到复制流程，并实现 [Issue #3](https://github.com/xiaolin624/listen/issues/3) 的原生目标绑定和 [Issue #4](https://github.com/xiaolin624/listen/issues/4) 的通用桌面/网页编辑区追加；真实桌面与浏览器验收分别见 [T2 验证记录](docs/issue-3-verification.md) 和 [T3 验证记录](docs/issue-4-verification.md)。[Issue #9](https://github.com/xiaolin624/listen/issues/9) 的本地模型与语音检测方案见 [质量基线](docs/issue-9-verification.md)，[Issue #6](https://github.com/xiaolin624/listen/issues/6) 的长时间分段采集与收尾见 [长会话验证记录](docs/issue-6-verification.md)，[Issue #7](https://github.com/xiaolin624/listen/issues/7) 的失败重试见 [重试验证记录](docs/issue-7-verification.md)，[Issue #8](https://github.com/xiaolin624/listen/issues/8) 的播放路由变化与中断反馈见 [路由验证记录](docs/issue-8-verification.md)。普通采集期间只显示状态，不持续生成字幕。
 
 ## 本机准备与构建
 
