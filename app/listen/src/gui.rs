@@ -215,6 +215,7 @@ pub fn run(config: Config) -> Result<(), String> {
             Arc::new(Whisper {
                 executable: config.engine,
                 model: config.model,
+                vad_model: config.vad_model,
                 language: config.language,
                 threads: config.threads,
             }),
@@ -392,7 +393,7 @@ impl Ui {
                 !state.text.is_empty(),
             );
             let status = format!(
-                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\n",
+                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 self.runtime.join("current-result.txt").display(),
@@ -401,7 +402,8 @@ impl Ui {
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
-                    .join(" | ")
+                    .join(" | "),
+                std::process::id()
             );
             if let Err(error) = fs::write(self.runtime.join("status.txt"), status) {
                 let _ = text(
@@ -434,6 +436,9 @@ impl Ui {
                             }
                             Phase::Result => {
                                 "Current result is available in the fallback text box. Copy and send manually."
+                            }
+                            Phase::NoSpeech => {
+                                "No valid speech detected. Nothing was delivered; the previous result is unchanged."
                             }
                             Phase::Failure => {
                                 "The operation failed. Open Listen for details and retained audio paths."

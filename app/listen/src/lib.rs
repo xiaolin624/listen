@@ -42,6 +42,7 @@ pub enum Phase {
     Capturing,
     Processing,
     Result,
+    NoSpeech,
     Failure,
 }
 
@@ -193,6 +194,21 @@ impl Application {
         };
         self.completion = None;
         match result {
+            Ok((text, description)) if text.trim().is_empty() => {
+                // A completed no-speech session is not a new transcript. In particular,
+                // leave the previous copyable result and its on-disk copy untouched.
+                match fs::remove_dir_all(self.session.as_ref().unwrap()) {
+                    Ok(()) => {
+                        self.snapshot.phase = Phase::NoSpeech;
+                        self.snapshot.detail = format!(
+                            "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {description}"
+                        );
+                    }
+                    Err(error) => self.fail(format!(
+                        "No valid speech detected, but temporary audio could not be cleaned: {error}"
+                    )),
+                }
+            }
             Ok((text, description)) => {
                 let result = fs::write(self.runtime.join("current-result.txt"), &text)
                     .and_then(|()| fs::remove_dir_all(self.session.as_ref().unwrap()));
