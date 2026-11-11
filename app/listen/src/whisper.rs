@@ -1,5 +1,5 @@
 //! Local whisper.cpp CLI adapter. No networking or alternative recognizer exists.
-use crate::{AppResult, CapturedAudio, LocalTranscriber};
+use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText};
 use std::{
     fs::{self, File},
     io::Read,
@@ -92,6 +92,72 @@ impl Whisper {
         }
         Ok(count > 0)
     }
+
+    /// Run the local decoder for one captured window and return its output stem.
+    /// Full JSON adds the per-token byte fragments and timestamps that overlap
+    /// ownership needs; plain text is enough for a single whole-file result.
+    fn recognize(
+        &self,
+        audio: &CapturedAudio,
+        directory: &Path,
+        full_json: bool,
+    ) -> AppResult<PathBuf> {
+        let stem = directory.join("transcript");
+        let log_path = directory.join("whisper.log");
+        let log =
+            File::create(&log_path).map_err(|e| format!("Cannot create local backend log: {e}"))?;
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["-m"])
+            .arg(&self.model)
+            .arg("-f")
+            .arg(&audio.path)
+            .args([
+                "-l",
+                &self.language,
+                "-t",
+                &self.threads.to_string(),
+                "-bs",
+                "5",
+                "-bo",
+                "5",
+                "-tp",
+                "0",
+                "-tpi",
+                "0.2",
+                "-nth",
+                "0.6",
+                "-lpt",
+                "-1",
+                "-et",
+                "2.4",
+                "-nt",
+            ]);
+        command.arg(if full_json { "-ojf" } else { "-otxt" });
+        let status = command
+            .arg("-of")
+            .arg(&stem)
+            // CPU is explicit for this first integration. CUDA selection/performance is later work.
+            .arg("-ng")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .status()
+            .map_err(|e| {
+                format!(
+                    "Cannot start local whisper.cpp backend: {e}. Log: {}",
+                    log_path.display()
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "Local whisper.cpp recognition failed ({status}). Log: {}",
+                log_path.display()
+            ));
+        }
+        Ok(stem)
+    }
 }
 
 impl LocalTranscriber for Whisper {
@@ -147,64 +213,28 @@ impl LocalTranscriber for Whisper {
         if !self.has_speech(audio, directory)? {
             return Ok(String::new());
         }
-        let stem = directory.join("transcript");
-        let log_path = directory.join("whisper.log");
-        let log =
-            File::create(&log_path).map_err(|e| format!("Cannot create local backend log: {e}"))?;
-        let status = Command::new(&self.executable)
-            .args(["-m"])
-            .arg(&self.model)
-            .arg("-f")
-            .arg(&audio.path)
-            .args([
-                "-l",
-                &self.language,
-                "-t",
-                &self.threads.to_string(),
-                "-bs",
-                "5",
-                "-bo",
-                "5",
-                "-tp",
-                "0",
-                "-tpi",
-                "0.2",
-                "-nth",
-                "0.6",
-                "-lpt",
-                "-1",
-                "-et",
-                "2.4",
-                "-nt",
-                "-otxt",
-                "-of",
-            ])
-            .arg(&stem)
-            // CPU is explicit for this first integration. CUDA selection/performance is later work.
-            .arg("-ng")
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
-            .status()
-            .map_err(|e| {
-                format!(
-                    "Cannot start local whisper.cpp backend: {e}. Log: {}",
-                    log_path.display()
-                )
-            })?;
-        if !status.success() {
-            return Err(format!(
-                "Local whisper.cpp recognition failed ({status}). Log: {}",
-                log_path.display()
-            ));
-        }
+        let stem = self.recognize(audio, directory, false)?;
         let text = fs::read_to_string(stem.with_extension("txt")).map_err(|e| {
             format!(
                 "Local backend did not produce a complete UTF-8 result: {e}. Log: {}",
-                log_path.display()
+                directory.join("whisper.log").display()
             )
         })?;
         Ok(text.trim().to_string())
+    }
+
+    fn transcribe_segment(
+        &self,
+        audio: &CapturedAudio,
+        directory: &Path,
+    ) -> AppResult<Vec<TimedText>> {
+        // A speech-free window produces no timed spans. Its audio stays on disk
+        // until the owning window commits, so silence never fabricates text and
+        // never discards speech recognized in an adjacent window.
+        if !self.has_speech(audio, directory)? {
+            return Ok(Vec::new());
+        }
+        let stem = self.recognize(audio, directory, true)?;
+        crate::whisper_timing::read(&stem.with_extension("json"))
     }
 }

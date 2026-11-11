@@ -1,8 +1,11 @@
 //! WASAPI render-endpoint loopback, streamed to disk on a dedicated capture thread.
 //! No microphone/capture endpoint API is used.
+use crate::streaming::{
+    CaptureProgress, Progress, SegmentConfig, SegmentStream, SegmentedAudioWriter,
+};
 use crate::{AppResult, CapturedAudio, PlaybackAudio, Recording};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,16 +33,19 @@ pub struct WasapiPlayback;
 struct WasapiRecording {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<AppResult<CapturedAudio>>>,
+    segments: Option<SegmentStream>,
+    progress: Arc<Progress>,
 }
 
 impl PlaybackAudio for WasapiPlayback {
     fn start(&self, directory: &Path) -> AppResult<Box<dyn Recording>> {
         let stop = Arc::new(AtomicBool::new(false));
         let signal = stop.clone();
-        let path = directory.join("playback.wav");
+        let (writer, segments) = SegmentedAudioWriter::new(directory, SegmentConfig::default())?;
+        let progress = segments.progress.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
-            let result = capture(&path, signal, &tx);
+            let result = capture(writer, signal, &tx);
             if let Err(error) = &result {
                 let _ = tx.try_send(Err(error.clone()));
             }
@@ -51,6 +57,8 @@ impl PlaybackAudio for WasapiPlayback {
             Ok(()) => Ok(Box::new(WasapiRecording {
                 stop,
                 worker: Some(worker),
+                segments: Some(segments),
+                progress,
             })),
             Err(error) => {
                 let _ = worker.join();
@@ -61,6 +69,12 @@ impl PlaybackAudio for WasapiPlayback {
 }
 
 impl Recording for WasapiRecording {
+    fn take_segments(&mut self) -> Option<SegmentStream> {
+        self.segments.take()
+    }
+    fn progress(&self) -> Option<CaptureProgress> {
+        Some(self.progress.snapshot())
+    }
     fn finish(mut self: Box<Self>) -> AppResult<CapturedAudio> {
         self.stop.store(true, Ordering::Release);
         self.worker.take().unwrap().join().map_err(|_| {
@@ -69,10 +83,12 @@ impl Recording for WasapiRecording {
     }
 
     fn failure(&self) -> Option<String> {
-        self.worker
-            .as_ref()
-            .filter(|worker| worker.is_finished())
-            .map(|_| "Playback capture was interrupted".into())
+        self.progress.failure().or_else(|| {
+            self.worker
+                .as_ref()
+                .filter(|worker| worker.is_finished())
+                .map(|_| "Playback capture was interrupted".into())
+        })
     }
 }
 
@@ -128,7 +144,7 @@ impl Resampler {
 }
 
 fn capture(
-    path: &PathBuf,
+    mut writer: SegmentedAudioWriter,
     stop: Arc<AtomicBool>,
     started: &mpsc::SyncSender<AppResult<()>>,
 ) -> AppResult<CapturedAudio> {
@@ -186,14 +202,6 @@ fn capture(
         CoTaskMemFree(Some(ptr.cast()));
         init.map_err(|e| e.to_string())?;
         let reader: IAudioCaptureClient = client.GetService().map_err(|e| e.to_string())?;
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(path, spec)
-            .map_err(|e| format!("Cannot create temporary playback audio: {e}"))?;
         let mut resampler = Resampler::new(rate);
         let mut frames = 0u64;
         let mut discontinuities = 0u64;
@@ -255,13 +263,7 @@ fn capture(
                             }
                             peak = peak.max(mono.abs());
                             frames += 1;
-                            resampler.push(mono, &mut |sample| {
-                                // WAV's u32 length is a storage-format limit, never a fixed capture timer.
-                                if writer.len() >= (u32::MAX - 128) / 2 {
-                                    return Err("Temporary WAV storage capacity exhausted; captured audio was retained".into());
-                                }
-                                writer.write_sample(sample).map_err(|e| format!("Cannot write temporary playback audio: {e}"))
-                            })?;
+                            resampler.push(mono, &mut |sample| writer.push(sample))?;
                         }
                         Ok(())
                     })();
@@ -270,9 +272,7 @@ fn capture(
                     released?;
                 }
                 if flushed.elapsed() >= Duration::from_secs(1) {
-                    writer
-                        .flush()
-                        .map_err(|e| format!("Cannot flush temporary playback audio: {e}"))?;
+                    writer.flush()?;
                     flushed = Instant::now();
                 }
                 if stop.load(Ordering::Acquire) {
@@ -283,21 +283,15 @@ fn capture(
             Ok(())
         })();
         let stopped = client.Stop().map_err(|e| e.to_string());
-        let finalized = writer
-            .finalize()
-            .map_err(|e| format!("Cannot finalize retained playback audio: {e}"));
+        let finalized = writer.finish(format!(
+                "default-render/multimedia {endpoint}; {:.3} s, {rate} Hz/{channels} ch/{bits} bit; peak={peak:.5}; discontinuities={discontinuities}",
+                frames as f64 / rate as f64
+            ));
         result?;
         stopped?;
-        finalized?;
         // Silence and an idle render device are valid capture results. Only real
         // device/packet/storage errors above are failures; speech detection owns
         // the no-speech outcome and must not lose quiet valid speech here.
-        Ok(CapturedAudio {
-            path: path.clone(),
-            description: format!(
-                "default-render/multimedia {endpoint}; {:.3} s, {rate} Hz/{channels} ch/{bits} bit; peak={peak:.5}; discontinuities={discontinuities}",
-                frames as f64 / rate as f64
-            ),
-        })
+        finalized
     }
 }
