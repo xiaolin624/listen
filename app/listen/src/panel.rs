@@ -8,10 +8,10 @@
 //! Nothing here adds state to the application. The panel is derived from the
 //! existing [`Snapshot`], so it stays consistent with the capsule and the files.
 
-use listen::{Delivery, Phase, Preparation, Snapshot, streaming::SAMPLE_RATE};
+use listen::{Delivery, Phase, Preparation, Refine, Snapshot, streaming::SAMPLE_RATE};
 
-/// The panel's button availability. `refine` is a visible but disabled placeholder
-/// until the 精修 port from ticket #21 is wired up.
+/// The panel's button availability. `refine` is only enabled when the application
+/// reports a complete result together with a refine port that can run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Actions {
     /// Copy the complete current 转写文本. Enabled exactly when there is text.
@@ -20,7 +20,7 @@ pub struct Actions {
     pub retry: bool,
     /// Delete that retained audio.
     pub cleanup: bool,
-    /// 精修: not connected yet, so this is always `false` in this version.
+    /// 精修: correct the current result through the configured text port.
     pub refine: bool,
 }
 
@@ -42,15 +42,54 @@ pub fn recovery_available(snapshot: &Snapshot) -> bool {
     idle(snapshot) && snapshot.retry_available
 }
 
-/// Which panel buttons can be used for this snapshot. 精修 stays disabled until
-/// ticket #21 connects the port, but its place is already reserved.
+/// Which panel buttons can be used for this snapshot. The 精修 entry follows the
+/// application's refine state: only `Refine::Available` enables it, and while a
+/// request is running (or after one has run) it is disabled so the same result
+/// cannot be refined twice.
 pub fn actions(snapshot: &Snapshot) -> Actions {
     let recovery = recovery_available(snapshot);
     Actions {
         copy: !snapshot.text.is_empty(),
         retry: recovery,
         cleanup: recovery,
-        refine: false,
+        refine: matches!(snapshot.refine, Refine::Available),
+    }
+}
+
+/// The 精修 button's label. The disabled label states the entry is unavailable
+/// instead of looking like a broken button; while a request runs it says so.
+pub fn refine_label(snapshot: &Snapshot) -> &'static str {
+    match snapshot.refine {
+        Refine::Available => "精修",
+        Refine::Running => "精修中…",
+        _ => "精修（不可用）",
+    }
+}
+
+/// The 精修 line for the panel's status block, or `None` when refine is not worth
+/// mentioning yet. `Unavailable` is only shown for a result (where the button would
+/// otherwise matter); the other states are always shown so the outcome cannot be
+/// missed.
+pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
+    match &snapshot.refine {
+        Refine::Available => {
+            Some("可以精修：只把下方的文字发送到 DeepSeek API，不发送音频。".into())
+        }
+        Refine::Running => Some("正在精修：只发送文字，不发送音频；本地结果暂时保留。".into()),
+        Refine::Applied => Some(match snapshot.delivery {
+            Some(Delivery::Fallback) => {
+                "精修完成：没有目标输入框可替换，精修结果已保存为当前结果。".into()
+            }
+            _ => "精修已应用：目标输入框中的本次转写已替换为精修结果，请检查后手动发送。".into(),
+        }),
+        Refine::NotApplied(reason) => Some(format!(
+            "精修结果没有写回目标输入框：{reason}。精修文本在下方，你的编辑保持不变。"
+        )),
+        Refine::Failed(reason) => Some(format!("精修失败：{reason}。本地结果保持不变，仍可复制。")),
+        Refine::Unavailable(reason) if snapshot.phase == Phase::Result => {
+            Some(format!("精修不可用：{reason}"))
+        }
+        Refine::Unavailable(_) => None,
     }
 }
 
@@ -130,6 +169,11 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     if !detail.is_empty() {
         lines.push(detail.to_string());
     }
+    // The refine state is an action line, not a phase: it says whether the 精修
+    // button can act and, once it ran, whether the text was written back.
+    if let Some(note) = refine_note(snapshot) {
+        lines.push(note);
+    }
     // A preparation that failed outside `Phase::Failure` (for example after a
     // result that was produced while the model was still loading) must not read as
     // "everything is ready for the next capture".
@@ -139,19 +183,28 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     lines.join("\n")
 }
 
-/// The complete current 转写文本, or a placeholder when there is none yet. The
-/// panel never edits this text; the copy button copies exactly this string.
+/// The complete current 转写文本, or a placeholder when there is none yet. When a
+/// refine produced text that must not be written to the target, it follows the local
+/// result with an explicit label: the panel never edits either string, and the copy
+/// button copies exactly the local result.
 pub fn result_text(snapshot: &Snapshot) -> String {
-    if snapshot.text.is_empty() {
-        "（还没有可复制的转写文本）".into()
+    let current = if snapshot.text.is_empty() {
+        "（还没有可复制的转写文本）".to_string()
     } else {
         snapshot.text.clone()
+    };
+    match &snapshot.refined_text {
+        Some(refined) => {
+            format!("{current}\n\n【精修结果，未写回目标输入框；可手动复制】\n{refined}")
+        }
+        None => current,
     }
 }
 
-/// The panel's full text in reading order: status first, then the complete result.
-/// This is exactly what `runtime\panel.txt` contains, so automation and the visible
-/// controls are generated from one source.
+/// The panel's full text in reading order: status first, then the complete result
+/// (and the unapplied refine result when there is one). This is exactly what
+/// `runtime\panel.txt` contains, so automation and the visible controls are
+/// generated from one source.
 pub fn text(snapshot: &Snapshot) -> String {
     format!("{}\n\n{}", status_text(snapshot), result_text(snapshot))
 }
@@ -251,6 +304,8 @@ mod tests {
             endpoint: None,
             backend: None,
             timing: Timing::default(),
+            refine: Refine::Unavailable("No DeepSeek API key is configured".into()),
+            refined_text: None,
         }
     }
 
@@ -434,7 +489,7 @@ mod tests {
         let offered = actions(&failed);
         assert!(offered.retry && offered.cleanup);
         assert!(!offered.copy, "there is no result to copy");
-        assert!(!offered.refine, "精修 is a disabled placeholder until #21");
+        assert!(!offered.refine, "a failed capture has no result to refine");
 
         failed.text = "保留的部分结果".into();
         assert!(actions(&failed).copy);
@@ -473,6 +528,83 @@ mod tests {
                 assert_eq!(shown.cleanup, recovery_available(&state));
             }
         }
+    }
+
+    #[test]
+    fn refine_is_enabled_exactly_when_the_application_reports_available() {
+        let mut state = result("完整结果", Delivery::Appended);
+        assert!(!actions(&state).refine, "unavailable by default");
+        state.refine = Refine::Available;
+        assert!(actions(&state).refine);
+        for done in [
+            Refine::Running,
+            Refine::Applied,
+            Refine::NotApplied("edited".into()),
+            Refine::Failed("network".into()),
+        ] {
+            state.refine = done;
+            assert!(!actions(&state).refine, "only Available may enable 精修");
+        }
+    }
+
+    #[test]
+    fn the_refine_label_follows_the_refine_state() {
+        let mut state = result("完整结果", Delivery::Appended);
+        state.refine = Refine::Available;
+        assert_eq!(refine_label(&state), "精修");
+        state.refine = Refine::Running;
+        assert_eq!(refine_label(&state), "精修中…");
+        state.refine = Refine::Failed("no network".into());
+        assert_eq!(refine_label(&state), "精修（不可用）");
+    }
+
+    #[test]
+    fn a_refine_result_that_must_not_be_written_is_shown_below_the_local_result() {
+        let mut state = result("本地完整结果", Delivery::Appended);
+        state.refine = Refine::NotApplied(
+            "the original target was edited after delivery, so it was not overwritten".into(),
+        );
+        state.refined_text = Some("精修后的文本".into());
+
+        assert_eq!(state.text, "本地完整结果");
+        let result_part = result_text(&state);
+        assert!(result_part.starts_with("本地完整结果"), "{result_part}");
+        assert!(result_part.contains("未写回目标输入框"), "{result_part}");
+        assert!(result_part.contains("精修后的文本"), "{result_part}");
+
+        let shown = text(&state);
+        assert!(shown.contains("精修结果没有写回目标输入框"), "{shown}");
+        assert!(shown.contains("你的编辑保持不变"), "{shown}");
+        assert!(shown.contains("精修后的文本"), "{shown}");
+    }
+
+    #[test]
+    fn an_applied_refine_says_it_was_written_back_and_does_not_duplicate_the_text() {
+        let mut state = result("精修后的完整结果", Delivery::Appended);
+        state.refine = Refine::Applied;
+        let shown = text(&state);
+        assert!(shown.contains("精修已应用"), "{shown}");
+        assert!(shown.contains("请检查后手动发送"), "{shown}");
+        assert_eq!(result_text(&state), "精修后的完整结果");
+        assert!(!shown.contains("未写回目标输入框"), "{shown}");
+    }
+
+    #[test]
+    fn refine_unavailability_is_explained_where_the_button_would_matter() {
+        let ready = snapshot(Phase::Ready, Preparation::Ready);
+        assert!(
+            !status_text(&ready).contains("精修不可用"),
+            "an idle panel does not need a refine explanation yet"
+        );
+
+        let mut no_key = result("完整结果", Delivery::Fallback);
+        no_key.refine = Refine::Unavailable("No DeepSeek API key is configured".into());
+        let shown = status_text(&no_key);
+        assert!(
+            shown.contains("精修不可用：No DeepSeek API key is configured"),
+            "{shown}"
+        );
+        assert!(!actions(&no_key).refine);
     }
 
     #[test]

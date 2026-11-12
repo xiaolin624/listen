@@ -101,9 +101,11 @@ Options:
         (default: <runtime>\\glossary.txt). A malformed file is reported and the
         uncorrected transcript is still delivered.
 
-Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|quit>
+Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|refine|quit>
 Retry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.
 show opens the expanded result panel, panel toggles it and copy copies the complete current result to the clipboard.
+refine asks the DeepSeek API to correct the complete current result. Only that transcript text is sent, never the audio.
+The refined text replaces the appended transcript only while the original target still holds exactly what Listen wrote; if the target was edited, the refined text stays in the panel and the edit is preserved. Without DEEPSEEK_API_KEY in the local environment the refine entry is unavailable, and local recognition is unaffected.
 Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail, and results are never sent automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
