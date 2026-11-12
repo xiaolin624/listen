@@ -27,6 +27,10 @@
 # Example:
 #   pwsh -File scripts\verify-capsule.ps1
 #   pwsh -File scripts\verify-capsule.ps1 -Exe <listen.exe> -Runtime <dir> -Evidence <dir>
+#
+# By default Listen runs with its shipped default engine (SenseVoice resident in the
+# process after issue #17); -Engine/-Model/-VadModel are optional overrides for the
+# whisper.cpp fallback engine.
 
 param(
     [string]$Exe = '',
@@ -52,9 +56,6 @@ $artifacts = Join-Path $sharedRoot '.artifacts'
 if (-not $Exe) { $Exe = Join-Path $artifacts 'cargo-target\release\listen.exe' }
 if (-not $Runtime) { $Runtime = Join-Path $artifacts 'issue-19\runtime' }
 if (-not $Evidence) { $Evidence = Join-Path $artifacts 'issue-19' }
-if (-not $Engine) { $Engine = Join-Path $sharedRoot '.tools\whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe' }
-if (-not $Model) { $Model = Join-Path $sharedRoot '.tools\models\ggml-small.bin' }
-if (-not $VadModel) { $VadModel = Join-Path $sharedRoot '.tools\models\ggml-silero-v5.1.2.bin' }
 if (-not $AudioClip) {
     $candidate = Join-Path $artifacts 'asr-quality-probe\zh-term.wav'
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { $AudioClip = $candidate }
@@ -341,13 +342,14 @@ function Invoke-Control([string]$Command) {
 }
 
 function Start-Listen([string[]]$Extra = @()) {
+    # Default launch: the engine, model and VAD paths that ship with the build.
     $arguments = @(
-        '--engine', (ConvertTo-QuotedWindowsPath $Engine),
-        '--model', (ConvertTo-QuotedWindowsPath $Model),
-        '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel),
         '--runtime', (ConvertTo-QuotedWindowsPath $Runtime),
         '--hidden'
     )
+    if ($Engine) { $arguments += @('--engine', (ConvertTo-QuotedWindowsPath $Engine)) }
+    if ($Model) { $arguments += @('--model', (ConvertTo-QuotedWindowsPath $Model)) }
+    if ($VadModel) { $arguments += @('--vad-model', (ConvertTo-QuotedWindowsPath $VadModel)) }
     $arguments += $Extra
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Exe
@@ -706,9 +708,12 @@ try {
     $listen = $null
 
     # --- Failure state ---------------------------------------------------
+    # Break whichever engine is under test: the default SenseVoice model path and the
+    # whisper fallback model path are both pointed at files that do not exist.
+    $brokenOnnx = Join-Path $Runtime 'missing-model.onnx'
     $brokenModel = Join-Path $Runtime 'missing-model.bin'
-    Remove-Item -LiteralPath $brokenModel -ErrorAction SilentlyContinue
-    $listen = Start-Listen @('--model', (ConvertTo-QuotedWindowsPath $brokenModel))
+    Remove-Item -LiteralPath $brokenOnnx, $brokenModel -ErrorAction SilentlyContinue
+    $listen = Start-Listen @('--sensevoice-model', (ConvertTo-QuotedWindowsPath $brokenOnnx), '--model', (ConvertTo-QuotedWindowsPath $brokenModel))
     $status = Wait-Phase $listen 'Failure'
     $summary.states.failure = Get-StatusValue $status 'capsule'
     $failureShot = Join-Path $Evidence 'capsule-failure.png'
