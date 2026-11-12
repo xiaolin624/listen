@@ -16,7 +16,7 @@ if not exist "%~dp0engine\whisper-cli.exe" goto engine_missing
 if not exist "%~dp0engine\vad-speech-segments.exe" goto engine_missing
 if not exist "%~dp0models\ggml-small.bin" goto model_missing
 if not exist "%~dp0models\ggml-silero-v5.1.2.bin" goto model_missing
-start "" "%~dp0listen.exe" --engine "%~dp0engine\whisper-cli.exe" --model "%~dp0models\ggml-small.bin" --vad-model "%~dp0models\ggml-silero-v5.1.2.bin" --runtime "%~dp0runtime"
+start "" "%~dp0listen.exe" --engine "%~dp0engine\whisper-cli.exe" --model "%~dp0models\ggml-small.bin" --vad-model "%~dp0models\ggml-silero-v5.1.2.bin" --runtime "%~dp0runtime" --glossary "%~dp0glossary.txt"
 exit /b 0
 
 :engine_missing

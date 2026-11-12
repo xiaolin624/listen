@@ -1,5 +1,5 @@
 use crate::{
-    Config, WasapiPlayback, Whisper,
+    Config, WasapiPlayback,
     capsule::{CapsuleState, capsule_state, preparation_name},
     capsule_window::{self, Capsule},
 };
@@ -151,14 +151,7 @@ pub fn run(config: Config) -> Result<(), String> {
 
         let app = Application::new(
             Arc::new(WasapiPlayback),
-            Arc::new(Whisper::with_backend(
-                config.engine,
-                config.model,
-                config.vad_model,
-                config.language,
-                config.threads,
-                config.backend,
-            )),
+            config.transcriber(),
             config.runtime.clone(),
             registration,
         )
