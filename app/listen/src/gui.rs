@@ -1,13 +1,15 @@
-use crate::{Config, WasapiPlayback};
+use crate::{
+    Config, WasapiPlayback,
+    capsule::{CapsuleState, capsule_state, preparation_name},
+    capsule_window::{self, Capsule},
+};
 use listen::{Application, Control, Delivery, Phase, Snapshot, target::NativeTargets};
-use std::{cell::RefCell, fs, sync::Arc};
+use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Controls::{EM_SETLIMITTEXT, EM_SETSEL},
             Input::KeyboardAndMouse::{
                 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
             },
@@ -18,40 +20,37 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-const CLASS: PCWSTR = w!("ListenCaptureToCopyWindowV1");
+/// The hidden owner window. It receives `--control`, hotkey and tray messages; the
+/// user-visible surface is the status capsule only. The class name is private to
+/// this implementation: scripts drive Listen through `--control` and `status.txt`.
+const HOST_CLASS: PCWSTR = w!("ListenHostWindowV2");
 const CONTROL_MESSAGE: u32 = WM_APP + 10;
 const TRAY_MESSAGE: u32 = WM_APP + 11;
 const ID_TOGGLE: usize = 101;
-const ID_COPY: usize = 102;
 const ID_EXIT: usize = 103;
 const ID_SHOW: usize = 104;
 const ID_RETRY: usize = 105;
 const ID_CLEANUP: usize = 106;
+/// How often the application snapshot is polled and `status.txt` is refreshed.
+const POLL_TIMER_MS: u32 = 100;
 
 struct Ui {
     app: Application,
+    /// Hidden owner window; the capsule has its own top-level window.
     hwnd: HWND,
-    status: HWND,
-    result: HWND,
-    toggle: HWND,
-    retry: HWND,
-    cleanup: HWND,
-    copy: HWND,
-    exit: HWND,
-    explanation: HWND,
-    label: HWND,
-    runtime: std::path::PathBuf,
+    capsule: Capsule,
+    runtime: PathBuf,
     last: Option<Snapshot>,
     tray: bool,
+    /// `--hidden` still shows the capsule (it is the only user-visible surface) but
+    /// suppresses transient tray notifications.
+    notify: bool,
     quit_requested: bool,
 }
 thread_local! { static UI: RefCell<Option<Ui>> = const { RefCell::new(None) }; }
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
-}
-unsafe fn text(hwnd: HWND, value: &str) -> windows::core::Result<()> {
-    unsafe { SetWindowTextW(hwnd, PCWSTR(wide(value).as_ptr())) }
 }
 fn fixed<const N: usize>(target: &mut [u16; N], value: &str) {
     for (index, code) in value.encode_utf16().take(N - 1).enumerate() {
@@ -90,18 +89,22 @@ pub fn control(command: &str) -> Result<(), String> {
         _ => return Err(format!("Unknown control command: {command}")),
     };
     unsafe {
-        let hwnd = FindWindowW(CLASS, None).map_err(|_| "Listen is not running".to_string())?;
+        let hwnd =
+            FindWindowW(HOST_CLASS, None).map_err(|_| "Listen is not running".to_string())?;
         PostMessageW(Some(hwnd), CONTROL_MESSAGE, WPARAM(id), LPARAM(0))
             .map_err(|e| format!("Cannot contact running Listen: {e}"))
     }
 }
 
 pub fn run(config: Config) -> Result<(), String> {
+    // Per-monitor DPI awareness must be set before any window exists.
+    capsule_window::enable_dpi_awareness();
     unsafe {
-        if let Ok(existing) = FindWindowW(CLASS, None) {
-            let _ = ShowWindow(existing, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(existing);
-            return Err("Listen is already running. Exit it from its window or tray before changing configuration.".into());
+        if FindWindowW(HOST_CLASS, None).is_ok() {
+            return Err(
+                "Listen is already running. Exit it from the tray before changing configuration."
+                    .into(),
+            );
         }
         fs::create_dir_all(&config.runtime).map_err(|e| {
             format!(
@@ -113,121 +116,39 @@ pub fn run(config: Config) -> Result<(), String> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
-            lpszClassName: CLASS,
+            lpszClassName: HOST_CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).map_err(|e| e.to_string())?,
-            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
             ..Default::default()
         };
         if RegisterClassW(&class) == 0 {
-            return Err("Cannot register Listen window class".into());
+            return Err("Cannot register Listen's window class".into());
         }
+        // A tiny off-screen owner window: it makes the tray menu behave like a
+        // normal foreground menu, and it never appears in the taskbar. Showing it
+        // does not activate it and nothing is ever painted into it.
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            CLASS,
-            w!("Listen — 耳机音频本地转写"),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            900,
-            670,
+            WS_EX_TOOLWINDOW,
+            HOST_CLASS,
+            w!("Listen"),
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
             None,
             None,
             Some(instance.into()),
             None,
         )
         .map_err(|e| e.to_string())?;
-        let child =
-            |class: PCWSTR, value: &str, style: WINDOW_STYLE, id: usize| -> Result<HWND, String> {
-                let handle = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    class,
-                    PCWSTR(wide(value).as_ptr()),
-                    WS_CHILD | WS_VISIBLE | style,
-                    0,
-                    0,
-                    1,
-                    1,
-                    Some(hwnd),
-                    Some(HMENU(id as *mut _)),
-                    Some(instance.into()),
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-                SendMessageW(
-                    handle,
-                    WM_SETFONT,
-                    Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
-                    Some(LPARAM(1)),
-                );
-                Ok(handle)
-            };
-        let explanation = child(
-            w!("STATIC"),
-            "Ctrl+Alt+R 开始 / 停止  ·  仅采集默认多媒体播放设备（不含默认通信设备）  ·  本地识别",
-            WINDOW_STYLE::default(),
-            110,
-        )?;
-        let status = child(
-            w!("EDIT"),
-            "",
-            WS_BORDER
-                | WS_VSCROLL
-                | WINDOW_STYLE(ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32),
-            111,
-        )?;
-        let label = child(
-            w!("STATIC"),
-            "备用文本框：当前完整结果（复制后由你手动粘贴和发送）",
-            WINDOW_STYLE::default(),
-            112,
-        )?;
-        let result = child(
-            w!("EDIT"),
-            "",
-            WS_BORDER
-                | WS_VSCROLL
-                | WS_HSCROLL
-                | WS_TABSTOP
-                | WINDOW_STYLE(
-                    ES_MULTILINE as u32
-                        | ES_READONLY as u32
-                        | ES_AUTOVSCROLL as u32
-                        | ES_AUTOHSCROLL as u32,
-                ),
-            113,
-        )?;
-        SendMessageW(result, EM_SETLIMITTEXT, Some(WPARAM(0x7ffffffe)), None);
-        let toggle = child(
-            w!("BUTTON"),
-            "开始采集",
-            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ID_TOGGLE,
-        )?;
-        let copy = child(
-            w!("BUTTON"),
-            "复制完整结果",
-            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ID_COPY,
-        )?;
-        let retry = child(
-            w!("BUTTON"),
-            "重试本地识别",
-            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ID_RETRY,
-        )?;
-        let cleanup = child(
-            w!("BUTTON"),
-            "清理失败音频",
-            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ID_CLEANUP,
-        )?;
-        let exit = child(
-            w!("BUTTON"),
-            "退出",
-            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ID_EXIT,
-        )?;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let registration = RegisterHotKey(Some(hwnd), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'R' as u32).map_err(|e| format!("Ctrl+Alt+R: {e}. Release this shortcut in the other application, then restart Listen."));
+
+        // The capsule exists before the model starts preparing, so the measured
+        // startup budget only covers window creation and the first frame. Its first
+        // state is deliberately "not ready yet" rather than a false "ready".
+        let capsule = capsule_window::create(&config.runtime, CapsuleState::Preparing)?;
+
         let app = Application::new(
             Arc::new(WasapiPlayback),
             config.transcriber(),
@@ -235,37 +156,38 @@ pub fn run(config: Config) -> Result<(), String> {
             registration,
         )
         .with_targets(Arc::new(NativeTargets));
+        capsule.set_state(capsule_state(&app.snapshot()));
+
         let mut state = Ui {
             app,
             hwnd,
-            status,
-            result,
-            toggle,
-            retry,
-            cleanup,
-            copy,
-            exit,
-            explanation,
-            label,
+            capsule,
             runtime: config.runtime,
             last: None,
             tray: false,
+            notify: !config.hidden,
             quit_requested: false,
         };
         let mut icon = state.icon_data();
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = TRAY_MESSAGE;
         state.tray = Shell_NotifyIconW(NIM_ADD, &icon).as_bool();
-        state.layout();
-        state.refresh();
-        let show = !config.hidden || !state.tray || state.app.snapshot().phase == Phase::Failure;
         UI.with(|ui| *ui.borrow_mut() = Some(state));
-        if SetTimer(Some(hwnd), 1, 100, None) == 0 {
+        let registered = UI.with(|ui| {
+            let mut slot = ui.borrow_mut();
+            if slot.as_mut().is_none() {
+                return false;
+            }
+            SetTimer(Some(hwnd), 1, POLL_TIMER_MS, None) != 0
+        });
+        if !registered {
             return Err("Cannot start the application status timer".into());
         }
-        if show {
-            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-        }
+        UI.with(|ui| {
+            if let Some(state) = ui.borrow_mut().as_mut() {
+                state.refresh();
+            }
+        });
         let mut message = MSG::default();
         loop {
             let next = GetMessageW(&mut message, None, 0, 0).0;
@@ -275,10 +197,8 @@ pub fn run(config: Config) -> Result<(), String> {
             if next == 0 {
                 break;
             }
-            if !IsDialogMessageW(hwnd, &message).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
         let _ = UnregisterHotKey(Some(hwnd), 1);
         UI.with(|ui| {
@@ -286,6 +206,7 @@ pub fn run(config: Config) -> Result<(), String> {
                 if state.tray {
                     let _ = Shell_NotifyIconW(NIM_DELETE, &state.icon_data());
                 }
+                // Dropping the state destroys the capsule window.
             }
         });
         Ok(())
@@ -313,37 +234,16 @@ impl Ui {
         data
     }
 
-    unsafe fn layout(&self) {
-        unsafe {
-            let mut rect = RECT::default();
-            let _ = GetClientRect(self.hwnd, &mut rect);
-            let width = (rect.right - 32).max(320);
-            let bottom = (rect.bottom - 52).max(360);
-            let _ = MoveWindow(self.explanation, 16, 14, width, 24, true);
-            let _ = MoveWindow(self.status, 16, 46, width, 120, true);
-            let _ = MoveWindow(self.label, 16, 182, width, 24, true);
-            let _ = MoveWindow(self.result, 16, 210, width, (bottom - 224).max(120), true);
-            let _ = MoveWindow(self.toggle, 16, bottom, 140, 32, true);
-            let _ = MoveWindow(self.retry, 164, bottom, 150, 32, true);
-            let _ = MoveWindow(self.cleanup, 322, bottom, 150, 32, true);
-            let _ = MoveWindow(self.copy, 480, bottom, 160, 32, true);
-            let _ = MoveWindow(self.exit, (width - 136).max(648), bottom, 120, 32, true);
-        }
-    }
-
-    unsafe fn show(&self) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(self.hwnd);
-        }
-    }
-
     unsafe fn refresh(&mut self) {
         unsafe {
             self.app.poll();
             let state = self.app.snapshot();
+            let visual = capsule_state(&state);
+            // The capsule draws itself; this only pushes a changed visual state.
+            self.capsule.set_state(visual);
             let changed = self.last.as_ref().is_none_or(|last| {
                 last.phase != state.phase
+                    || last.preparation != state.preparation
                     || last.detail != state.detail
                     || last.text != state.text
                     || last.retained_audio != state.retained_audio
@@ -359,80 +259,9 @@ impl Ui {
                 .last
                 .as_ref()
                 .is_some_and(|last| last.phase != state.phase);
-            let mut detail = format!(
-                "{:?}\r\n{}",
-                state.phase,
-                state.detail.replace('\n', "\r\n")
-            );
-            if self.quit_requested {
-                detail.push_str("\r\nFinishing the current operation before exiting.");
-            }
-            if let Some(backend) = &state.backend {
-                detail.push_str(&format!("\r\nBackend: {backend}"));
-            }
-            if !self.tray {
-                detail.push_str(
-                    "\r\nTray icon unavailable; minimizing keeps this window on the taskbar.",
-                );
-            }
-            let _ = text(self.status, &detail);
-            let _ = text(
-                self.hwnd,
-                &format!("Listen — {:?} — Ctrl+Alt+R", state.phase),
-            );
-            if self
-                .last
-                .as_ref()
-                .is_none_or(|last| last.text != state.text)
-            {
-                let visible = state.text.replace("\r\n", "\n").replace('\n', "\r\n");
-                let loaded = text(self.result, &visible).is_ok()
-                    && GetWindowTextLengthW(self.result) as usize == visible.encode_utf16().count();
-                if !loaded {
-                    let _ = text(
-                        self.status,
-                        &format!(
-                            "Failure: the fallback control could not display the complete result. The full current result is available at {}",
-                            self.runtime.join("current-result.txt").display()
-                        ),
-                    );
-                }
-            }
-            let _ = text(
-                self.toggle,
-                if state.phase == Phase::Capturing {
-                    "停止并转写"
-                } else if state.phase == Phase::Processing {
-                    "正在本机转写…"
-                } else if state.phase == Phase::Preparing {
-                    "正在准备本地模型…"
-                } else {
-                    "开始采集"
-                },
-            );
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                self.toggle,
-                !matches!(state.phase, Phase::Processing | Phase::Preparing),
-            );
-            let idle = !matches!(
-                state.phase,
-                Phase::Capturing | Phase::Processing | Phase::Preparing
-            );
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                self.retry,
-                idle && state.retry_available,
-            );
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                self.cleanup,
-                idle && state.retry_available,
-            );
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                self.copy,
-                !state.text.is_empty(),
-            );
             let timing = &state.timing;
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\ncapsule={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -459,6 +288,14 @@ impl Ui {
                     .join(" | "),
                 state.retry_available,
                 state.backend.as_deref().unwrap_or(""),
+                preparation_name(state.preparation),
+                visual.name(),
+                self.capsule.startup_ms(),
+                if self.capsule.capture_excluded() {
+                    1
+                } else {
+                    0
+                },
                 timing
                     .preparation_ms
                     .map(|value| value.to_string())
@@ -494,16 +331,11 @@ impl Ui {
                 timing.recognition_windows,
                 std::process::id()
             );
-            if let Err(error) = fs::write(self.runtime.join("status.txt"), status) {
-                let _ = text(
-                    self.status,
-                    &format!("{detail}\r\nCannot persist current status: {error}"),
-                );
-            }
+            let _ = fs::write(self.runtime.join("status.txt"), status);
             if self.tray {
                 let mut icon = self.icon_data();
                 icon.uFlags = NIF_TIP | NIF_ICON;
-                if phase_changed {
+                if phase_changed && self.notify {
                     icon.uFlags |= NIF_INFO;
                     icon.dwInfoFlags = if state.phase == Phase::Failure {
                         NIIF_ERROR
@@ -524,13 +356,13 @@ impl Ui {
                                 "Recognizing locally. Wait for the current result."
                             }
                             Phase::Preparing => {
-                                "Preparing the local model. Capture starts after Ready."
+                                "Preparing the local model. Capture can still start now."
                             }
                             Phase::Result => {
                                 if state.delivery == Some(Delivery::Appended) {
                                     "Appended to the original target. Review and send manually."
                                 } else {
-                                    "Check the original target, then use the complete fallback result."
+                                    "Check the original target. The last result is kept for review."
                                 }
                             }
                             Phase::NoSpeech => {
@@ -538,9 +370,9 @@ impl Ui {
                             }
                             Phase::Failure => {
                                 if state.retry_available {
-                                    "Recognition failed. The captured audio is retained; open Listen to retry locally."
+                                    "Recognition failed. The captured audio is retained; retry it locally from the tray menu."
                                 } else {
-                                    "The operation failed. Open Listen for details and retained audio paths."
+                                    "The operation failed. Retry or clean the retained audio from the tray menu."
                                 }
                             }
                             _ => "Ready. Ctrl+Alt+R starts playback capture.",
@@ -548,12 +380,6 @@ impl Ui {
                     );
                 }
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &icon);
-            }
-            if phase_changed
-                && (state.phase == Phase::Failure
-                    || (state.phase == Phase::Result && state.delivery != Some(Delivery::Appended)))
-            {
-                self.show();
             }
             self.last = Some(state.clone());
             if self.quit_requested && !matches!(state.phase, Phase::Capturing | Phase::Processing) {
@@ -570,7 +396,8 @@ impl Ui {
                 3 | ID_TOGGLE => self.app.dispatch(Control::Toggle),
                 6 | ID_RETRY => self.app.dispatch(Control::Retry),
                 7 | ID_CLEANUP => self.app.dispatch(Control::CleanupAudio),
-                4 | ID_SHOW => self.show(),
+                // There is no panel yet (#20): reveal the capsule without focus.
+                4 | ID_SHOW => self.capsule.reveal(),
                 5 | ID_EXIT => {
                     self.quit_requested = true;
                     if self.app.snapshot().phase == Phase::Capturing {
@@ -583,11 +410,6 @@ impl Ui {
                         let _ = DestroyWindow(self.hwnd);
                     }
                 }
-                ID_COPY => {
-                    // WM_COPY only responds to this explicit button. It never pastes or sends.
-                    SendMessageW(self.result, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
-                    SendMessageW(self.result, WM_COPY, None, None);
-                }
                 _ => {}
             }
             self.refresh();
@@ -595,15 +417,38 @@ impl Ui {
     }
 }
 
-unsafe fn show_tray_menu(hwnd: HWND) {
+unsafe fn show_tray_menu(hwnd: HWND, state: &Snapshot) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("显示当前结果"));
+        let idle = !matches!(
+            state.phase,
+            Phase::Capturing | Phase::Processing | Phase::Preparing
+        );
+        let retry_available = idle && state.retry_available;
+        let availability = |enabled: bool| {
+            if enabled {
+                MF_STRING
+            } else {
+                MF_STRING | MF_GRAYED
+            }
+        };
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, w!("开始 / 停止  Ctrl+Alt+R"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RETRY, w!("重试本地识别"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_CLEANUP, w!("清理失败音频"));
+        // Ticket #20 adds "打开面板" and the refine entry here.
+        let _ = AppendMenuW(
+            menu,
+            availability(retry_available),
+            ID_RETRY,
+            w!("重试本地识别"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            availability(retry_available),
+            ID_CLEANUP,
+            w!("清理失败音频"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -641,13 +486,9 @@ unsafe extern "system" fn window_proc(
             PostQuitMessage(0);
             return LRESULT(0);
         }
-        if message == WM_GETMINMAXINFO {
-            let limits = &mut *(lparam.0 as *mut MINMAXINFO);
-            limits.ptMinTrackSize = POINT { x: 900, y: 500 };
-            return LRESULT(0);
-        }
         let handled = UI.with(|slot| {
-            // SetWindowText/child layout may synchronously reenter this procedure.
+            // Native menus and window updates may synchronously reenter this
+            // procedure; a busy slot simply defers to the next poll.
             let Ok(mut slot) = slot.try_borrow_mut() else {
                 return false;
             };
@@ -657,10 +498,6 @@ unsafe extern "system" fn window_proc(
             match message {
                 WM_TIMER => {
                     state.refresh();
-                    true
-                }
-                WM_SIZE => {
-                    state.layout();
                     true
                 }
                 WM_HOTKEY => {
@@ -675,13 +512,10 @@ unsafe extern "system" fn window_proc(
                     state.command(wparam.0 & 0xffff);
                     true
                 }
-                WM_CLOSE => {
-                    let _ = ShowWindow(hwnd, if state.tray { SW_HIDE } else { SW_MINIMIZE });
-                    true
-                }
                 TRAY_MESSAGE => {
                     if matches!(lparam.0 as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK) {
-                        state.show();
+                        // Ticket #20 opens the expanded panel here instead.
+                        state.command(ID_SHOW);
                     }
                     true
                 }
@@ -690,9 +524,13 @@ unsafe extern "system" fn window_proc(
         });
         if handled {
             if message == TRAY_MESSAGE && lparam.0 as u32 == WM_RBUTTONUP {
-                // Native menus dispatch hotkey, control and timer messages while open.
-                // Release the UI borrow before entering that nested message loop.
-                show_tray_menu(hwnd);
+                // Native menus dispatch hotkey, control and timer messages while
+                // open. Release the UI borrow before entering that nested loop.
+                let snapshot =
+                    UI.with(|slot| slot.borrow().as_ref().map(|state| state.app.snapshot()));
+                if let Some(snapshot) = snapshot {
+                    show_tray_menu(hwnd, &snapshot);
+                }
             }
             LRESULT(0)
         } else {

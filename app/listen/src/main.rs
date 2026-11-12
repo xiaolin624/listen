@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod capsule;
+mod capsule_window;
 mod gui;
 
 use listen::{
