@@ -1,17 +1,17 @@
 # Issue #19：常驻状态胶囊
 
-2026-11-12。工作树 `E:\luyin\.worktrees\issue-19`，分支 `ticket/issue-19`，基线 `ec97f86`（`integration/v0.2`，含 #16）。主工作树未改动。本文只记录实际执行过的测量；未运行的场景明确标为未覆盖。
+2026-11-12。工作树 `E:\luyin\.worktrees\issue-19`，分支 `ticket/issue-19`，基线 `ec97f86`（`integration/v0.2`，含 #16），报告前已合并 `integration/v0.2`（`0562e58`，含 #17 SenseVoice 引擎与 #18 术语校正）。主工作树未改动。本文只记录实际执行过的测量；未运行的场景明确标为未覆盖。
 
 ## 结论摘要
 
 - 主窗口（`ListenCaptureToCopyWindowV1`、状态 EDIT、备用文本框、五个按钮）已完全删除。`listen.exe` 现在只有一个用户可见表面：常驻桌面的长条状态胶囊，不显示任何文字、数字或实时转写。
 - 状态胶囊由本进程自绘：32 位预乘 ARGB DIB + `UpdateLayeredWindow` 的圆角长条；四种状态只用颜色、形状和动效区分（就绪=暗绿静止、采集=亮绿呼吸、处理=蓝色扫光、失败=红色静止），准备中=暗色虚线慢呼吸。
 - 窗口样式实测 `0x8080088`（`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE`），窗口标题长度为 **0**，`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 返回成功且 `GetWindowDisplayAffinity` 读回 **17**。
-- `startup_capsule_ms`（进程创建 → 首帧呈现）多次实测为 **24–44 ms**，最后两次为 27 ms 与 29 ms，低于 300 ms 目标。
+- `startup_capsule_ms`（进程创建 → 首帧呈现）多次实测为 **24–44 ms**，合并 #17 后用默认 SenseVoice 引擎为 **41 ms**，均低于 300 ms 目标。
 - 点击胶囊不改变前台窗口（实测前台句柄点击前后均为 `0x106DE`），`WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`（3）；拖动 140×60 px 后 `capsule-position.txt` 与实际窗口位置一致，重启后位置恢复一致。
 - 胶囊不出现在任何屏幕截图里：全桌面截图（`.artifacts\issue-19\desktop-capsule-excluded.png`）中胶囊所在区域是它背后的桌面内容。由于这个排除是设计目标，四张状态图不是屏幕截图，而是胶囊**实际呈现的那一帧**（通过文档化的内部消息 `WM_APP + 20` 让胶囊把当前 DIB 写成 BMP，再由验收脚本转 PNG）。
 - 验收脚本 `scripts\verify-capsule.ps1` 对真实运行的 `listen.exe` 跑了 **40 项检查，全部通过**，证据 JSON 在 `.artifacts\issue-19\capsule-verification.json`。
-- 测试：**76 passed, 3 ignored**（基线 71 passed / 3 ignored，新增 5 个胶囊单元测试）；`cargo build --release` 成功；`cargo fmt --check` 通过。
+- 测试：合并前 **76 passed, 3 ignored**（基线 71 passed / 3 ignored，新增 5 个胶囊单元测试）；合并 #17/#18 后全套 **104 passed, 12 ignored**，仍全绿。`cargo build --release` 成功；`cargo fmt --check` 通过。
 
 ## 实现
 
@@ -48,6 +48,7 @@
 - `--control start|stop|toggle|retry|cleanup|show|quit` 全部通过 `FindWindowW(ListenHostWindowV2)` 到达运行中的实例，语义不变（`quit` 仍会先停止采集、等处理结束再退出）。`show` 目前只是在不抢焦点的情况下重新显示/置顶胶囊，#20 会改为打开面板。
 - `status.txt` 保留全部既有键与格式（`phase`、`detail`、`endpoint_*`、`current_result`、`retained_audio`、`retry_available`、`backend`、全部 `timing_*`、`process_id`），新增 `preparation=Pending|Ready|Failed`、`capsule=Preparing|Ready|Capturing|Processing|Failure`、`startup_capsule_ms=<n>`、`capsule_capture_excluded=1|0`；写入节拍仍是快照变化时的 100 ms 轮询。
 - `--hidden` 仍然只启动胶囊（胶囊是唯一可见表面），并抑制托盘气泡通知（脚本化/隐藏启动不再弹提示）。
+- 识别引擎边界不经过界面：`gui.rs` 只调用 `config.transcriber()`，因此合并 #17 的 SenseVoice 默认引擎时界面代码无需改动（合并只在 `gui.rs` 的 import 上有一处冲突，已解决）。
 
 ## 验收证据
 
@@ -60,10 +61,10 @@
 & E:\luyin\.worktrees\issue-19\scripts\verify-capsule.ps1
 ```
 
-- 测试：16（lib 单元）+ 5（bin 单元，新增）+ 27 + 4 + 4 + 11 + 2 + 7 = **76 passed, 0 failed, 3 ignored**。
-- 构建：`Finished release profile ... in 7.6s`。
+- 测试：合并前 16（lib 单元）+ 5（bin 单元，新增）+ 27 + 4 + 4 + 11 + 2 + 7 = **76 passed, 0 failed, 3 ignored**；合并 #17/#18 后 **104 passed, 0 failed, 12 ignored**（`cargo test --offline --locked`）。
+- 构建：合并后 `Finished release profile ... in 17.1s`。
 - 格式：`cargo fmt --check` 退出码 0。
-- 验收脚本：`Result: PASS (40 checks, 0 failures)`。
+- 验收脚本：合并后针对默认 SenseVoice 引擎的运行 `Result: PASS (40 checks, 0 failures)`。
 
 ### 启动预算
 
@@ -72,10 +73,10 @@
 | 运行 | startup_capsule_ms |
 | --- | --- |
 | 首次手工冒烟 | 44 |
-| 验收脚本多轮 | 24、25、27、28、29、31、35、37 |
-| 最终证据运行 | 27 |
+| 验收脚本多轮（whisper 回退引擎） | 24、25、27、28、29、31、35、37 |
+| 合并 #17 后（默认 SenseVoice 引擎） | 41 |
 
-全部低于 300 ms；`verify-capsule.ps1` 里有一条 `startup_capsule_ms < 300` 的检查，失败会显式报出。这个数字包含首次准备开始之前的部分；SenseVoice/whisper 模型准备是后台进行的，不阻塞胶囊出现。
+全部低于 300 ms；`verify-capsule.ps1` 里有一条 `startup_capsule_ms < 300` 的检查，失败会显式报出。这个数字包含首次准备开始之前的部分；模型准备（whisper 或 SenseVoice）在后台进行，不阻塞胶囊出现。
 
 ### 窗口属性（最终证据运行，`.artifacts\issue-19\capsule-verification.json`）
 
@@ -103,12 +104,12 @@
 | 就绪（暗绿、静止） | 启动后 `phase=Ready` | `.artifacts\issue-19\capsule-ready.png` |
 | 采集（亮绿、呼吸） | `--control start` | `.artifacts\issue-19\capsule-capturing.png` |
 | 处理（蓝色、扫光） | `--control stop` 后 `phase=Processing` | `.artifacts\issue-19\capsule-processing.png` |
-| 失败（红色、静止） | 用不存在的 `--model` 启动 | `.artifacts\issue-19\capsule-failure.png` |
+| 失败（红色、静止） | 用不存在的 SenseVoice/whisper 模型启动 | `.artifacts\issue-19\capsule-failure.png` |
 | 全桌面（胶囊被排除） | 就绪时截取整个虚拟屏幕 | `.artifacts\issue-19\desktop-capsule-excluded.png` |
 
 说明：
 
-- 静音采集时本地识别约 100 ms 就结束，100 ms 的状态写入节拍可能错过 `Processing`；验收脚本因此把 `zh-term.wav` 循环播放到默认多媒体渲染设备（`PlaySound`），让处理阶段持续数秒，再轮询 `status.txt` 抓帧。脚本里 `-AudioClip` 可覆盖该文件，找不到时退化为静音并对处理态给出明确检查结果。
+- 静音采集时本地识别约 100 ms 就结束，100 ms 的状态写入节拍可能错过 `Processing`；验收脚本因此把 `zh-term.wav` 循环播放到默认多媒体渲染设备（`PlaySound`），让处理阶段持续数秒，再轮询 `status.txt` 抓帧。脚本里 `-AudioClip` 可覆盖该文件，找不到时退化为静音并对处理态给出明确检查结果。合并 #17 后脚本默认使用产品自带引擎（SenseVoice），不再显式传 whisper 路径；`-Engine/-Model/-VadModel` 仅用于显式测试 whisper 回退。
 - 由于 `WDA_EXCLUDEFROMCAPTURE`，任何屏幕截图（包括本脚本的 `CopyFromScreen`）都看不到胶囊；这也是 `desktop-capsule-excluded.png` 里胶囊区域是桌面的原因。状态图因此来自胶囊**实际呈现的帧**（内部消息 `WM_APP+20` → `capsule-frame.bmp` → PNG）。这不是绕过排除，而是同一进程把已呈现的像素原样导出；屏幕共享排除本身由 `GetWindowDisplayAffinity`、`status.txt` 和全桌面截图三方印证。
 - 状态图是 275×33 的裁切（125% DPI 下的整条胶囊），四张图颜色/动效特征明显不同（暗绿 / 亮绿 / 蓝底亮带 / 红）。
 
@@ -139,5 +140,6 @@
 - **新增一个内部窗口消息**：`WM_APP + 20`（胶囊帧导出），只服务验收脚本；产品路径不发送它。若不接受这类可测试性钩子，替代方案是验收时临时关闭 `WDA_EXCLUDEFROMCAPTURE`（需要产品提供开关，更危险），因此选择了只读导出。
 - **拖动改为使用鼠标消息坐标**（`ClientToScreen`）而不是 `GetCursorPos`：行为更准确，也让验收脚本能用窗口消息确定性地驱动拖动。真实鼠标拖动路径同样走这段代码。
 - **共享桌面干扰**：本机同时有另一个 agent 在运行另一份 Listen 构建并做 UI 自动化，鼠标指针会被外部移动、胶囊可能被外部截获拖动。验收脚本因此只认**本可执行文件路径**的 Listen 实例，并对点击/拖动/重启检查做短重试；最终证据运行仍然全部通过。真实单机环境下这些重试不会被触发。
+- **合并 #17/#18**：`git merge integration/v0.2` 唯一冲突是 `gui.rs` 的 import（#17 把引擎构造移入 `Config::transcriber`），解决后界面代码与 SenseVoice 引擎无耦合；合并后全套测试与验收脚本重新跑过。
 - 未做：全屏独占游戏覆盖胶囊的情况（spec 已接受）、多显示器切换的实测（代码在 `WM_DPICHANGED`/`WM_DISPLAYCHANGE` 里处理并按虚拟屏幕夹取，但本轮只在 1920×1080@125% 单屏上运行）、托盘菜单各项的像素级可用性检查（菜单为原生菜单，脚本只验证打开/关闭；置灰规则与旧按钮共用同一可用性判断）。
 - `cargo clippy` 未运行：该工具链未安装 clippy 组件（离线环境无法补装）。
