@@ -37,6 +37,18 @@ Whisper
 sherpa-onnx
 SenseVoice
 
+# Acronyms used in meeting speech. Exact matching restores their case; the
+# four-letter forms also recover a measured one-vowel deformation ("jason" for
+# JSON). The three- and two-letter entries stay exact-only: "SL" -> "SLA" and
+# "PRR" -> "PR" are too close to other short forms to replace safely.
+JSON
+HTTP
+API
+MVP
+SLA
+QPS
+PR
+
 # "re" is the measured mis-recognition in Chinese technical sentences such as
 # "我们用re实现音频采集". The corrector only applies a short alias like this
 # next to Chinese text, never inside English words ("are", "there", "re-do").

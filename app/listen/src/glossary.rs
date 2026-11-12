@@ -32,12 +32,24 @@ pub fn set_default_path(path: impl Into<PathBuf>) {
     let _ = DEFAULT_PATH.set(path.into());
 }
 
-/// The glossary path for an application whose runtime directory is `runtime`.
-pub(crate) fn default_path(runtime: &Path) -> PathBuf {
-    DEFAULT_PATH
-        .get()
-        .cloned()
-        .unwrap_or_else(|| runtime.join("glossary.txt"))
+/// Candidate glossary paths for an application whose runtime directory is
+/// `runtime`. An explicit `--glossary` path is used alone; otherwise the runtime
+/// copy is preferred and the copy next to the executable is the fallback, so a
+/// copied portable build still finds the glossary shipped beside it. When no
+/// candidate exists, loading the first path is a silent no-op.
+pub(crate) fn default_paths(runtime: &Path, executable: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = DEFAULT_PATH.get() {
+        return vec![path.clone()];
+    }
+    let runtime_path = runtime.join("glossary.txt");
+    let mut paths = vec![runtime_path.clone()];
+    if let Some(directory) = executable.and_then(Path::parent) {
+        let sibling = directory.join("glossary.txt");
+        if sibling != runtime_path {
+            paths.push(sibling);
+        }
+    }
+    paths
 }
 
 /// A loaded 术语表. The application reloads it at capture start.
@@ -66,6 +78,9 @@ struct Key {
     /// Canonical keys are trusted to identify the term; aliases are user guesses
     /// and get the extra short-span safety check.
     trusted: bool,
+    /// An all-caps spelling such as `JSON` may be recognised through one dropped
+    /// or inserted vowel, which is how speech engines spell it in practice.
+    acronym: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +98,7 @@ struct CompiledKey {
     tokens: Vec<Vec<char>>,
     script: Script,
     trusted: bool,
+    acronym: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +185,7 @@ impl Glossary {
                     tokens: vec![leading.clone()],
                     script: Script::Latin,
                     trusted: true,
+                    acronym: false,
                 });
             }
             parsed.push((canonical.to_string(), keys));
@@ -190,6 +207,7 @@ impl Glossary {
                         .collect(),
                     script: key.script,
                     trusted: key.trusted,
+                    acronym: key.acronym,
                 };
                 let key_index = glossary.keys.len();
                 glossary.exact.entry(normalized).or_insert(key_index);
@@ -306,6 +324,22 @@ const SINGLE_KEY_THRESHOLD: f64 = 0.85;
 const MULTI_KEY_THRESHOLD: f64 = 0.6;
 const EDGE_THRESHOLD: f64 = 0.6;
 const MAX_LENGTH_DIFFERENCE: f64 = 0.4;
+/// Real speech also changes the number of words: "sens voice" for `SenseVoice`
+/// and "waSAPpilook back" for `WASAPI loopback`. Comparing the whole normalized
+/// span with the whole normalized key recovers those without loosening the
+/// token-level alignment. The key must stay distinctive (six characters) and the
+/// first/last character must still agree; 0.85 accepts the measured 0.87-0.90
+/// deformations while "wasabi" (0.83) and "deep water harness" (0.75) stay below.
+const WHOLE_SPAN_THRESHOLD: f64 = 0.85;
+const WHOLE_SPAN_MIN_KEY_LEN: usize = 6;
+/// The shortest all-caps acronym that may lose or gain one vowel ("jason" ->
+/// "JSON"). Three-letter acronyms stay exact-only because "QOS" is one edit from
+/// "QPS", and two-letter acronyms ("PR") are too ambiguous to approximate.
+const ACRONYM_MIN_KEY_LEN: usize = 4;
+const ACRONYM_MIN_SPAN_LEN: usize = 4;
+/// A multi-word key may be recognised by a clearly truncated first word when
+/// every remaining word still matches ("de harness" -> "DeepSeek Harness").
+const ABBREVIATED_FIRST_WORD_MIN_LEN: usize = 6;
 
 #[derive(Clone, Copy)]
 enum Edge {
@@ -319,6 +353,11 @@ fn approximate_score(
     key: &CompiledKey,
     scratch: &mut Scratch,
 ) -> Option<f64> {
+    if window.len() == 1 && key.acronym {
+        if let Some(score) = acronym_score(span, &key.chars) {
+            return Some(score);
+        }
+    }
     if key.chars.len() < MIN_APPROXIMATE_LEN || span.len() < MIN_APPROXIMATE_LEN {
         return None;
     }
@@ -333,39 +372,91 @@ fn approximate_score(
     }
     let key_tokens = key.tokens.len();
     let window_tokens = window.len();
-    if key_tokens == 1 {
-        // A one-word key is only compared with one token. Multi-token spellings
-        // ("deep seek", "wa-sa-pi") are caught by the exact normalized lookup.
-        if window_tokens != 1 {
-            return None;
-        }
-        let score = scratch.ratio(span, &key.chars);
-        return (score >= SINGLE_KEY_THRESHOLD).then_some(score);
-    }
-    if window_tokens < key_tokens {
-        return None;
-    }
-    // When the span has more tokens than the key, every key token must cover one
-    // or more span tokens. Anchor the outer tokens to the edges of the key word so
-    // an adjacent ordinary word ("Harness and") is never swallowed.
-    if window_tokens > key_tokens {
-        if edge_ratio(&window[0].chars, &key.tokens[0], Edge::Prefix, scratch) < EDGE_THRESHOLD {
-            return None;
-        }
-        if edge_ratio(
-            &window[window_tokens - 1].chars,
-            &key.tokens[key_tokens - 1],
-            Edge::Suffix,
-            scratch,
-        ) < EDGE_THRESHOLD
-        {
-            return None;
-        }
-    }
+
     // Align key tokens to contiguous groups of span tokens. Every key token must
     // get at least one token and every span token must belong to a group, which
     // lets "deep sea harnessness" align as "deepsea" + "harnessness" while a
     // different phrase such as "deep water harness" stays below the threshold.
+    let structured = match (key_tokens, window_tokens) {
+        (1, 1) => {
+            let score = scratch.ratio(span, &key.chars);
+            (score >= SINGLE_KEY_THRESHOLD).then_some(score)
+        }
+        (1, _) => None,
+        (key_tokens, window_tokens) if window_tokens >= key_tokens => {
+            // When the span has more tokens than the key, every key token must
+            // cover one or more span tokens. Anchor the outer tokens to the edges
+            // of the key word so an adjacent ordinary word ("Harness and") is
+            // never swallowed.
+            if window_tokens > key_tokens && !outer_tokens_align(window, key, scratch) {
+                None
+            } else {
+                aligned_token_score(window, key, scratch)
+            }
+        }
+        _ => None,
+    };
+    if let Some(score) = structured {
+        return Some(score);
+    }
+
+    // Word counts differ or the token grouping did not line up. Compare the whole
+    // normalized span against the whole normalized key before giving up. This is
+    // a Latin-word problem; Chinese terms keep the stricter per-character path.
+    if key.script == Script::Latin && key.chars.len() >= WHOLE_SPAN_MIN_KEY_LEN {
+        let score = scratch.ratio(span, &key.chars);
+        if score >= WHOLE_SPAN_THRESHOLD {
+            return Some(score);
+        }
+    }
+
+    abbreviated_leading_word(window, key, scratch)
+}
+
+/// A speech engine may spell an acronym with one vowel dropped or inserted
+/// ("jason" for `JSON`, "waspi" for `WASAPI`). Only a pure insertion/deletion is
+/// accepted: a substitution ("wasabi" for `WASAPI`, "coda" for `CUDA`) and any
+/// three-letter acronym stay untouched.
+fn acronym_score(span: &[char], key: &[char]) -> Option<f64> {
+    if key.len() < ACRONYM_MIN_KEY_LEN || span.len() < ACRONYM_MIN_SPAN_LEN {
+        return None;
+    }
+    if span.first() != key.first() || span.last() != key.last() {
+        return None;
+    }
+    let (longer, shorter) = if span.len() == key.len() + 1 {
+        (span, key)
+    } else if key.len() == span.len() + 1 {
+        (key, span)
+    } else {
+        return None;
+    };
+    let mut index = 0;
+    while index < shorter.len() && longer[index] == shorter[index] {
+        index += 1;
+    }
+    if index == shorter.len() || longer[index + 1..] != shorter[index..] {
+        return None;
+    }
+    if !matches!(longer[index], 'a' | 'e' | 'i' | 'o' | 'u') {
+        return None;
+    }
+    Some(1.0 - 1.0 / longer.len() as f64)
+}
+
+fn outer_tokens_align(window: &[Token], key: &CompiledKey, scratch: &mut Scratch) -> bool {
+    edge_ratio(&window[0].chars, &key.tokens[0], Edge::Prefix, scratch) >= EDGE_THRESHOLD
+        && edge_ratio(
+            &window[window.len() - 1].chars,
+            &key.tokens[key.tokens.len() - 1],
+            Edge::Suffix,
+            scratch,
+        ) >= EDGE_THRESHOLD
+}
+
+fn aligned_token_score(window: &[Token], key: &CompiledKey, scratch: &mut Scratch) -> Option<f64> {
+    let key_tokens = key.tokens.len();
+    let window_tokens = window.len();
     let mut dp = vec![vec![-1.0f64; window_tokens + 1]; key_tokens + 1];
     dp[0][0] = 1.0;
     for i in 1..=key_tokens {
@@ -398,6 +489,40 @@ fn approximate_score(
     }
     let score = dp[key_tokens][window_tokens];
     (score >= MULTI_KEY_THRESHOLD).then_some(score)
+}
+
+/// Recover a term whose first word was shortened to a prefix ("de harness").
+/// The rest of the words must still match nearly exactly, which is what keeps
+/// ordinary phrases such as "the harness" or "deep water harness" untouched.
+fn abbreviated_leading_word(
+    window: &[Token],
+    key: &CompiledKey,
+    scratch: &mut Scratch,
+) -> Option<f64> {
+    if key.script != Script::Latin || key.tokens.len() < 2 || window.len() != key.tokens.len() {
+        return None;
+    }
+    let first_key = &key.tokens[0];
+    let first_span = &window[0].chars;
+    if first_key.len() < ABBREVIATED_FIRST_WORD_MIN_LEN
+        || first_span.len() < 2
+        || first_span.len() >= first_key.len()
+        || !first_key.starts_with(first_span)
+    {
+        return None;
+    }
+    let mut score = 1.0f64;
+    for (span, key_token) in window.iter().skip(1).zip(key.tokens.iter().skip(1)) {
+        if span.chars.first() != key_token.first() || span.chars.last() != key_token.last() {
+            return None;
+        }
+        let token_score = scratch.ratio(&span.chars, key_token);
+        if token_score < SINGLE_KEY_THRESHOLD {
+            return None;
+        }
+        score = score.min(token_score);
+    }
+    Some(score)
 }
 
 fn edge_ratio(candidate: &[char], key_token: &[char], edge: Edge, scratch: &mut Scratch) -> f64 {
@@ -473,8 +598,16 @@ impl Key {
             tokens: tokens.into_iter().map(|token| token.normalized).collect(),
             script,
             trusted,
+            acronym: is_acronym(text),
         })
     }
+}
+
+/// An all-caps spelling is an acronym, not an ordinary word, so the safe
+/// one-vowel shortcut in [`acronym_score`] may consider it.
+fn is_acronym(text: &str) -> bool {
+    let length = text.chars().count();
+    length >= 2 && text.chars().all(|ch| ch.is_ascii_uppercase())
 }
 
 fn tokenize(text: &str) -> Vec<Token> {
@@ -830,5 +963,196 @@ Rust | re
             "correcting 300 terms took {elapsed:?}"
         );
         println!("300-term correction took {elapsed:?}");
+    }
+
+    /// The ten sentences from the user's first real-world meeting run, paired
+    /// with the exact recognised output the engine produced and the result the
+    /// shipped glossary can honestly deliver. Lines whose recognised text is the
+    /// reference are included so the diagnostic covers the whole run; the parts
+    /// the matcher cannot recover are left untouched and documented in
+    /// `docs/issue-glossary-real-speech.md`.
+    const REAL_MEETING_LINES: [(&str, &str); 10] = [
+        (
+            "我先同步一下今天的进展，后端接口已经联调完成，前端还在补最后的错误提示，明天下午可以走一遍验收流程。",
+            "我先同步一下今天的进展，后端接口已经联调完成，前端还在补最后的错误提示，明天下午可以走一遍验收流程。",
+        ),
+        (
+            "我们把语音识别成w换成sens voice，现在用 ON X在本地跑推理。",
+            "我们把语音识别成w换成SenseVoice，现在用 ON X在本地跑推理。",
+        ),
+        (
+            "de harness的接口已经调通了ku打加速这一版先不开，选用CPU把流程抛稳。",
+            "DeepSeek Harness的接口已经调通了CUDA打加速这一版先不开，选用CPU把流程抛稳。",
+        ),
+        (
+            "采集走的是waSAPpilook back音频直接送进模接口偶尔返回HTTP500日志里能看到jason解析失败。",
+            "采集走的是WASAPI loopback音频直接送进模接口偶尔返回HTTP500日志里能看到JSON解析失败。",
+        ),
+        (
+            "这次发布版本是 1.8.2，服务端口改成8080失败重试3次，间隔2秒，超时实验设30秒。",
+            "这次发布版本是 1.8.2，服务端口改成8080失败重试3次，间隔2秒，超时实验设30秒。",
+        ),
+        (
+            "本机环境已经配好了，本季度的目标不变，请确认是要在本季部署还是下个季度再部署一次。",
+            "本机环境已经配好了，本季度的目标不变，请确认是要在本季部署还是下个季度再部署一次。",
+        ),
+        (
+            "这个 PRR我 review过了，主要改了retryed的逻辑 merge之前还需要再补一个d stay unit test.",
+            "这个 PRR我 review过了，主要改了retryed的逻辑 merge之前还需要再补一个d stay unit test.",
+        ),
+        (
+            "结论有3点，第一，回度比例悬空制在5%。第二，回滚窗考留30分钟。第三，明天10点半之前给我确认。",
+            "结论有3点，第一，回度比例悬空制在5%。第二，回滚窗考留30分钟。第三，明天10点半之前给我确认。",
+        ),
+        (
+            "地方在腾讯会议里说话，我这边把耳机里的声音直接录下来，不做任何识别，先保证音频完整。",
+            "地方在腾讯会议里说话，我这边把耳机里的声音直接录下来，不做任何识别，先保证音频完整。",
+        ),
+        (
+            "今天的de先MVPAPI文档，我下午发到群里SL和QPS这两个指标下周再对齐。",
+            "今天的de先MVPAPI文档，我下午发到群里SL和QPS这两个指标下周再对齐。",
+        ),
+    ];
+
+    #[test]
+    fn the_users_real_meeting_transcripts_are_corrected_where_the_glossary_can() {
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for (index, (recognized, expected)) in REAL_MEETING_LINES.iter().enumerate() {
+            assert_eq!(
+                glossary.correct(recognized),
+                *expected,
+                "meeting line {}",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: prints the ten real meeting lines through Glossary::correct()"]
+    fn diagnostic_real_meeting_lines() {
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for (index, (recognized, expected)) in REAL_MEETING_LINES.iter().enumerate() {
+            let corrected = glossary.correct(recognized);
+            let result = if corrected == *expected {
+                if corrected == *recognized {
+                    "unchanged"
+                } else {
+                    "fixed"
+                }
+            } else {
+                "MISMATCH"
+            };
+            println!(
+                "line {:2} [{result}]\n  recognized: {recognized}\n  corrected : {corrected}",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_glossary_restores_the_corpus_acronyms() {
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for (input, expected) in [
+            ("jason", "JSON"),
+            ("日志里能看到jason解析失败。", "日志里能看到JSON解析失败。"),
+            ("http 500", "HTTP 500"),
+            ("the api and mvp", "the API and MVP"),
+            ("sla and qps", "SLA and QPS"),
+            ("pr review", "PR review"),
+            ("cuda", "CUDA"),
+        ] {
+            assert_eq!(glossary.correct(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn short_acronym_deformations_are_left_alone_instead_of_guessed() {
+        // "SL" -> "SLA" and "PRR" -> "PR" would need a 2/3 or 1/2 edit ratio on a
+        // two- or three-letter key, where ordinary words and other acronyms are
+        // too close. They stay in the documented gap rather than risk a wrong term.
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for input in ["发到群里SL和QPS", "这个 PRR我 review过了", "SLO 和 QPS"] {
+            assert_eq!(glossary.correct(input), input, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn the_looser_whole_span_rule_leaves_ordinary_words_and_phrases_alone() {
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for input in [
+            "we seek consensus.",
+            "The deep sea is calm.",
+            "The safety harness is loose.",
+            "The deep water harness is not our product.",
+            "Wasabi is a plant, not an audio API.",
+            "Take a rest before the review.",
+            "The deck is on the left.",
+            "I sense that the voice is clear.",
+            "The device works, and the service is down.",
+        ] {
+            assert_eq!(glossary.correct(input), input, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_leading_word_is_recovered_only_with_the_rest_of_the_term() {
+        let glossary = Glossary::parse(SHIPPED).unwrap();
+        for (input, expected) in [
+            ("de harness的接口", "DeepSeek Harness的接口"),
+            ("de harness", "DeepSeek Harness"),
+            ("wa loopback", "WASAPI loopback"),
+        ] {
+            assert_eq!(glossary.correct(input), expected, "input: {input:?}");
+        }
+        for input in [
+            "do harness",
+            "the harness",
+            "deployment harness",
+            "deep water harness is not our product.",
+        ] {
+            assert_eq!(glossary.correct(input), input, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_glossary_falls_back_to_the_copy_next_to_the_executable() {
+        let directory = std::env::temp_dir().join(format!(
+            "listen-glossary-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runtime = directory.join("runtime");
+        let build = directory.join("build");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        let executable = build.join("listen.exe");
+        let runtime_file = runtime.join("glossary.txt");
+        let sibling = build.join("glossary.txt");
+
+        assert_eq!(
+            default_paths(&runtime, Some(&executable)),
+            vec![runtime_file.clone(), sibling.clone()]
+        );
+
+        fs::write(&sibling, "DeepSeek Harness\n").unwrap();
+        let paths = default_paths(&runtime, Some(&executable));
+        assert_eq!(
+            paths.iter().find(|path| path.is_file()),
+            Some(&sibling),
+            "a copied build must find the glossary next to listen.exe"
+        );
+
+        fs::write(&runtime_file, "WASAPI\n").unwrap();
+        let paths = default_paths(&runtime, Some(&executable));
+        assert_eq!(
+            paths.iter().find(|path| path.is_file()),
+            Some(&runtime_file),
+            "an existing runtime glossary must win over the copy next to the exe"
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

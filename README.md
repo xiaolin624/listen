@@ -2,7 +2,7 @@
 
 Windows 后台工具：先点击目标编辑区，按 **Ctrl+Alt+R** 采集**默认多媒体播放设备**上的声音，再按一次停止；它在本机用 **SenseVoiceSmall q8（sherpa-onnx，常驻进程内）** 转写，把完整结果追加到开始时选定的目标编辑区。没有有效目标或写入无法确认时，完整结果保留在**展开结果面板**中，可直接复制。工具不会自动发送消息，也不会把转写文本作为命令执行。
 
-v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任务栏，并用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏；胶囊只用颜色、形状和动效表达状态，点击展开**结果面板**（完整结果、复制、重试、清理、精修）。原详情窗口已删除，托盘仍可打开面板。更早版本的历史与验收记录保持不变：[#2 采集到复制](docs/issue-2-verification.md)、[#3 原生目标](docs/issue-3-verification.md)、[#4 通用编辑区](docs/issue-4-verification.md)、[#6 长会话](docs/issue-6-verification.md)、[#7 失败重试](docs/issue-7-verification.md)、[#8 路由中断](docs/issue-8-verification.md)、[#9 质量基线](docs/issue-9-verification.md)、[#10 准备与延迟](docs/issue-10-verification.md)、[#11 交付包](docs/issue-11-verification.md)。v0.2 的引擎、术语表、胶囊、面板与精修验收见 [#17](docs/issue-17-verification.md)、[#19](docs/issue-19-verification.md)、[#20](docs/issue-20-verification.md)、[#21](docs/issue-21-verification.md)；本轮代码审查的修复与实测数字见 [审查修复记录](docs/issue-review-fixes.md)。
+v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任务栏，并用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏；胶囊只用颜色、形状和动效表达状态，点击展开**结果面板**（完整结果、复制、重试、清理、精修）。原详情窗口已删除，托盘仍可打开面板。更早版本的历史与验收记录保持不变：[#2 采集到复制](docs/issue-2-verification.md)、[#3 原生目标](docs/issue-3-verification.md)、[#4 通用编辑区](docs/issue-4-verification.md)、[#6 长会话](docs/issue-6-verification.md)、[#7 失败重试](docs/issue-7-verification.md)、[#8 路由中断](docs/issue-8-verification.md)、[#9 质量基线](docs/issue-9-verification.md)、[#10 准备与延迟](docs/issue-10-verification.md)、[#11 交付包](docs/issue-11-verification.md)。v0.2 的引擎、术语表、胶囊、面板与精修验收见 [#17](docs/issue-17-verification.md)、[#19](docs/issue-19-verification.md)、[#20](docs/issue-20-verification.md)、[#21](docs/issue-21-verification.md)；本轮代码审查的修复与实测数字见 [审查修复记录](docs/issue-review-fixes.md)，用户真实语音暴露的术语表加载与匹配修复见 [术语表真实语音修复记录](docs/issue-glossary-real-speech.md)。
 
 ## v0.2 的行为
 
@@ -48,7 +48,7 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 
 ## 术语表（专名校正）
 
-默认路径是 `<runtime>\glossary.txt`，可用 `--glossary` 指定。`#` 开头是注释，空行忽略；正式写法在前，可选别名（拼音、中文写法或顽固误写）放在 `|` 后，用逗号分隔：
+默认路径是 `<runtime>\glossary.txt`；如果它不存在，再找 `listen.exe` 旁边的 `glossary.txt`（复制出去的构建因此也能用上随包术语表）。开发启动器 `run-listen.ps1` 默认传入仓库里的 `packaging\glossary.txt`，可用 `-Glossary` 换文件；`listen.exe --glossary <file>` 仍然优先。`status.txt` 的 `glossary=` 行写明本次实际使用的文件，没有文件时为 `none`。`#` 开头是注释，空行忽略；正式写法在前，可选别名（拼音、中文写法或顽固误写）放在 `|` 后，用逗号分隔：
 
 ```text
 DeepSeek Harness | shen du qiu suo, 迪普西克
@@ -76,7 +76,7 @@ Rust | re
 | --- | --- |
 | `current-result.txt` | 当前完整 UTF-8 转写文本；成功后覆盖，不建立会议历史 |
 | `panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新，供自动化读取 |
-| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、各段耗时、进程 ID；不含转写正文 |
+| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、各段耗时、进程 ID；不含转写正文 |
 | `latency.jsonl` | 每次采集/失败的准备、采集启动、收尾、识别、保存、交付耗时；不含音频 |
 | 本次会话临时目录 | 采集音频与本地诊断；成功后删除，失败时保留以便人工恢复 |
 
