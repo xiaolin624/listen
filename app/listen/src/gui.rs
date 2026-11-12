@@ -2,8 +2,10 @@ use crate::{
     Config, WasapiPlayback,
     capsule::{CapsuleState, capsule_state, preparation_name},
     capsule_window::{self, Capsule},
+    panel,
+    panel_window::{self, Panel},
 };
-use listen::{Application, Control, Delivery, Phase, Snapshot, target::NativeTargets};
+use listen::{Application, Control, Delivery, Phase, Snapshot, paste, target::NativeTargets};
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
     Win32::{
@@ -28,22 +30,42 @@ const CONTROL_MESSAGE: u32 = WM_APP + 10;
 const TRAY_MESSAGE: u32 = WM_APP + 11;
 const ID_TOGGLE: usize = 101;
 const ID_EXIT: usize = 103;
+/// Open the expanded result panel (the tray menu item and a tray left click).
 const ID_SHOW: usize = 104;
 const ID_RETRY: usize = 105;
 const ID_CLEANUP: usize = 106;
+/// `--control panel`: toggle the expanded result panel.
+const ID_PANEL: usize = 107;
+/// `--control copy`: copy the complete current result without opening the panel.
+const ID_COPY_RESULT: usize = 108;
 /// How often the application snapshot is polled and `status.txt` is refreshed.
 const POLL_TIMER_MS: u32 = 100;
 
 struct Ui {
     app: Application,
-    /// Hidden owner window; the capsule has its own top-level window.
+    /// Hidden owner window; the capsule and the expanded panel are its only
+    /// user-visible surfaces.
     hwnd: HWND,
     capsule: Capsule,
+    /// Created on first use, then only shown or hidden, so reopening is instant and
+    /// the window keeps its settings and position for the session.
+    panel: Option<Panel>,
     runtime: PathBuf,
     last: Option<Snapshot>,
+    /// Last `status.txt` contents, so `panel_visible`/`panel_error` changes are
+    /// persisted even when the application snapshot itself did not change.
+    last_status: String,
+    /// Last `panel.txt` contents. The file is the contract for automation.
+    last_panel_text: String,
+    /// The last fallback/failure the panel opened for, so a closed panel is not
+    /// re-opened on every poll and a new event does open again.
+    last_auto_open: Option<String>,
+    /// Why the panel window could not be created, if it ever fails. Reported in
+    /// `status.txt` as `panel_error` so a failure is diagnosable without a console.
+    panel_error: Option<String>,
     tray: bool,
-    /// `--hidden` still shows the capsule (it is the only user-visible surface) but
-    /// suppresses transient tray notifications.
+    /// `--hidden` still shows the capsule and the panel on demand (they are the only
+    /// user-visible surfaces) but suppresses transient tray notifications.
     notify: bool,
     quit_requested: bool,
 }
@@ -86,6 +108,8 @@ pub fn control(command: &str) -> Result<(), String> {
         "quit" => 5,
         "retry" => 6,
         "cleanup" => 7,
+        "panel" => 8,
+        "copy" => 9,
         _ => return Err(format!("Unknown control command: {command}")),
     };
     unsafe {
@@ -162,8 +186,13 @@ pub fn run(config: Config) -> Result<(), String> {
             app,
             hwnd,
             capsule,
+            panel: None,
             runtime: config.runtime,
             last: None,
+            last_status: String::new(),
+            last_panel_text: String::new(),
+            last_auto_open: None,
+            panel_error: None,
             tray: false,
             notify: !config.hidden,
             quit_requested: false,
@@ -173,6 +202,9 @@ pub fn run(config: Config) -> Result<(), String> {
         icon.uCallbackMessage = TRAY_MESSAGE;
         state.tray = Shell_NotifyIconW(NIM_ADD, &icon).as_bool();
         UI.with(|ui| *ui.borrow_mut() = Some(state));
+        // A click on the capsule toggles the expanded result panel. The handler is a
+        // plain function so the capsule window never depends on the application.
+        capsule_window::set_click_handler(toggle_panel_on_click);
         let registered = UI.with(|ui| {
             let mut slot = ui.borrow_mut();
             if slot.as_mut().is_none() {
@@ -196,6 +228,15 @@ pub fn run(config: Config) -> Result<(), String> {
             }
             if next == 0 {
                 break;
+            }
+            // Dialog keyboard processing for the expanded panel: Esc closes it and
+            // Tab moves between its read-only text and its buttons. Messages that do
+            // not belong to the panel fall through to the normal dispatch below.
+            let dialog = UI.with(|ui| ui.borrow().as_ref().and_then(|state| state.panel_dialog()));
+            if let Some(dialog) = dialog {
+                if IsDialogMessageW(dialog, &message).as_bool() {
+                    continue;
+                }
             }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -241,6 +282,31 @@ impl Ui {
             let visual = capsule_state(&state);
             // The capsule draws itself; this only pushes a changed visual state.
             self.capsule.set_state(visual);
+
+            // `panel.txt` is the panel's full text (status + complete result) in
+            // reading order. It is derived from the same snapshot as the window and
+            // is written whenever it changes, open or not, so automation never needs
+            // UIA or window handles to read the panel.
+            let panel_text = panel::text(&state);
+            if panel_text != self.last_panel_text {
+                let _ = fs::write(self.runtime.join("panel.txt"), &panel_text);
+                self.last_panel_text = panel_text;
+            }
+
+            // A result that could not be appended and every failure open the panel
+            // by themselves, once per event: the text must be reachable without the
+            // user discovering the capsule. A successful append never does.
+            let auto_open = panel::auto_open_key(&state);
+            if auto_open != self.last_auto_open {
+                if auto_open.is_some() {
+                    self.open_panel();
+                }
+                self.last_auto_open = auto_open;
+            }
+            if let Some(panel) = self.panel.as_mut() {
+                panel.apply(&state);
+            }
+
             let changed = self.last.as_ref().is_none_or(|last| {
                 last.phase != state.phase
                     || last.preparation != state.preparation
@@ -252,16 +318,20 @@ impl Ui {
                     || last.backend != state.backend
                     || last.timing != state.timing
             });
-            if !changed {
-                return;
-            }
             let phase_changed = self
                 .last
                 .as_ref()
                 .is_some_and(|last| last.phase != state.phase);
             let timing = &state.timing;
+            let panel_visible = self.panel_visible();
+            let panel_error = self
+                .panel_error
+                .clone()
+                .unwrap_or_default()
+                .replace('\r', "")
+                .replace('\n', " ");
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\ncapsule={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -290,6 +360,8 @@ impl Ui {
                 state.backend.as_deref().unwrap_or(""),
                 preparation_name(state.preparation),
                 visual.name(),
+                if panel_visible { 1 } else { 0 },
+                panel_error,
                 self.capsule.startup_ms(),
                 if self.capsule.capture_excluded() {
                     1
@@ -331,7 +403,17 @@ impl Ui {
                 timing.recognition_windows,
                 std::process::id()
             );
-            let _ = fs::write(self.runtime.join("status.txt"), status);
+            // `status.txt` also changes when only the panel opened/closed or the
+            // panel window failed to create, which the snapshot comparison above
+            // cannot see.
+            let status_changed = status != self.last_status;
+            if status_changed {
+                let _ = fs::write(self.runtime.join("status.txt"), &status);
+                self.last_status = status;
+            }
+            if !changed && !status_changed {
+                return;
+            }
             if self.tray {
                 let mut icon = self.icon_data();
                 icon.uFlags = NIF_TIP | NIF_ICON;
@@ -388,6 +470,78 @@ impl Ui {
         }
     }
 
+    /// Toggle the expanded result panel. `--control panel` and a capsule click reach
+    /// this; the button/tray paths use `open_panel` instead.
+    fn toggle_panel(&mut self) {
+        if self.panel_visible() {
+            self.close_panel();
+        } else {
+            self.open_panel();
+        }
+    }
+
+    /// Open (creating it on first use) and show the panel next to the capsule.
+    /// Showing never activates the window, so this is safe from a poll update, from
+    /// `--control show` and from a capsule click.
+    fn open_panel(&mut self) {
+        if self.panel.is_none() {
+            match Panel::create(self.capsule.hwnd(), self.hwnd) {
+                Ok(panel) => {
+                    self.panel = Some(panel);
+                    self.panel_error = None;
+                }
+                Err(error) => {
+                    self.panel_error = Some(error);
+                    return;
+                }
+            }
+        }
+        self.capsule.reveal();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.place_near(self.capsule.hwnd());
+            panel.apply(&self.app.snapshot());
+            panel.show();
+        }
+    }
+
+    fn close_panel(&mut self) {
+        if let Some(panel) = &self.panel {
+            panel.hide();
+        }
+    }
+
+    fn panel_visible(&self) -> bool {
+        self.panel.as_ref().is_some_and(|panel| panel.visible())
+    }
+
+    fn panel_dialog(&self) -> Option<HWND> {
+        self.panel.as_ref().and_then(|panel| panel.dialog_handle())
+    }
+
+    /// Run one action requested from the panel window. Commands arrive through the
+    /// owner window, never inside the panel's own procedure, so application polling
+    /// and native menus keep working.
+    fn panel_command(&mut self, command: usize) {
+        match command {
+            panel_window::COMMAND_COPY => self.copy_result(),
+            panel_window::COMMAND_RETRY => self.app.dispatch(Control::Retry),
+            panel_window::COMMAND_CLEANUP => self.app.dispatch(Control::CleanupAudio),
+            panel_window::COMMAND_CLOSE => self.close_panel(),
+            _ => {}
+        }
+        unsafe {
+            self.refresh();
+        }
+    }
+
+    /// Clipboard only: never pastes, never sends, never touches a target.
+    fn copy_result(&self) {
+        let text = self.app.snapshot().text;
+        if !text.is_empty() {
+            let _ = paste::copy_to_clipboard(&text);
+        }
+    }
+
     unsafe fn command(&mut self, id: usize) {
         unsafe {
             match id {
@@ -396,8 +550,11 @@ impl Ui {
                 3 | ID_TOGGLE => self.app.dispatch(Control::Toggle),
                 6 | ID_RETRY => self.app.dispatch(Control::Retry),
                 7 | ID_CLEANUP => self.app.dispatch(Control::CleanupAudio),
-                // There is no panel yet (#20): reveal the capsule without focus.
-                4 | ID_SHOW => self.capsule.reveal(),
+                // `show` opens the panel, `panel` toggles it and `copy` copies the
+                // current result; none of them takes focus.
+                4 | ID_SHOW => self.open_panel(),
+                8 | ID_PANEL => self.toggle_panel(),
+                9 | ID_COPY_RESULT => self.copy_result(),
                 5 | ID_EXIT => {
                     self.quit_requested = true;
                     if self.app.snapshot().phase == Phase::Capturing {
@@ -417,16 +574,32 @@ impl Ui {
     }
 }
 
+/// The capsule click handler. It only toggles the panel and refreshes the status
+/// files; it never activates the panel or the capsule.
+fn toggle_panel_on_click() {
+    UI.with(|ui| {
+        // The click is delivered from the capsule window procedure, so a busy slot
+        // (a native menu or a panel command re-entering) simply defers the click.
+        let Ok(mut slot) = ui.try_borrow_mut() else {
+            return;
+        };
+        if let Some(state) = slot.as_mut() {
+            state.toggle_panel();
+            unsafe {
+                state.refresh();
+            }
+        }
+    });
+}
+
 unsafe fn show_tray_menu(hwnd: HWND, state: &Snapshot) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let idle = !matches!(
-            state.phase,
-            Phase::Capturing | Phase::Processing | Phase::Preparing
-        );
-        let retry_available = idle && state.retry_available;
+        // The tray and the panel share this availability rule, so a menu item and
+        // the matching panel button are always enabled together.
+        let retry_available = panel::recovery_available(state);
         let availability = |enabled: bool| {
             if enabled {
                 MF_STRING
@@ -434,8 +607,8 @@ unsafe fn show_tray_menu(hwnd: HWND, state: &Snapshot) {
                 MF_STRING | MF_GRAYED
             }
         };
+        let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("打开结果面板"));
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, w!("开始 / 停止  Ctrl+Alt+R"));
-        // Ticket #20 adds "打开面板" and the refine entry here.
         let _ = AppendMenuW(
             menu,
             availability(retry_available),
@@ -512,9 +685,13 @@ unsafe extern "system" fn window_proc(
                     state.command(wparam.0 & 0xffff);
                     true
                 }
+                panel_window::COMMAND_MESSAGE => {
+                    state.panel_command(wparam.0);
+                    true
+                }
                 TRAY_MESSAGE => {
                     if matches!(lparam.0 as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK) {
-                        // Ticket #20 opens the expanded panel here instead.
+                        // A tray left click opens the expanded result panel.
                         state.command(ID_SHOW);
                     }
                     true

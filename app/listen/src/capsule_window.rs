@@ -42,11 +42,11 @@ use windows::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, GetWindowRect,
                 HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassW,
                 SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-                SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow, ULW_ALPHA,
-                UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED, WM_DESTROY,
-                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+                SWP_NOZORDER, SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+                ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
+                WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
                 WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
@@ -101,6 +101,12 @@ impl Capsule {
         self.startup_ms
     }
 
+    /// The capsule's window handle. The expanded panel uses it to find the capsule
+    /// monitor and to place itself next to the bar; nothing else needs it.
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     /// Change the visual state. The window repaints immediately if the picture
     /// changes and picks the matching timer cadence.
     pub fn set_state(&self, state: CapsuleState) {
@@ -108,8 +114,9 @@ impl Capsule {
         with_window(hwnd, |window| window.set_state(state));
     }
 
-    /// Make the capsule visible and topmost again without taking focus. `--control
-    /// show` reaches this; ticket #20 will also open the expanded panel here.
+    /// Make the capsule visible and topmost again without taking focus or moving
+    /// it. The expanded panel opens through here so the capsule cannot be left
+    /// behind another window.
     pub fn reveal(&self) {
         let hwnd = self.hwnd;
         unsafe {
@@ -121,7 +128,7 @@ impl Capsule {
                 0,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             );
         }
     }
@@ -196,12 +203,27 @@ pub fn create(runtime: &Path, state: CapsuleState) -> Result<Capsule, String> {
     }
 }
 
-/// Click hook for the expanded panel. A click (as opposed to a drag) currently has
-/// no visible effect: ticket #20 fills this in with "toggle the expanded text
-/// panel". It must never take focus, so it must not call SetForegroundWindow,
-/// SetActiveWindow or SetFocus.
+/// Click hook for the expanded panel. `gui` registers the toggle handler once at
+/// startup; a click (as opposed to a drag) calls it. This must never take focus
+/// itself, so it must not call SetForegroundWindow, SetActiveWindow or SetFocus.
 pub fn on_click() {
-    // Intentionally empty until the panel exists (#20).
+    CLICK_HANDLER.with(|slot| {
+        if let Some(handler) = slot.get() {
+            handler();
+        }
+    });
+}
+
+thread_local! {
+    /// The panel toggle registered by `gui`. A plain function pointer keeps the
+    /// capsule window independent of the application state it toggles.
+    static CLICK_HANDLER: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Register the action a capsule click performs. Called once by `gui` before the
+/// message loop starts.
+pub fn set_click_handler(handler: fn()) {
+    CLICK_HANDLER.with(|slot| slot.set(Some(handler)));
 }
 
 fn with_window(hwnd: HWND, action: impl FnOnce(&mut Window)) {
