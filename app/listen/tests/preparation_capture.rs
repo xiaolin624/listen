@@ -1,7 +1,7 @@
 //! Capture may start while the local model is still being prepared. These tests
-//! drive the same `Application` boundary the hotkey uses with fake playback,
-//! fake local models and fake targets: they assert only what the user can see
-//! (phase, preparation state, detail text, delivered text, retained audio).
+//! drive the same `Application` boundary the hotkey uses with fake playback and
+//! fake local models: they assert only what the user can see (phase, preparation
+//! state, detail text, delivered text, retained audio).
 #![cfg(windows)]
 
 use listen::{
@@ -49,20 +49,10 @@ impl Drop for Runtime {
 }
 
 /// A playback device that starts writing immediately, like the real loopback.
-struct Playback {
-    starts: Arc<AtomicUsize>,
-}
-impl Playback {
-    fn new() -> Self {
-        Self {
-            starts: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
+struct Playback;
 struct Playing(PathBuf);
 impl PlaybackAudio for Playback {
     fn start(&self, directory: &Path) -> AppResult<Box<dyn Recording>> {
-        self.starts.fetch_add(1, Ordering::SeqCst);
         let path = directory.join("audio.wav");
         let spec = hound::WavSpec {
             channels: 1,
@@ -94,12 +84,20 @@ impl Recording for Playing {
 struct PreparingModel {
     preparation: Mutex<Option<mpsc::Receiver<AppResult<String>>>>,
     ready: AtomicBool,
+    recognition_delay_ms: u64,
 }
 impl PreparingModel {
     fn new(receiver: mpsc::Receiver<AppResult<String>>) -> Self {
         Self {
             preparation: Mutex::new(Some(receiver)),
             ready: AtomicBool::new(false),
+            recognition_delay_ms: 0,
+        }
+    }
+    fn with_recognition_delay(receiver: mpsc::Receiver<AppResult<String>>, delay_ms: u64) -> Self {
+        Self {
+            recognition_delay_ms: delay_ms,
+            ..Self::new(receiver)
         }
     }
     fn mark_ready(&self) {
@@ -119,6 +117,7 @@ impl LocalTranscriber for PreparingModel {
                 "The local model is still being prepared, so it cannot recognize audio yet".into(),
             );
         }
+        thread::sleep(Duration::from_millis(self.recognition_delay_ms));
         let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
         let samples = wav.duration();
         if samples == 0 {
@@ -164,12 +163,7 @@ fn preparation_failure_during_capture_ends_in_failure_and_retains_the_whole_audi
     fs::write(runtime.0.join("current-result.txt"), previous).unwrap();
     let (sender, receiver) = mpsc::channel();
     let model = Arc::new(PreparingModel::new(receiver));
-    let mut app = Application::new(
-        Arc::new(Playback::new()),
-        model.clone(),
-        runtime.0.clone(),
-        Ok(()),
-    );
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
     app.dispatch(Control::Toggle);
     assert_eq!(app.snapshot().phase, Phase::Capturing);
 
@@ -241,12 +235,7 @@ fn hotkey_start_while_the_model_is_preparing_captures_and_delivers_after_readine
     let runtime = Runtime::new();
     let (sender, receiver) = mpsc::channel();
     let model = Arc::new(PreparingModel::new(receiver));
-    let mut app = Application::new(
-        Arc::new(Playback::new()),
-        model.clone(),
-        runtime.0.clone(),
-        Ok(()),
-    );
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
     assert_eq!(app.snapshot().phase, Phase::Preparing);
 
     // The hotkey arrives while the model is still loading: capture must start now,
@@ -303,6 +292,41 @@ fn hotkey_start_while_the_model_is_preparing_captures_and_delivers_after_readine
         session_directories(&runtime).is_empty(),
         "success must clean its session audio"
     );
+}
+
+#[test]
+fn preparation_finishing_while_local_processing_keeps_processing_and_delivers_the_capture() {
+    let runtime = Runtime::new();
+    let (sender, receiver) = mpsc::channel();
+    // Long enough that preparation can finish while the stopped capture is still
+    // being recognized locally.
+    let model = Arc::new(PreparingModel::with_recognition_delay(receiver, 200));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    model.mark_ready();
+    app.dispatch(Control::Stop);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+
+    sender
+        .send(Ok("Resident local model is ready.".into()))
+        .unwrap();
+    let ready = wait(&mut app, "readiness while processing", |state| {
+        state.preparation == Preparation::Ready
+    });
+    assert_eq!(
+        ready.phase,
+        Phase::Processing,
+        "readiness must not replace the local-processing phase: {ready:?}"
+    );
+
+    let result = wait(&mut app, "result", |state| state.phase == Phase::Result);
+    assert_eq!(result.preparation, Preparation::Ready, "{result:?}");
+    assert_eq!(
+        result.text,
+        format!("complete capture of {CAPTURE_SAMPLES} samples")
+    );
+    assert!(result.retained_audio.is_empty());
 }
 
 /// The real capture path writes bounded windows and recognizes them before stop.
@@ -576,12 +600,7 @@ fn retry_and_cleanup_refuse_accurately_while_preparing_or_capturing_without_touc
     let runtime = Runtime::new();
     let (sender, receiver) = mpsc::channel();
     let model = Arc::new(PreparingModel::new(receiver));
-    let mut app = Application::new(
-        Arc::new(Playback::new()),
-        model.clone(),
-        runtime.0.clone(),
-        Ok(()),
-    );
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
 
     // Before capture: both controls refuse while the model is preparing.
     app.dispatch(Control::Retry);
@@ -688,7 +707,7 @@ fn snapshot_reports_pending_ready_and_failed_preparation_without_claiming_ready_
     let runtime = Runtime::new();
     let (sender, receiver) = mpsc::channel();
     let mut app = Application::new(
-        Arc::new(Playback::new()),
+        Arc::new(Playback),
         Arc::new(PreparingModel::new(receiver)),
         runtime.0.clone(),
         Ok(()),
@@ -716,7 +735,7 @@ fn snapshot_reports_pending_ready_and_failed_preparation_without_claiming_ready_
     let failed_runtime = Runtime::new();
     let (sender, receiver) = mpsc::channel();
     let mut failed = Application::new(
-        Arc::new(Playback::new()),
+        Arc::new(Playback),
         Arc::new(PreparingModel::new(receiver)),
         failed_runtime.0.clone(),
         Ok(()),
