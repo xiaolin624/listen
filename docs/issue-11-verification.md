@@ -438,4 +438,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 - 打包产物的真实运行中，相关进程共加载 57 个模块，没有网络模块。
 - 同一套采集与识别源码在 `9faa9c3` 上做过一次**系统级强制禁网**的完整 8 样本验收并全部通过。
 
-为把本节写进包内 README 与仓库记录，之后用 `-SkipBuild` 重建了一次交付目录；重建前后的四个二进制 SHA-256 相同（`listen.exe` 96FF88F2…D8B7、`whisper-cli.exe` DC164875…14E8、`vad-speech-segments.exe` 92DDB93A…56CF、`whisper.dll` 4155EDB6…61FF），因此上面的实测适用于重建后的包。
+为把本节写进包内 README 与仓库记录，之后用 `-SkipBuild` 重建了一次交付目录；重建前后的四个二进制 SHA-256 相同（`listen.exe` 96FF88F2…D8B7、`whisper-cli.exe` DC164875…14E8、`vad-speech-segments.exe` 92DDB93A…56CF、`whisper.dll` 4155EDB6…61FF），因此上面的实测适用于重建后的包。重建后的校验：`.artifacts\issue-11\package\verify-20261112-110720.json`——17/17 哈希一致、`Preparing → Ready`（`start_to_state_ms=1434`）、`control_quit_ok=true`，`git_dirty_at_package_time=false`。
