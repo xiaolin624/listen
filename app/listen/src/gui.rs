@@ -1,4 +1,4 @@
-use crate::{Config, WasapiPlayback, Whisper};
+use crate::{Config, WasapiPlayback};
 use listen::{Application, Control, Delivery, Phase, Snapshot, target::NativeTargets};
 use std::{cell::RefCell, fs, sync::Arc};
 use windows::{
@@ -230,14 +230,7 @@ pub fn run(config: Config) -> Result<(), String> {
         let registration = RegisterHotKey(Some(hwnd), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'R' as u32).map_err(|e| format!("Ctrl+Alt+R: {e}. Release this shortcut in the other application, then restart Listen."));
         let app = Application::new(
             Arc::new(WasapiPlayback),
-            Arc::new(Whisper::with_backend(
-                config.engine,
-                config.model,
-                config.vad_model,
-                config.language,
-                config.threads,
-                config.backend,
-            )),
+            config.transcriber(),
             config.runtime.clone(),
             registration,
         )
