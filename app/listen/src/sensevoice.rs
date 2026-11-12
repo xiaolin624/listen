@@ -889,7 +889,7 @@ impl LocalTranscriber for SenseVoice {
         ] {
             if !path.is_file() {
                 return Err(format!(
-                    "The local SenseVoice {label} is missing: {}. Capture is unavailable until the engine files are restored; no cloud service is used.",
+                    "The local {label} is missing: {}. Capture is unavailable until the engine files are restored; no cloud service is used.",
                     path.display()
                 ));
             }
