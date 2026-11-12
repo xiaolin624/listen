@@ -9,7 +9,7 @@
 - 校正只替换命中的 span，文本其余字节、空格、换行、标点都保持原样；只作用在**最终合并文本**上，不进入 `streaming.rs` 的合并逻辑，因此时间戳与分段不受影响。
 - 应用边界三条路径（整段识别、流式分段识别、失败音频重试）都经过同一校正步骤；术语表文件缺失时不做校正，文件格式错误时状态说明会报告错误，本次采集仍交付未校正文本。
 - 300 条术语、300 处替换、300 行转写的单次 `correct` 调用在本机 debug 测试配置下约 **28–30 ms**（单元测试上限 100 ms；release 会更快）。
-- 全部测试：**82 passed, 3 ignored**（基线 64 passed, 3 ignored；新增 12 个 `glossary.rs` 单元测试、6 个应用边界测试）。
+- 全部测试：本 ticket 新增 12 个 `glossary.rs` 单元测试、6 个应用边界测试；未合并前 **82 passed, 3 ignored**，合入当前 `integration/v0.2`（含 #16、#17、#22 工具）后 **96 passed, 11 ignored**（多出的 ignored 是 #17 的真引擎测试，默认不跑）。
 
 ## 交付内容
 
@@ -140,14 +140,14 @@ GPU
 & E:\luyin\.artifacts\run-cargo.ps1 -Task CheckFormat -Manifest E:\luyin\.worktrees\issue-18\app\listen\Cargo.toml
 ```
 
-- 结果：**82 passed, 3 ignored, 0 failed**；基线 64/3/0，新增测试没有修改既有断言。
+- 结果：未合并前 **82 passed, 3 ignored, 0 failed**（基线 64/3/0）；合入当前 `integration/v0.2` 后 **96 passed, 11 ignored, 0 failed**。新增测试没有修改既有断言。
 - 新增 `glossary.rs` 单元测试 12 个：格式/注释/空行、缺失文件、一条条目多种实测误识别、普通句负例、别名/拼音/中文写法、短别名负例、默认打包术语表正例/负例、换行与标点保持、中文长句负例、malformed 行号与路径、性能。
 - 新增应用边界测试 6 个：交付 + 当前结果、两次采集之间改文件、重试、流式合并文本、malformed 不丢采集、缺失文件。
 - **性能测试**：300 条术语（每个词一条）、300 行转写、共 300 处替换，单次 `correct` 断言 < 100 ms；本机 debug 测试配置实测：
   ```text
    300-term correction took 28.5608ms
   ```
-  多次运行落在 28–33 ms。实现按“首/末字符桶 + 长度差 + token 数”先剪枝，候选只做短字符串 Levenshtein，且复用 DP 行缓冲；不对条目两两比较。
+  多次运行（含合并 #17 后的完整套件）落在 26–36 ms。实现按“首/末字符桶 + 长度差 + token 数”先剪枝，候选只做短字符串 Levenshtein，且复用 DP 行缓冲；不对条目两两比较。
 
 ## 正例（输入来自本机 sherpa-onnx SenseVoice q8 实测）
 
@@ -196,4 +196,6 @@ GPU
 
 ## 合并记录
 
-- 合入 `integration/v0.2` 的验证在本分支完成后执行，见最终提交与测试输出；完整测试套件在合并后保持全绿。
+- `81cabf0`：合入 `integration/v0.2` 的 #16（准备期即可开始采集），冲突在 `lib.rs` 的采集 `detail` 组装处；保留双方内容（`preparation_note` + glossary note）。
+- `ed93864`：合入 `integration/v0.2` 的 #17（SenseVoice 常驻引擎，`main.rs` 的 `Config` 增加引擎字段并把默认引擎改为 SenseVoice）与 #22 工具，冲突在 `main.rs` 的 `Config` 字段、HELP 和相对路径解析列表；保留 SenseVoice 配置并加入 `glossary` 字段/说明/路径。
+- 合并后使用独立 target 目录重跑完整套件：`96 passed, 11 ignored, 0 failed`；`glossary_correction` 6 个应用边界测试和 `glossary` 12 个单元测试全绿，性能断言仍为 26.4 ms（本次合并后运行）。
