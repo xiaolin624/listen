@@ -72,7 +72,7 @@ enum LaunchAction {
 const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.
 Only that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.
 
-Recognition: SenseVoice q8 through sherpa-onnx, resident in this process on the CPU (AVX2 required). It is prepared on a background thread; capture stays unavailable until Listen reports Ready. Silence, music and notification windows are gated by Silero VAD and are never decoded into fabricated text. No cloud service is used and whisper is not a silent fallback.
+Recognition: SenseVoice q8 through sherpa-onnx, resident in this process on the CPU (AVX2 required). It is prepared on a background thread; capture can start immediately and is buffered until the model reports ready. Silence, music and notification windows are gated by Silero VAD and are never decoded into fabricated text. No cloud service is used and whisper is not a silent fallback.
 
 Options:
   --engine <sensevoice|whisper|whisper-cli.exe>
