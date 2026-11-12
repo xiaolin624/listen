@@ -1,0 +1,40 @@
+# Listen 术语表 (glossary)
+#
+# One term per line, UTF-8. Lines starting with '#' are comments; blank lines
+# are ignored. The canonical spelling comes first, followed by optional aliases
+# after a '|' separator:
+#
+#   Canonical Form | alias, alias, alias
+#
+# Matching is approximate and case-insensitive; spaces, '-' and punctuation
+# between Latin words are ignored. Aliases may be a pinyin spelling
+# ("shen du qiu suo") or a Chinese-character guess ("迪普西克"). They are
+# compared exactly as written: there is no bundled hanzi -> pinyin table.
+# The file is re-read when a capture starts, so edits apply to the next capture.
+#
+# Keep one entry per term. The canonical form alone already catches common
+# mis-recognitions ("deep sea harnessness", "deep seek harness", "DeepSek
+# harnessness", "deepsek"); aliases are only for stubborn or non-Latin variants.
+
+# DeepSeek's harness product. "DeepSeek" itself is caught by the leading word,
+# and the pinyin/Chinese spellings are what a user may add for their own audio.
+DeepSeek Harness | shen du qiu suo, 迪普西克
+
+# Windows audio APIs. "waapp loop back" is the measured engine output.
+WASAPI | waapp, wa-sa-pi
+WASAPI loopback | waapp loop back
+
+# CUDA is often heard as "ku" or "ku da" in Chinese speech.
+CUDA | ku da, ku
+
+GPU
+Whisper
+sherpa-onnx
+SenseVoice
+
+# "re" is the measured mis-recognition in Chinese technical sentences such as
+# "我们用re实现音频采集". The corrector only applies a short alias like this
+# next to Chinese text, never inside English words ("are", "there", "re-do").
+Rust | re
+
+Vosk

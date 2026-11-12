@@ -35,6 +35,7 @@ $required = @(
     'listen.exe',
     'libunwind.dll',
     'README.md',
+    'glossary.txt',
     'VERSION.txt',
     'engine\whisper-cli.exe',
     'engine\whisper.dll',

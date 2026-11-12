@@ -145,6 +145,7 @@ else {
 }
 
 Copy-Item -LiteralPath (Join-Path $packagingRoot 'README.md') -Destination (Join-Path $OutputDirectory 'README.md')
+Copy-Item -LiteralPath (Join-Path $packagingRoot 'glossary.txt') -Destination (Join-Path $OutputDirectory 'glossary.txt')
 $launchers = @(Get-ChildItem -LiteralPath $packagingRoot -Filter '*.cmd' -File)
 if ($launchers.Count -ne 1) { throw ('packaging must contain exactly one launcher .cmd; found ' + $launchers.Count) }
 Copy-Item -LiteralPath $launchers[0].FullName -Destination (Join-Path $OutputDirectory $launchers[0].Name)

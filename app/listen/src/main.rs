@@ -29,6 +29,7 @@ pub struct Config {
     threads: usize,
     hidden: bool,
     backend: Backend,
+    glossary: PathBuf,
     engine_kind: Engine,
     sherpa_lib: PathBuf,
     sensevoice_model: PathBuf,
@@ -91,6 +92,10 @@ Options:
         whisper.cpp fallback settings; --backend host (default) keeps the model resident, cli starts one process per window.
   --runtime <directory> --threads <count> --hidden
         runtime files, recognition threads and start-hidden behavior.
+  --glossary <glossary.txt>
+        local UTF-8 term list, one term per line, re-read at every capture start
+        (default: <runtime>\\glossary.txt). A malformed file is reported and the
+        uncorrected transcript is still delivered.
 
 Control running application: --control <start|stop|toggle|retry|cleanup|show|quit>
 Retry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.
@@ -112,6 +117,7 @@ fn parse() -> Result<LaunchAction, String> {
         threads: 6,
         hidden: false,
         backend: Backend::ModelHost,
+        glossary: PathBuf::new(),
         engine_kind: Engine::SenseVoice,
         sherpa_lib: root
             .join(".tools/sherpa-onnx/sherpa-onnx-v2.0.1-win-x64-shared-MT-Release/lib"),
@@ -120,6 +126,7 @@ fn parse() -> Result<LaunchAction, String> {
         sensevoice_vad: root.join(".tools/models/sense-voice/silero_vad.onnx"),
         sensevoice_language: "auto".into(),
     };
+    let mut glossary = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--hidden" {
@@ -157,6 +164,7 @@ fn parse() -> Result<LaunchAction, String> {
             "--model" => config.model = PathBuf::from(value),
             "--vad-model" => config.vad_model = PathBuf::from(value),
             "--runtime" => config.runtime = PathBuf::from(value),
+            "--glossary" => glossary = Some(PathBuf::from(value)),
             "--language" => config.language = value,
             "--backend" => {
                 config.backend = match value.as_str() {
@@ -176,6 +184,9 @@ fn parse() -> Result<LaunchAction, String> {
             _ => return Err(format!("Unknown option: {arg}")),
         }
     }
+    // A custom runtime also moves the default term list; an explicit --glossary
+    // always wins.
+    config.glossary = glossary.unwrap_or_else(|| config.runtime.join("glossary.txt"));
     // Resolve once so changing the foreground application cannot change file interpretation.
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     for path in [
@@ -183,6 +194,7 @@ fn parse() -> Result<LaunchAction, String> {
         &mut config.model,
         &mut config.vad_model,
         &mut config.runtime,
+        &mut config.glossary,
         &mut config.sherpa_lib,
         &mut config.sensevoice_model,
         &mut config.sensevoice_tokens,
@@ -201,7 +213,12 @@ fn main() {
     // code. Interactive launch errors keep the existing visible message.
     let control_mode = env::args().any(|argument| argument == "--control");
     let result = match parse() {
-        Ok(LaunchAction::Run(config)) => gui::run(config),
+        Ok(LaunchAction::Run(config)) => {
+            // The window owns Application construction, so hand it the resolved term
+            // list before it starts. The file itself is re-read at every capture.
+            listen::glossary::set_default_path(config.glossary.clone());
+            gui::run(config)
+        }
         Ok(LaunchAction::Control(control)) => gui::control(&control),
         Ok(LaunchAction::Help) => {
             gui::show_help(HELP);
