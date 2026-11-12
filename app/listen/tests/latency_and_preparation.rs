@@ -5,7 +5,7 @@
 
 use listen::{
     AppResult, Application, CapturedAudio, Control, LocalTranscriber, Phase, PlaybackAudio,
-    Recording,
+    Preparation, Recording,
 };
 use std::{
     fs,
@@ -108,8 +108,24 @@ impl LocalTranscriber for PreparingModel {
     }
 }
 
+fn wait_for_preparation(app: &mut Application) -> listen::Snapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.poll();
+        let state = app.snapshot();
+        if state.preparation == Preparation::Ready {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "preparation did not finish: {state:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
-fn preparation_is_visible_and_start_is_refused_until_the_model_is_ready() {
+fn preparation_is_visible_and_capture_starts_before_the_model_is_ready() {
     let runtime = Runtime::new();
     let starts = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::channel();
@@ -127,6 +143,7 @@ fn preparation_is_visible_and_start_is_refused_until_the_model_is_ready() {
     );
     let preparing = app.snapshot();
     assert_eq!(preparing.phase, Phase::Preparing, "{preparing:?}");
+    assert_eq!(preparing.preparation, Preparation::Pending, "{preparing:?}");
     assert!(
         preparing
             .detail
@@ -134,34 +151,48 @@ fn preparation_is_visible_and_start_is_refused_until_the_model_is_ready() {
         "{preparing:?}"
     );
     app.dispatch(Control::Start);
-    assert_eq!(app.snapshot().phase, Phase::Preparing);
+    let capturing = app.snapshot();
+    assert_eq!(
+        capturing.phase,
+        Phase::Capturing,
+        "a capture started during preparation must not be refused: {capturing:?}"
+    );
+    assert_eq!(
+        capturing.preparation,
+        Preparation::Pending,
+        "a capture started during preparation must not be reported as ready: {capturing:?}"
+    );
     assert!(
-        app.snapshot().detail.contains("still being prepared"),
-        "{:?}",
-        app.snapshot()
+        capturing.detail.contains("still preparing"),
+        "the capture must say the model is still loading: {capturing:?}"
     );
     assert_eq!(
         starts.load(Ordering::SeqCst),
-        0,
-        "a preparing model must not start a capture"
+        1,
+        "a preparing model must still start the recording device"
     );
 
     sender
         .send(Ok("Resident local model is ready.".into()))
         .unwrap();
-    let ready = wait(&mut app, Phase::Ready);
-    assert!(
-        ready.detail.contains("Resident local model is ready."),
-        "{ready:?}"
+    let ready = wait_for_preparation(&mut app);
+    assert_eq!(
+        ready.phase,
+        Phase::Capturing,
+        "preparation finishing during capture must not replace the capture phase: {ready:?}"
     );
     assert!(
         ready.timing.preparation_ms.is_some(),
         "preparation duration must be recorded: {ready:?}"
     );
 
+    app.dispatch(Control::Stop);
+    let result = wait(&mut app, Phase::Result);
+    assert_eq!(result.text, "prepared model result");
+
     app.dispatch(Control::Start);
     assert_eq!(app.snapshot().phase, Phase::Capturing);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
 }
 
 #[test]
