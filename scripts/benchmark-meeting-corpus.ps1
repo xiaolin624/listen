@@ -470,7 +470,11 @@ foreach ($entry in $scored) {
     else { $failed++ }
 }
 $accuracy = $null
-if ($totalReferenceChars -gt 0) { $accuracy = 1.0 - ($totalDistance / [double]$totalReferenceChars) }
+if ($totalReferenceChars -gt 0) {
+    # Clamp only the reported accuracy; per-sentence CER itself stays unclamped so
+    # an insertion-heavy result is still visible as CER above 100%.
+    $accuracy = [Math]::Max(0.0, 1.0 - ($totalDistance / [double]$totalReferenceChars))
+}
 $meanSentenceAccuracy = Get-Mean @($scored | ForEach-Object { $_.accuracy })
 $meanLatency = Get-Mean $latencies
 $medianLatency = Get-Median $latencies
@@ -527,7 +531,7 @@ $summary = [ordered]@{
     proper_noun_recall           = $overallRecall
     proper_noun_expected_count   = $expectedTotal
     proper_noun_hit_count        = $hitTotal
-    accuracy_definition          = '1 - (sum Levenshtein distance / sum reference characters) over every corpus sentence; punctuation, symbols and whitespace are removed first. Recognition failures and no-speech count as all characters wrong.'
+    accuracy_definition          = '1 - (sum Levenshtein distance / sum reference characters) over every corpus sentence; punctuation, symbols and whitespace are removed first. Recognition failures and no-speech count as all characters wrong. The aggregate accuracy is clamped at 0; per-sentence CER is not clamped.'
 }
 $result = [ordered]@{
     corpus_manifest       = $manifestPath
@@ -676,7 +680,7 @@ if (-not $comparisonReady) {
     $lines.Add('')
     $lines.Add('## Notes')
     $lines.Add('')
-    $lines.Add('- `Chinese accuracy` is 1 - (sum edit distance / sum reference characters) after removing punctuation, symbols and spaces. Recognition failures and no-speech count as all characters wrong.')
+    $lines.Add('- `Chinese accuracy` is 1 - (sum edit distance / sum reference characters) after removing punctuation, symbols and spaces. Recognition failures and no-speech count as all characters wrong; the aggregate is clamped at 0 while per-sentence CER is not.')
     $lines.Add('- `stop->result` is `timing_stop_to_result_ms` reported by Listen; the wall-clock column also includes control-process latency.')
     $lines.Add('- The engine label is operator supplied in attached mode; the app''s own `backend=` note is stored with every sample in the JSON results.')
     $lines.Add('- The corpus was recorded through the Tencent-Meeting link; playback during this benchmark uses the default multimedia render endpoint, not the meeting application.')
