@@ -11,6 +11,8 @@ pub mod audio;
 pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
+#[cfg(windows)]
+pub mod sensevoice;
 pub mod streaming;
 #[cfg(windows)]
 pub mod target;
