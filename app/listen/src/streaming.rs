@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -53,6 +53,7 @@ pub struct Progress {
     recognized: AtomicU64,
     spool: AtomicU64,
     peak_pending: AtomicUsize,
+    cancelled: AtomicBool,
     error: Mutex<Option<String>>,
 }
 impl Progress {
@@ -65,6 +66,12 @@ impl Progress {
             spool_bytes: self.spool.load(Ordering::Relaxed),
             peak_pending_segments: self.peak_pending.load(Ordering::Relaxed),
         }
+    }
+    /// Ask the recognition worker to stop consuming buffered windows. The windows
+    /// it has not decoded yet stay on disk, so an aborted capture can still be
+    /// retained and retried instead of being silently deleted.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
     }
     pub fn failure(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
@@ -450,6 +457,15 @@ fn recognize(
         windows: 0,
     };
     while let Ok(segment) = stream.receiver.recv() {
+        if stream.progress.cancelled.load(Ordering::Acquire) {
+            // The capture was aborted (for example because the model could not be
+            // prepared). Keep this window's complete WAV on disk for the user's
+            // retry/cleanup controls instead of decoding and deleting it.
+            return Err(
+                "Local recognition was cancelled before this window was decoded; its audio was retained"
+                    .into(),
+            );
+        }
         let wait_ms = segment.queued_at.elapsed().as_millis() as u64;
         let workspace = segment.audio.path.parent().unwrap();
         let started = Instant::now();

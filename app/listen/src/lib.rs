@@ -116,8 +116,9 @@ pub trait Target: Send {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// First-use local model preparation is in progress. Capture is intentionally
-    /// unavailable so a preparation delay is never shown as a ready state.
+    /// First-use local model preparation is in progress and no capture has been
+    /// started. Capture may still start; a capture started during preparation is
+    /// `Capturing` while `Snapshot::preparation` stays `Preparation::Pending`.
     Preparing,
     Ready,
     Capturing,
@@ -125,6 +126,20 @@ pub enum Phase {
     Result,
     NoSpeech,
     Failure,
+}
+
+/// First-use local model preparation, reported separately from `Phase` so that a
+/// consumer can always distinguish "the model is still loading" from "ready",
+/// including while capturing. A pending or failed preparation is never reported
+/// as ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preparation {
+    /// First-use preparation is still running in the background.
+    Pending,
+    /// The local model reported readiness; recognition is available.
+    Ready,
+    /// Preparation failed (or was never possible), so recognition is not available.
+    Failed,
 }
 
 /// Measured stop-to-result breakdown. Every duration is wall-clock milliseconds;
@@ -162,6 +177,9 @@ pub enum Delivery {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub phase: Phase,
+    /// Whether first-use model preparation is pending, finished or failed. This
+    /// remains observable in every phase, including `Capturing`.
+    pub preparation: Preparation,
     pub detail: String,
     pub text: String,
     pub retained_audio: Vec<PathBuf>,
@@ -186,6 +204,17 @@ fn capture_scope(endpoint: Option<&CaptureEndpoint>) -> String {
 }
 
 const READY_DETAIL: &str = "Ready. Ctrl+Alt+R captures only the default multimedia playback endpoint; audio routed only to the default communication endpoint or another device is outside this capture. Closing the window keeps Listen in the tray.";
+
+/// Capture details always say whether the local model is still loading, so a
+/// capture that started during preparation never reads like a ready capture.
+fn preparation_note(preparation: Preparation) -> &'static str {
+    match preparation {
+        Preparation::Pending => {
+            " The local recognition model is still preparing; audio is being buffered and recognition starts when it is ready."
+        }
+        Preparation::Ready | Preparation::Failed => "",
+    }
+}
 
 fn ready_detail(note: Option<&str>) -> String {
     match note {
@@ -373,18 +402,23 @@ impl Application {
         let backend = transcriber.backend_note();
         let mut preparation = None;
         let mut preparation_started = None;
-        let (phase, detail) = match &initial_error {
-            Some(error) => (Phase::Failure, error.clone()),
+        let (phase, preparation_state, detail) = match &initial_error {
+            Some(error) => (Phase::Failure, Preparation::Failed, error.clone()),
             None => match transcriber.prepare() {
                 Some(receiver) => {
                     preparation = Some(receiver);
                     preparation_started = Some(Instant::now());
                     (
                         Phase::Preparing,
-                        "Preparing the local recognition model; capture is unavailable until Listen reports Ready. No audio is being captured.".into(),
+                        Preparation::Pending,
+                        "Preparing the local recognition model in the background; capture can start now and its audio is buffered until the model reports Ready.".into(),
                     )
                 }
-                None => (Phase::Ready, ready_detail(backend.as_deref())),
+                None => (
+                    Phase::Ready,
+                    Preparation::Ready,
+                    ready_detail(backend.as_deref()),
+                ),
             },
         };
         let backend = transcriber.backend_note();
@@ -392,6 +426,7 @@ impl Application {
         Self {
             snapshot: Snapshot {
                 phase,
+                preparation: preparation_state,
                 detail,
                 text: fs::read_to_string(runtime.join("current-result.txt")).unwrap_or_default(),
                 retained_audio: Vec::new(),
@@ -460,6 +495,18 @@ impl Application {
         self
     }
 
+    /// What the application is doing right now, phrased for refusal messages that
+    /// must not claim "nothing is being captured" while a capture is running.
+    fn activity(&self) -> &'static str {
+        if self.recording.is_some() {
+            "Playback is being captured and buffered"
+        } else if self.completion.is_some() {
+            "The previous capture is still being processed locally"
+        } else {
+            "Nothing is being captured"
+        }
+    }
+
     pub fn dispatch(&mut self, control: Control) {
         let control = match control {
             Control::Toggle if self.snapshot.phase == Phase::Capturing => Control::Stop,
@@ -470,10 +517,6 @@ impl Application {
             Control::Start if self.recording.is_none() && self.completion.is_none() => {
                 if self.retry.is_some() {
                     self.snapshot.detail = "A failed capture's audio is retained for local retry. Retry local recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
-                    return;
-                }
-                if self.preparation.is_some() {
-                    self.snapshot.detail = "The local recognition model is still being prepared; wait until Listen reports Ready before capturing. No audio is captured.".into();
                     return;
                 }
                 // Capture the actual selection before readiness checks or any UI feedback.
@@ -522,8 +565,11 @@ impl Application {
                         self.snapshot.delivery = None;
                         self.snapshot.retained_audio.clear();
                         self.snapshot.retry_available = false;
-                        self.snapshot.detail =
-                            self.with_glossary_note(capture_scope(self.snapshot.endpoint.as_ref()));
+                        self.snapshot.detail = self.with_glossary_note(format!(
+                            "{}{}",
+                            capture_scope(self.snapshot.endpoint.as_ref()),
+                            preparation_note(self.snapshot.preparation)
+                        ));
                         self.snapshot.timing = Timing {
                             preparation_ms: self.snapshot.timing.preparation_ms,
                             ..Timing::default()
@@ -711,10 +757,17 @@ impl Application {
             }
             Control::Retry => {
                 if self.preparation.is_some() {
-                    self.snapshot.detail = "The local recognition model is still being prepared; wait until Listen reports Ready before retrying. Nothing is being captured and the current result is unchanged.".into();
+                    let activity = self.activity();
+                    self.snapshot.detail = format!(
+                        "The local recognition model is still being prepared; wait until Listen reports Ready before retrying. {activity} and the current result is unchanged."
+                    );
                     return;
                 }
-                if self.recording.is_some() || self.completion.is_some() {
+                if self.recording.is_some() {
+                    self.snapshot.detail = "Still capturing the current playback locally; stop it and wait for the result before retrying.".into();
+                    return;
+                }
+                if self.completion.is_some() {
                     self.snapshot.detail = "Still processing the current playback locally; wait for the result before retrying.".into();
                     return;
                 }
@@ -722,17 +775,27 @@ impl Application {
             }
             Control::CleanupAudio => {
                 if self.preparation.is_some() {
-                    self.snapshot.detail = "The local recognition model is still being prepared; wait until Listen reports Ready. Nothing is being captured and the current result is unchanged.".into();
+                    let activity = self.activity();
+                    self.snapshot.detail = format!(
+                        "The local recognition model is still being prepared; wait until Listen reports Ready before cleaning failed audio. {activity} and the current result is unchanged."
+                    );
                     return;
                 }
-                if self.recording.is_some() || self.completion.is_some() {
+                if self.recording.is_some() {
+                    self.snapshot.detail = "Still capturing the current playback locally; stop it and wait for the result before cleaning failed audio.".into();
+                    return;
+                }
+                if self.completion.is_some() {
                     self.snapshot.detail = "Still processing the current playback locally; wait for the result before cleaning failed audio.".into();
                     return;
                 }
                 self.cleanup_failed_audio();
             }
             _ if self.preparation.is_some() => {
-                self.snapshot.detail = "The local recognition model is still being prepared; nothing is being captured and the current result is unchanged.".into();
+                let activity = self.activity();
+                self.snapshot.detail = format!(
+                    "The local recognition model is still being prepared; {activity}. The current result is unchanged."
+                );
             }
             _ if self.completion.is_some() => {
                 self.snapshot.detail = "Still processing the current playback locally; wait for the result before starting again.".into();
@@ -886,6 +949,99 @@ impl Application {
         }
     }
 
+    /// Report a failed first-use preparation. A capture that was already running is
+    /// stopped and its received audio is retained: a preparation failure is a real
+    /// failure, never a ready state and never a silently discarded capture.
+    fn fail_preparation(&mut self, error: String) {
+        self.preparation = None;
+        self.preparation_started = None;
+        self.snapshot.preparation = Preparation::Failed;
+        if self.recording.is_some() {
+            self.abort_capture_for_failed_preparation(error);
+            return;
+        }
+        if self.snapshot.phase == Phase::Preparing {
+            self.snapshot.phase = Phase::Failure;
+            self.snapshot.detail = error;
+        }
+    }
+
+    /// Stop a capture because the model it is waiting for cannot become ready. The
+    /// windows the worker has not decoded yet stay on disk, the recording is
+    /// finalized, and the existing retained-audio/retry/cleanup controls are
+    /// offered exactly as for a failed recognition.
+    fn abort_capture_for_failed_preparation(&mut self, error: String) {
+        let Some(recording) = self.recording.take() else {
+            return;
+        };
+        let directory = self.session.take();
+        let recognition = self.recognition.take();
+        let streaming = recognition.is_some();
+        let progress = self.progress.take();
+        if let Some(progress) = &progress {
+            progress.cancel();
+        }
+        let target = std::mem::replace(&mut self.bound_target, Ok(None));
+
+        // Finalize the recording first so its retained WAV is complete, then stop
+        // the worker; cancellation keeps the windows it has not decoded.
+        let captured = recording.finish();
+        let _ = recognition.map(|worker| worker.finish());
+        let recognized_segments = progress
+            .as_ref()
+            .map(|progress| progress.snapshot().recognized_segments)
+            .unwrap_or(0);
+
+        let (capture_error, kept) = match captured {
+            Ok(audio) => {
+                let kept = if audio.path.is_file() {
+                    Some(CapturedAudio {
+                        path: audio.path.clone(),
+                        description: audio.description.clone(),
+                    })
+                } else if streaming && recognized_segments == 0 {
+                    directory
+                        .as_deref()
+                        .and_then(|directory| streaming::retained_audio_path(directory).ok())
+                        .map(|path| CapturedAudio {
+                            path,
+                            description: audio.description.clone(),
+                        })
+                } else {
+                    None
+                };
+                (None, kept)
+            }
+            Err(capture_error) => (Some(capture_error), None),
+        };
+        let retryable = kept.is_some();
+        self.retry = match (kept, directory.clone()) {
+            (Some(audio), Some(directory)) => Some(RetainedCapture {
+                audio,
+                directory,
+                target,
+            }),
+            _ => None,
+        };
+        self.snapshot.retry_available = retryable;
+        let mut message = format!(
+            "The local recognition model failed to prepare: {error}. The capture in progress was stopped; nothing was transcribed or delivered."
+        );
+        if let Some(capture_error) = capture_error {
+            message.push_str(&format!(
+                " Finalizing the capture also failed: {capture_error}"
+            ));
+        }
+        self.fail(directory.as_deref(), message);
+        if retryable {
+            self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the fallback text box is used if it is no longer valid.");
+        } else if streaming && recognized_segments > 0 {
+            self.snapshot.detail.push_str(&format!(
+                "\nThis capture was partially recognized before the preparation failure ({recognized_segments} window(s) had been checkpointed). Those windows' audio was released after recognition, so automatic local retry is not offered here; the remaining audio paths are listed for manual recovery."
+            ));
+        }
+    }
+
     pub fn poll(&mut self) {
         if self.preparation.is_some() {
             let received = self.preparation.as_ref().unwrap().try_recv();
@@ -895,24 +1051,36 @@ impl Application {
                         self.preparation_started.map(|started| elapsed_ms(started));
                     self.preparation = None;
                     self.preparation_started = None;
-                    self.snapshot.phase = Phase::Ready;
-                    self.snapshot.detail = ready_detail(Some(&note));
+                    self.snapshot.preparation = Preparation::Ready;
+                    // A capture started during preparation keeps its own phase and
+                    // detail; readiness is reported through `Snapshot::preparation`.
+                    if self.snapshot.phase == Phase::Preparing {
+                        self.snapshot.phase = Phase::Ready;
+                        self.snapshot.detail = ready_detail(Some(&note));
+                    } else if self.snapshot.phase == Phase::Capturing {
+                        // Drop the "still preparing" note without waiting for the
+                        // next progress update (non-streamed captures do not have one).
+                        self.snapshot.detail = self.with_glossary_note(format!(
+                            "{}{}",
+                            capture_scope(self.snapshot.endpoint.as_ref()),
+                            preparation_note(self.snapshot.preparation)
+                        ));
+                    }
                 }
                 Ok(Err(error)) => {
-                    self.preparation = None;
-                    self.preparation_started = None;
-                    self.snapshot.phase = Phase::Failure;
-                    self.snapshot.detail = error;
+                    self.fail_preparation(error);
                     return;
                 }
-                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Preparation is still pending. A capture may already be
+                    // running (and buffering), so keep polling progress, device
+                    // failures and completions below instead of returning early.
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.preparation = None;
-                    self.preparation_started = None;
-                    self.snapshot.phase = Phase::Failure;
-                    self.snapshot.detail =
-                        "Local model preparation stopped unexpectedly; no audio was captured."
-                            .into();
+                    self.fail_preparation(
+                        "Local model preparation stopped unexpectedly, so the local model is not ready."
+                            .into(),
+                    );
                     return;
                 }
             }
@@ -946,6 +1114,8 @@ impl Application {
                     ""
                 }
             );
+            let mut detail = detail;
+            detail.push_str(preparation_note(self.snapshot.preparation));
             self.snapshot.detail = self.with_glossary_note(detail);
         }
         if let Some(error) = self
