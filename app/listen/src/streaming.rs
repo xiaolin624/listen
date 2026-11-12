@@ -1,6 +1,6 @@
 //! Bounded PCM windows shared by WASAPI capture and controlled playback devices.
 //! Recognition receives paths, never an accumulating in-memory recording.
-use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText};
+use crate::{AppResult, CapturedAudio, LocalTranscriber, ReadinessSignal, TimedText};
 use std::{
     collections::VecDeque,
     fs::{self, File},
@@ -403,6 +403,7 @@ impl RecognitionWorker {
         stream: SegmentStream,
         transcriber: Arc<dyn LocalTranscriber>,
         directory: PathBuf,
+        readiness: Arc<ReadinessSignal>,
     ) -> Self {
         let progress = stream.progress.clone();
         let state = progress.clone();
@@ -410,7 +411,7 @@ impl RecognitionWorker {
             // A crashing local backend is a recoverable failure, not a silent stall.
             // Report it at once so capture stops and its audio is retained.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                recognize(stream, transcriber, directory)
+                recognize(stream, transcriber, directory, readiness)
             }));
             let result = match outcome {
                 Ok(result) => result,
@@ -444,6 +445,7 @@ fn recognize(
     stream: SegmentStream,
     transcriber: Arc<dyn LocalTranscriber>,
     directory: PathBuf,
+    readiness: Arc<ReadinessSignal>,
 ) -> AppResult<RecognitionOutcome> {
     let mut committed = String::new();
     let mut tail = String::new();
@@ -466,6 +468,11 @@ fn recognize(
                     .into(),
             );
         }
+        // First-use preparation may still be running when the first window closes.
+        // Wait for its outcome before decoding; a failed or wedged preparation is
+        // reported as a retained-audio failure instead of decoding against an
+        // unprepared engine. Once ready this is a single uncontended lock.
+        readiness.wait()?;
         let wait_ms = segment.queued_at.elapsed().as_millis() as u64;
         let workspace = segment.audio.path.parent().unwrap();
         let started = Instant::now();

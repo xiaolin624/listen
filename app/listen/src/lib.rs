@@ -1,9 +1,9 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -78,8 +78,9 @@ pub trait LocalTranscriber: Send + Sync {
     fn check_ready(&self) -> AppResult<()>;
     /// Start any first-use model preparation (for example loading a resident
     /// model). `None` means the transcriber is ready immediately. The receiver
-    /// yields a user-visible backend note on success; capture must not start
-    /// until it is ready.
+    /// yields a user-visible backend note on success. Capture may start before
+    /// preparation finishes; its recognition waits for this outcome instead of
+    /// decoding audio against an unprepared model.
     fn prepare(&self) -> Option<mpsc::Receiver<AppResult<String>>> {
         None
     }
@@ -292,6 +293,96 @@ fn capture_scope(endpoint: Option<&CaptureEndpoint>) -> String {
 }
 
 const READY_DETAIL: &str = "Ready. Ctrl+Alt+R captures only the default multimedia playback endpoint; audio routed only to the default communication endpoint or another device is outside this capture. Closing the window keeps Listen in the tray.";
+
+/// The honest local-processing detail while the stopped capture waits for the
+/// still-loading model. Nothing has been delivered or failed yet.
+const PROCESSING_WHILE_PREPARING_DETAIL: &str = "The local recognition model is still being prepared. The buffered audio will be recognized when the model is ready; no messages are sent.";
+
+/// The same waiting state after the model reported readiness but recognition is
+/// still running.
+const PROCESSING_READY_DETAIL: &str = "The local recognition model is ready. The buffered audio is being recognized locally; no messages are sent.";
+
+/// How long a recognition thread waits for first-use preparation before it gives
+/// up. It matches the harness-level preparation timeout used by the long-session
+/// example: a wedged preparation must never hang a recognition thread forever, and
+/// its buffered audio follows the normal retained-audio failure path instead.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+enum ReadinessState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// First-use preparation state shared with recognition threads. `poll` resolves it
+/// from the transcriber's preparation receiver. A capture started during
+/// preparation waits here before decoding anything, so buffered audio is recognized
+/// once the model is ready and is never decoded against an unprepared engine.
+pub(crate) struct ReadinessSignal {
+    state: Mutex<ReadinessState>,
+    changed: Condvar,
+}
+
+impl ReadinessSignal {
+    fn new(state: ReadinessState) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        })
+    }
+    fn pending() -> Arc<Self> {
+        Self::new(ReadinessState::Pending)
+    }
+    fn ready() -> Arc<Self> {
+        Self::new(ReadinessState::Ready)
+    }
+    fn failed(error: &str) -> Arc<Self> {
+        Self::new(ReadinessState::Failed(error.to_string()))
+    }
+    fn resolve(&self, state: ReadinessState) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
+        self.changed.notify_all();
+    }
+    fn succeed(&self) {
+        self.resolve(ReadinessState::Ready);
+    }
+    fn fail(&self, error: &str) {
+        self.resolve(ReadinessState::Failed(error.to_string()));
+    }
+    /// Wait until preparation reports ready or failed. The wait is bounded, so a
+    /// preparation that never resolves becomes an explicit, retained-audio failure
+    /// instead of a hung worker.
+    pub(crate) fn wait(&self) -> AppResult<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let deadline = Instant::now()
+            .checked_add(READINESS_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match &*state {
+                ReadinessState::Ready => return Ok(()),
+                ReadinessState::Failed(error) => {
+                    return Err(format!(
+                        "The local recognition model failed to prepare: {error}. The buffered audio was not decoded and is retained."
+                    ));
+                }
+                ReadinessState::Pending => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "The local recognition model was still preparing after {} s, so the buffered audio was not decoded and is retained.",
+                    READINESS_TIMEOUT.as_secs()
+                ));
+            }
+            let remaining = deadline.duration_since(now);
+            let (guard, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = guard;
+        }
+    }
+}
 
 /// Capture details always say whether the local model is still loading, so a
 /// capture that started during preparation never reads like a ready capture.
@@ -629,6 +720,7 @@ pub struct Application {
     bound_target: AppResult<Option<Box<dyn Target>>>,
     preparation: Option<mpsc::Receiver<AppResult<String>>>,
     preparation_started: Option<Instant>,
+    readiness: Arc<ReadinessSignal>,
     backend: Option<String>,
     glossary_path: PathBuf,
     glossary: glossary::Glossary,
@@ -674,6 +766,15 @@ impl Application {
                 ),
             },
         };
+        let readiness = match preparation_state {
+            Preparation::Pending => ReadinessSignal::pending(),
+            Preparation::Ready => ReadinessSignal::ready(),
+            Preparation::Failed => ReadinessSignal::failed(
+                initial_error
+                    .as_deref()
+                    .unwrap_or("the local model is unavailable"),
+            ),
+        };
         let backend = transcriber.backend_note();
         let glossary_path = glossary::default_path(&runtime);
         Self {
@@ -706,6 +807,7 @@ impl Application {
             bound_target: Ok(None),
             preparation,
             preparation_started,
+            readiness,
             backend,
             glossary_path,
             glossary: glossary::Glossary::default(),
@@ -872,6 +974,7 @@ impl Application {
                             stream,
                             self.transcriber.clone(),
                             directory,
+                            self.readiness.clone(),
                         ));
                     }
                     self.snapshot.progress = CaptureProgress::default();
@@ -920,10 +1023,15 @@ impl Application {
                 let target = std::mem::replace(&mut self.bound_target, Ok(None));
                 let current_result = self.runtime.join("current-result.txt");
                 let glossary = self.glossary.clone();
+                let readiness = self.readiness.clone();
                 let (tx, rx) = mpsc::channel();
                 self.completion = Some(rx);
                 self.snapshot.phase = Phase::Processing;
-                self.snapshot.detail = "Processing locally; no messages are sent.".into();
+                self.snapshot.detail = if self.snapshot.preparation == Preparation::Pending {
+                    PROCESSING_WHILE_PREPARING_DETAIL.into()
+                } else {
+                    "Processing locally; no messages are sent.".into()
+                };
                 thread::spawn(move || {
                     let finalize_started = Instant::now();
                     let captured = recording.finish();
@@ -962,7 +1070,12 @@ impl Application {
                         Some(Err(error)) => (Err(error), None),
                         None => {
                             let started = Instant::now();
-                            let result = transcriber.transcribe(&audio, &directory);
+                            // A capture may start before first-use preparation
+                            // finishes; decoding waits for its outcome instead of
+                            // failing against an unprepared model.
+                            let result = readiness
+                                .wait()
+                                .and_then(|()| transcriber.transcribe(&audio, &directory));
                             let elapsed = elapsed_ms(started);
                             timing.recognition_ms = Some(elapsed);
                             (
@@ -1227,6 +1340,7 @@ impl Application {
         let transcriber = self.transcriber.clone();
         let current_result = self.runtime.join("current-result.txt");
         let glossary = self.glossary.clone();
+        let readiness = self.readiness.clone();
         let (tx, rx) = mpsc::channel();
         self.completion = Some(rx);
         self.snapshot.phase = Phase::Processing;
@@ -1236,8 +1350,9 @@ impl Application {
             "Retrying recognition locally on the retained audio; no replay is needed and no messages are sent.".into();
         thread::spawn(move || {
             let started = Instant::now();
-            let recognized = transcriber
-                .check_ready()
+            let recognized = readiness
+                .wait()
+                .and_then(|()| transcriber.check_ready())
                 .and_then(|()| transcriber.transcribe(&audio, &directory))
                 .map(|text| {
                     // The retry must deliver the same corrected text as the original
@@ -1342,6 +1457,8 @@ impl Application {
     /// stopped and its received audio is retained: a preparation failure is a real
     /// failure, never a ready state and never a silently discarded capture.
     fn fail_preparation(&mut self, error: String) {
+        // Wake every recognition thread before aborting: the abort path joins them.
+        self.readiness.fail(&error);
         self.preparation = None;
         self.preparation_started = None;
         self.snapshot.preparation = Preparation::Failed;
@@ -1352,6 +1469,10 @@ impl Application {
         if self.snapshot.phase == Phase::Preparing {
             self.snapshot.phase = Phase::Failure;
             self.snapshot.detail = error;
+        } else if self.snapshot.phase == Phase::Processing && self.completion.is_some() {
+            self.snapshot.detail = format!(
+                "The local recognition model failed to prepare: {error}. The buffered audio is retained; nothing was delivered."
+            );
         }
     }
 
@@ -1455,6 +1576,9 @@ impl Application {
             let received = self.preparation.as_ref().unwrap().try_recv();
             match received {
                 Ok(Ok(note)) => {
+                    // Waking waiting recognition threads comes before any UI
+                    // bookkeeping so a stopped capture can decode immediately.
+                    self.readiness.succeed();
                     self.snapshot.timing.preparation_ms =
                         self.preparation_started.map(|started| elapsed_ms(started));
                     self.preparation = None;
@@ -1473,6 +1597,10 @@ impl Application {
                             capture_scope(self.snapshot.endpoint.as_ref()),
                             preparation_note(self.snapshot.preparation)
                         ));
+                    } else if self.snapshot.phase == Phase::Processing
+                        && self.snapshot.detail == PROCESSING_WHILE_PREPARING_DETAIL
+                    {
+                        self.snapshot.detail = PROCESSING_READY_DETAIL.into();
                     }
                 }
                 Ok(Err(error)) => {
