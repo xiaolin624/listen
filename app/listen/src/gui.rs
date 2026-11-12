@@ -183,7 +183,7 @@ pub fn run(config: Config) -> Result<(), String> {
             config.runtime.clone(),
             registration,
         )
-        .with_targets(Arc::new(NativeTargets))
+        .with_targets(Arc::new(NativeTargets::new()))
         // The only outbound path is opt-in: without DEEPSEEK_API_KEY this client
         // reports itself unavailable and the refine entry stays disabled.
         .with_refine(Arc::new(DeepSeek::from_environment()));
