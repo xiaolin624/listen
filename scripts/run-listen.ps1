@@ -6,7 +6,7 @@ param(
     [string]$VadModel = '',
     [ValidateSet('host', 'cli')][string]$Backend = 'host',
     [switch]$Hidden,
-    [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'quit')][string]$Control = ''
+    [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'panel', 'copy', 'quit')][string]$Control = ''
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -62,4 +62,5 @@ if ($Hidden) { $launchArguments += '--hidden' }
 $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -WindowStyle Hidden -PassThru
 Write-Output "Listen PID: $($process.Id)"
 Write-Output "Current status: $(Join-Path $Runtime 'status.txt')"
-Write-Output 'Ctrl+Alt+R starts/stops capture. Closing the window keeps Listen in the tray.'
+Write-Output "Panel text: $(Join-Path $Runtime 'panel.txt')"
+Write-Output 'Ctrl+Alt+R starts/stops capture. Click the capsule or use --control show to open the result panel; Listen stays in the tray.'

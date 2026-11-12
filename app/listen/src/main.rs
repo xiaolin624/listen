@@ -3,6 +3,8 @@
 mod capsule;
 mod capsule_window;
 mod gui;
+mod panel;
+mod panel_window;
 
 use listen::{
     LocalTranscriber,
@@ -99,9 +101,10 @@ Options:
         (default: <runtime>\\glossary.txt). A malformed file is reported and the
         uncorrected transcript is still delivered.
 
-Control running application: --control <start|stop|toggle|retry|cleanup|show|quit>
+Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|quit>
 Retry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.
-Results are copyable in the application. Messages are never sent automatically.";
+show opens the expanded result panel, panel toggles it and copy copies the complete current result to the clipboard.
+Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail, and results are never sent automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;

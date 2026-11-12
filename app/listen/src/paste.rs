@@ -107,6 +107,13 @@ fn write_text(text: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Copies `text` to the system clipboard for the expanded panel's
+/// 复制完整结果 button. It only writes the clipboard: it never pastes, never sends
+/// input and never touches a target, so the "append only, never send" rule holds.
+pub fn copy_to_clipboard(text: &str) -> AppResult<()> {
+    write_text(text)
+}
+
 fn clear() {
     if let Ok(_open) = Clipboard::open() {
         unsafe {
