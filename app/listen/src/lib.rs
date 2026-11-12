@@ -8,6 +8,7 @@ use std::{
 
 #[cfg(windows)]
 pub mod audio;
+pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
 pub mod streaming;
@@ -352,6 +353,9 @@ pub struct Application {
     preparation: Option<mpsc::Receiver<AppResult<String>>>,
     preparation_started: Option<Instant>,
     backend: Option<String>,
+    glossary_path: PathBuf,
+    glossary: glossary::Glossary,
+    glossary_note: Option<String>,
 }
 
 impl Application {
@@ -384,6 +388,7 @@ impl Application {
             },
         };
         let backend = transcriber.backend_note();
+        let glossary_path = glossary::default_path(&runtime);
         Self {
             snapshot: Snapshot {
                 phase,
@@ -412,6 +417,41 @@ impl Application {
             preparation,
             preparation_started,
             backend,
+            glossary_path,
+            glossary: glossary::Glossary::default(),
+            glossary_note: None,
+        }
+    }
+
+    /// Use a specific 术语表 file for this application. The default is
+    /// `<runtime>/glossary.txt`, or the process default set from `--glossary`.
+    pub fn with_glossary(mut self, path: impl Into<PathBuf>) -> Self {
+        self.glossary_path = path.into();
+        self
+    }
+
+    /// Read the glossary again so an edit applies to this capture without a
+    /// restart. A malformed file is reported and never loses the capture: the
+    /// transcript is still delivered, only without correction.
+    fn reload_glossary(&mut self) {
+        match glossary::Glossary::load(&self.glossary_path) {
+            Ok(loaded) => {
+                self.glossary = loaded;
+                self.glossary_note = None;
+            }
+            Err(error) => {
+                self.glossary = glossary::Glossary::default();
+                self.glossary_note = Some(format!(
+                    "Glossary correction is unavailable: {error}. The uncorrected transcript is still delivered."
+                ));
+            }
+        }
+    }
+
+    fn with_glossary_note(&self, detail: String) -> String {
+        match &self.glossary_note {
+            Some(note) => format!("{detail}\n{note}"),
+            None => detail,
         }
     }
 
@@ -447,6 +487,9 @@ impl Application {
                         return Err(format!("Global hotkey unavailable: {error}"));
                     }
                     self.transcriber.check_ready()?;
+                    // The glossary is edited by hand between captures; re-read it
+                    // at every capture start rather than at process start.
+                    self.reload_glossary();
                     fs::create_dir_all(&self.runtime).map_err(|e| e.to_string())?;
                     let unique = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -479,7 +522,8 @@ impl Application {
                         self.snapshot.delivery = None;
                         self.snapshot.retained_audio.clear();
                         self.snapshot.retry_available = false;
-                        self.snapshot.detail = capture_scope(self.snapshot.endpoint.as_ref());
+                        self.snapshot.detail =
+                            self.with_glossary_note(capture_scope(self.snapshot.endpoint.as_ref()));
                         self.snapshot.timing = Timing {
                             preparation_ms: self.snapshot.timing.preparation_ms,
                             ..Timing::default()
@@ -503,6 +547,7 @@ impl Application {
                 let progress = self.progress.clone();
                 let target = std::mem::replace(&mut self.bound_target, Ok(None));
                 let current_result = self.runtime.join("current-result.txt");
+                let glossary = self.glossary.clone();
                 let (tx, rx) = mpsc::channel();
                 self.completion = Some(rx);
                 self.snapshot.phase = Phase::Processing;
@@ -563,6 +608,10 @@ impl Application {
                         timing.last_window_inference_ms = Some(window.inference_ms);
                         timing.recognition_windows = window.windows;
                     }
+                    // Correct only the final merged text, after recognition and
+                    // segmentation are finished: timestamps and window boundaries are
+                    // never touched by the glossary.
+                    let recognized = recognized.map(|text| glossary.correct(&text));
                     let completion = match recognized {
                         // Only an unfragmented capture can be retried as a whole. A
                         // streamed session that has already consumed windows no longer
@@ -727,6 +776,7 @@ impl Application {
         } = retry;
         let transcriber = self.transcriber.clone();
         let current_result = self.runtime.join("current-result.txt");
+        let glossary = self.glossary.clone();
         let (tx, rx) = mpsc::channel();
         self.completion = Some(rx);
         self.snapshot.phase = Phase::Processing;
@@ -738,7 +788,12 @@ impl Application {
             let started = Instant::now();
             let recognized = transcriber
                 .check_ready()
-                .and_then(|()| transcriber.transcribe(&audio, &directory));
+                .and_then(|()| transcriber.transcribe(&audio, &directory))
+                .map(|text| {
+                    // The retry must deliver the same corrected text as the original
+                    // path; it uses the glossary loaded when this capture started.
+                    glossary.correct(&text)
+                });
             let elapsed = elapsed_ms(started);
             let timing = Timing {
                 recognition_ms: Some(elapsed),
@@ -877,7 +932,7 @@ impl Application {
         }
         if self.snapshot.phase == Phase::Capturing && self.recognition.is_some() {
             let p = &self.snapshot.progress;
-            self.snapshot.detail = format!(
+            let detail = format!(
                 "{} {:.1} s received; {} recognition windows pending, {} completed; {} bytes audio on disk; {} samples audio in memory.{}",
                 capture_scope(self.snapshot.endpoint.as_ref()),
                 p.received_samples as f64 / streaming::SAMPLE_RATE as f64,
@@ -891,6 +946,7 @@ impl Application {
                     ""
                 }
             );
+            self.snapshot.detail = self.with_glossary_note(detail);
         }
         if let Some(error) = self
             .recording
@@ -958,8 +1014,10 @@ impl Application {
                 match cleanup {
                     Ok(()) => {
                         self.snapshot.phase = Phase::Result;
-                        self.snapshot.detail =
-                            format!("{}\nPlayback: {}", completed.detail, completed.description);
+                        self.snapshot.detail = self.with_glossary_note(format!(
+                            "{}\nPlayback: {}",
+                            completed.detail, completed.description
+                        ));
                     }
                     Err(error) => self.fail(
                         Some(&completed.directory),
