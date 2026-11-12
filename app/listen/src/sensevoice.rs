@@ -700,12 +700,17 @@ impl Resident {
                 );
             }
             let start = start as u64;
-            let samples = samples as u64;
-            if start + samples > pcm.len() as u64 {
-                return Err(
-                    "The local Silero VAD returned a speech segment outside the window; audio retained"
-                        .into(),
-                );
+            let total = pcm.len() as u64;
+            if start >= total {
+                // The VAD timeline includes the zero padding of the final frame;
+                // a segment made only of that padding is not speech.
+                continue;
+            }
+            // The final accept call is zero-padded to a full 512-sample frame, so
+            // an open segment can end a few dozen samples past the real audio.
+            let samples = (samples as u64).min(total - start);
+            if samples == 0 {
+                continue;
             }
             segments.push((start, samples));
         }
