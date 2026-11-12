@@ -5,7 +5,10 @@ use crate::{
     panel,
     panel_window::{self, Panel},
 };
-use listen::{Application, Control, Delivery, Phase, Snapshot, paste, target::NativeTargets};
+use listen::{
+    Application, Control, Delivery, Phase, Refine, Snapshot, deepseek::DeepSeek, paste,
+    target::NativeTargets,
+};
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
     Win32::{
@@ -110,6 +113,7 @@ pub fn control(command: &str) -> Result<(), String> {
         "cleanup" => 7,
         "panel" => 8,
         "copy" => 9,
+        "refine" => 10,
         _ => return Err(format!("Unknown control command: {command}")),
     };
     unsafe {
@@ -179,7 +183,10 @@ pub fn run(config: Config) -> Result<(), String> {
             config.runtime.clone(),
             registration,
         )
-        .with_targets(Arc::new(NativeTargets));
+        .with_targets(Arc::new(NativeTargets))
+        // The only outbound path is opt-in: without DEEPSEEK_API_KEY this client
+        // reports itself unavailable and the refine entry stays disabled.
+        .with_refine(Arc::new(DeepSeek::from_environment()));
         capsule.set_state(capsule_state(&app.snapshot()));
 
         let mut state = Ui {
@@ -317,6 +324,8 @@ impl Ui {
                     || last.retry_available != state.retry_available
                     || last.backend != state.backend
                     || last.timing != state.timing
+                    || last.refine != state.refine
+                    || last.refined_text != state.refined_text
             });
             let phase_changed = self
                 .last
@@ -330,8 +339,16 @@ impl Ui {
                 .unwrap_or_default()
                 .replace('\r', "")
                 .replace('\n', " ");
+            // The refine reason is one line so the file stays a simple key=value
+            // contract. Only a state that stopped refine explains itself.
+            let refine_reason = match &state.refine {
+                Refine::Unavailable(reason)
+                | Refine::NotApplied(reason)
+                | Refine::Failed(reason) => reason.replace('\r', "").replace('\n', " "),
+                _ => String::new(),
+            };
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\nrefine={}\nrefine_reason={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -359,6 +376,8 @@ impl Ui {
                 state.retry_available,
                 state.backend.as_deref().unwrap_or(""),
                 preparation_name(state.preparation),
+                state.refine.name(),
+                refine_reason,
                 visual.name(),
                 if panel_visible { 1 } else { 0 },
                 panel_error,
@@ -526,6 +545,7 @@ impl Ui {
             panel_window::COMMAND_COPY => self.copy_result(),
             panel_window::COMMAND_RETRY => self.app.dispatch(Control::Retry),
             panel_window::COMMAND_CLEANUP => self.app.dispatch(Control::CleanupAudio),
+            panel_window::COMMAND_REFINE => self.app.dispatch(Control::Refine),
             panel_window::COMMAND_CLOSE => self.close_panel(),
             _ => {}
         }
@@ -555,6 +575,7 @@ impl Ui {
                 4 | ID_SHOW => self.open_panel(),
                 8 | ID_PANEL => self.toggle_panel(),
                 9 | ID_COPY_RESULT => self.copy_result(),
+                10 => self.app.dispatch(Control::Refine),
                 5 | ID_EXIT => {
                     self.quit_requested = true;
                     if self.app.snapshot().phase == Phase::Capturing {

@@ -6,7 +6,7 @@ param(
     [string]$VadModel = '',
     [ValidateSet('host', 'cli')][string]$Backend = 'host',
     [switch]$Hidden,
-    [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'panel', 'copy', 'quit')][string]$Control = ''
+    [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'panel', 'copy', 'refine', 'quit')][string]$Control = ''
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent

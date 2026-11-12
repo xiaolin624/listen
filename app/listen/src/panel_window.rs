@@ -63,6 +63,8 @@ pub const COMMAND_COPY: usize = 1;
 pub const COMMAND_RETRY: usize = 2;
 pub const COMMAND_CLEANUP: usize = 3;
 pub const COMMAND_CLOSE: usize = 4;
+/// 精修: ask the application to refine the complete current result.
+pub const COMMAND_REFINE: usize = 5;
 
 // Panel control IDs. They are private; scripts use `--control` instead.
 const ID_STATUS: i32 = 211;
@@ -91,6 +93,7 @@ pub struct Panel {
     refine: HWND,
     last_status: String,
     last_result: String,
+    last_refine_label: String,
 }
 
 impl Panel {
@@ -143,6 +146,7 @@ impl Panel {
                     refine,
                     last_status: String::new(),
                     last_result: String::new(),
+                    last_refine_label: String::new(),
                 }),
                 Err(error) => {
                     let _ = DestroyWindow(hwnd);
@@ -225,8 +229,15 @@ impl Panel {
             enable(self.copy, actions.copy);
             enable(self.retry, actions.retry);
             enable(self.cleanup, actions.cleanup);
-            // 精修: reserved and visibly disabled until ticket #21 connects the port.
+            // 精修: enabled only for a complete result the application can refine;
+            // the label makes the running and unavailable states readable.
             enable(self.refine, actions.refine);
+            let refine_label = panel::refine_label(snapshot);
+            if refine_label != self.last_refine_label {
+                let buffer = wide(refine_label);
+                let _ = SetWindowTextW(self.refine, PCWSTR(buffer.as_ptr()));
+                self.last_refine_label = refine_label.into();
+            }
         }
     }
 }
@@ -632,6 +643,7 @@ pub fn command_for_control(id: usize) -> Option<usize> {
         ID_COPY => Some(COMMAND_COPY),
         ID_RETRY => Some(COMMAND_RETRY),
         ID_CLEANUP => Some(COMMAND_CLEANUP),
+        ID_REFINE => Some(COMMAND_REFINE),
         ID_CLOSE => Some(COMMAND_CLOSE),
         _ => None,
     }
@@ -646,9 +658,8 @@ mod tests {
         assert_eq!(command_for_control(ID_COPY), Some(COMMAND_COPY));
         assert_eq!(command_for_control(ID_RETRY), Some(COMMAND_RETRY));
         assert_eq!(command_for_control(ID_CLEANUP), Some(COMMAND_CLEANUP));
+        assert_eq!(command_for_control(ID_REFINE), Some(COMMAND_REFINE));
         assert_eq!(command_for_control(ID_CLOSE), Some(COMMAND_CLOSE));
-        // 精修 is a disabled placeholder: it deliberately maps to nothing yet.
-        assert_eq!(command_for_control(ID_REFINE), None);
         assert_eq!(command_for_control(ID_STATUS as usize), None);
         assert_eq!(command_for_control(ID_RESULT as usize), None);
     }

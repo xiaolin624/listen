@@ -8,6 +8,8 @@ use std::{
 
 #[cfg(windows)]
 pub mod audio;
+#[cfg(windows)]
+pub mod deepseek;
 pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
@@ -116,6 +118,21 @@ pub trait Target: Send {
     fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()>;
 }
 
+/// The optional 精修 (refine) boundary: text in, corrected text out.
+///
+/// This is the product's only outbound-network path, so the interface is
+/// deliberately the whole safety story: the implementation is handed one transcript
+/// string and nothing else. It never sees the captured audio, a file path, the
+/// runtime directory or any other transcript. Implementations report availability
+/// without doing network work, so a missing API key disables the entry before the
+/// user can press it.
+pub trait RefineText: Send + Sync {
+    /// `Ok(())` when this implementation can run at all (for example a key exists).
+    fn availability(&self) -> Result<(), String>;
+    /// Correct one complete transcript. Only this text leaves the machine.
+    fn refine(&self, text: &str) -> AppResult<String>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// First-use local model preparation is in progress and no capture has been
@@ -168,12 +185,74 @@ pub enum Control {
     Toggle,
     Retry,
     CleanupAudio,
+    /// 精修: ask the configured text-refine port to correct the complete current
+    /// result and replace only the transcript that was appended from it.
+    Refine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Appended,
     Fallback,
+}
+
+/// The always-observable 精修 state. It is reported next to, not instead of, `Phase`:
+/// refining never changes what capture, processing or a result mean.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refine {
+    /// Nothing can be refined right now; the reason is user-readable and never
+    /// contains a credential.
+    Unavailable(String),
+    /// A complete result exists and the port is able to run.
+    Available,
+    /// A refine request is in flight. The local result is still the current result.
+    Running,
+    /// The refined text replaced the current result and, when a target existed, the
+    /// appended transcript that the target still held.
+    Applied,
+    /// The refined text is valid but was deliberately not written to the target; it
+    /// is exposed as `Snapshot::refined_text` and the user's target is untouched.
+    NotApplied(String),
+    /// The refine request itself failed. The complete local result is unchanged.
+    Failed(String),
+}
+
+impl Refine {
+    /// The stable `status.txt` spelling. Reasons live in `detail` and, in the UI, in
+    /// the panel's status block.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Refine::Unavailable(_) => "unavailable",
+            Refine::Available => "available",
+            Refine::Running => "running",
+            Refine::Applied => "applied",
+            Refine::NotApplied(_) => "not_applied",
+            Refine::Failed(_) => "failed",
+        }
+    }
+
+    /// Why the refine entry is not (or no longer) usable, if there is a reason.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Refine::Unavailable(reason) | Refine::NotApplied(reason) | Refine::Failed(reason) => {
+                Some(reason)
+            }
+            Refine::Running => Some("a refine request is already running"),
+            Refine::Applied => Some("the refined text was already applied to this result"),
+            Refine::Available => None,
+        }
+    }
+}
+
+/// No refine implementation was connected at all; the entry stays unavailable and
+/// local recognition is unaffected.
+const NO_REFINE_PORT: &str =
+    "No DeepSeek refine connector is configured, so the current result cannot be refined.";
+
+/// Line endings are not part of a target's meaning: editors may report the same
+/// content with CRLF or LF, so every refine comparison uses this form.
+fn normalize_newlines(value: &str) -> String {
+    value.replace("\r\n", "\n")
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +270,13 @@ pub struct Snapshot {
     pub endpoint: Option<CaptureEndpoint>,
     pub backend: Option<String>,
     pub timing: Timing,
+    /// The 精修 state. Observable in every phase, including before any result exists,
+    /// so a missing key or an in-flight refine never has to be guessed from the UI.
+    pub refine: Refine,
+    /// The refined text when it must not be written to the target (the target was
+    /// edited, or could not be confirmed unchanged). It is shown in the expanded
+    /// panel while `text` keeps the complete local result.
+    pub refined_text: Option<String>,
 }
 
 /// States which render route the capture is bound to and which routes are outside
@@ -237,6 +323,9 @@ struct Completed {
     save_error: Option<String>,
     directory: PathBuf,
     timing: Timing,
+    /// What a successful append left behind, so the same appended transcript can be
+    /// replaced later without guessing. Only a fully confirmed append sets it.
+    memory: Option<DeliveryMemory>,
 }
 
 /// Audio from a failed recognition attempt, kept on disk so the user can retry
@@ -262,21 +351,51 @@ enum Completion {
     },
 }
 
+/// What a successful append left behind. The bound target is kept alive so a later
+/// refine can read it again through the same adapter; `before` is the complete
+/// content read before the append, `after` is the content written, and `appended` is
+/// the transcript itself. A refine may only replace the appended transcript when the
+/// target still holds exactly `after`.
+struct DeliveryMemory {
+    target: Box<dyn Target>,
+    before: String,
+    after: String,
+    appended: String,
+}
+
 /// One delivery attempt's user-visible outcome. A complete append is only reported
 /// after the target contract confirms that the whole replacement was read back.
-fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> (Delivery, String) {
+struct DeliveryOutcome {
+    delivery: Delivery,
+    detail: String,
+    /// Present only for a confirmed append. Fallback deliveries have no target to
+    /// read again, so they can never be replaced in place.
+    memory: Option<DeliveryMemory>,
+}
+
+impl DeliveryOutcome {
+    fn fallback(detail: String) -> Self {
+        Self {
+            delivery: Delivery::Fallback,
+            detail,
+            memory: None,
+        }
+    }
+}
+
+fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> DeliveryOutcome {
     let mut target = match target {
         Ok(Some(target)) => target,
         Ok(None) => {
-            return not_delivered(
+            return DeliveryOutcome::fallback(not_delivered(
                 "No supported editable target was selected at capture start".into(),
-            );
+            ));
         }
-        Err(error) => return not_delivered(error),
+        Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
     };
     let latest = match target.content() {
         Ok(latest) => latest,
-        Err(error) => return not_delivered(error),
+        Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
     };
     let replacement = if latest.is_empty() {
         text.to_string()
@@ -284,26 +403,153 @@ fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> (Delivery,
         format!("{latest}\n{text}")
     };
     match target.replace(&latest, &replacement) {
-        Ok(()) => (
-            Delivery::Appended,
-            "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
-        ),
+        Ok(()) => DeliveryOutcome {
+            delivery: Delivery::Appended,
+            detail: "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
+            memory: Some(DeliveryMemory {
+                target,
+                before: latest,
+                after: replacement,
+                appended: text.to_string(),
+            }),
+        },
         Err(error) => {
             // Diagnose the failed write by reading the target again. Reading is not a
             // retry: the write is never repeated and the previous text is never restored.
             let observed = target.content();
-            failed_write(&latest, &replacement, &error, observed)
+            let (delivery, detail) = failed_write(&latest, &replacement, &error, observed);
+            DeliveryOutcome {
+                delivery,
+                detail,
+                memory: None,
+            }
         }
     }
 }
 
+/// The result of one refine request. The delivery memory was moved to the worker so
+/// the target read, replace and read-back all happen off the UI thread; a target that
+/// must not be written leaves the local result untouched.
+enum RefineOutcome {
+    Applied { refined: String, note: String },
+    NotApplied { refined: String, reason: String },
+    Failed { reason: String },
+}
+
+/// Run one refine and, when it is safe, replace only the appended transcript. This
+/// function is the whole backfill safety boundary:
+///
+/// * the refine port only ever receives `text` (the local 转写文本);
+/// * a target is written only when it still holds exactly the content delivery wrote
+///   and the appended transcript is still the current result;
+/// * the write is confirmed by reading it back before success is claimed;
+/// * any failure keeps the complete local result and never re-appends or restores.
+fn refine_delivery(
+    refine: Arc<dyn RefineText>,
+    text: String,
+    memory: Option<DeliveryMemory>,
+    current_result: PathBuf,
+) -> RefineOutcome {
+    let refined = match refine.refine(&text) {
+        Ok(refined) => refined.trim().to_string(),
+        Err(error) => {
+            return RefineOutcome::Failed {
+                reason: format!("the refine request failed: {error}"),
+            };
+        }
+    };
+    if refined.is_empty() {
+        return RefineOutcome::Failed {
+            reason: "the refine service returned an empty correction, so the local result is kept"
+                .into(),
+        };
+    }
+    let Some(mut memory) = memory else {
+        // Nothing was ever appended (the result was a fallback), so there is no
+        // target to protect: the refined text simply becomes the current result.
+        return match fs::write(&current_result, &refined) {
+            Ok(()) => RefineOutcome::Applied {
+                refined,
+                note: "There was no writable target input to replace, so the refined text became the current result and is shown in the panel; nothing was written to any control.".into(),
+            },
+            Err(error) => RefineOutcome::Failed {
+                reason: format!(
+                    "the refined text could not be saved as the current result: {error}"
+                ),
+            },
+        };
+    };
+    if memory.appended != text {
+        // Defensive: only replace a target that still belongs to the article being
+        // refined. A mismatch means the memory no longer describes this result.
+        return RefineOutcome::NotApplied {
+            refined,
+            reason:
+                "the current result is not the transcript that was delivered, so the target was not written"
+                    .into(),
+        };
+    }
+    let observed = match memory.target.content() {
+        Ok(observed) => observed,
+        Err(error) => {
+            return RefineOutcome::NotApplied {
+                refined,
+                reason: format!(
+                    "the original target could not be read back to confirm it is unchanged ({error}), so it was not written"
+                ),
+            };
+        }
+    };
+    if normalize_newlines(&observed) != normalize_newlines(&memory.after) {
+        return RefineOutcome::NotApplied {
+            refined,
+            reason:
+                "the original target was edited after delivery, so it was not overwritten and the refined text stays in the panel"
+                    .into(),
+        };
+    }
+    let replacement = if memory.before.is_empty() {
+        refined.clone()
+    } else {
+        format!("{}\n{}", memory.before, refined)
+    };
+    if let Err(error) = memory.target.replace(&observed, &replacement) {
+        return RefineOutcome::NotApplied {
+            refined,
+            reason: format!(
+                "writing the refined text to the original target failed ({error}), so the target was left as it was and the refined text stays in the panel"
+            ),
+        };
+    }
+    match memory.target.content() {
+        Ok(readback) if normalize_newlines(&readback) == normalize_newlines(&replacement) => {
+            let mut note = "The refined text replaced the appended transcript in the original target and was read back in full; review and send it manually.".to_string();
+            if let Err(error) = fs::write(&current_result, &refined) {
+                note.push_str(&format!(
+                    " The refined text is the current result here, but it could not be saved to current-result.txt ({error})."
+                ));
+            }
+            RefineOutcome::Applied { refined, note }
+        }
+        Ok(_) => RefineOutcome::NotApplied {
+            refined,
+            reason:
+                "the original target did not confirm the complete refined text, so no complete write is claimed and the local result is kept"
+                    .into(),
+        },
+        Err(error) => RefineOutcome::NotApplied {
+            refined,
+            reason: format!(
+                "the refined text could not be confirmed in the original target ({error}), so the local result is kept; the target is not written again"
+            ),
+        },
+    }
+}
+
 /// Nothing was sent to the target because selection, reading, or saving failed first.
-fn not_delivered(reason: String) -> (Delivery, String) {
-    (
-        Delivery::Fallback,
-        format!(
-            "{reason}. No text was written to any control. The complete result is in the fallback text box. Review and copy it to the intended input."
-        ),
+fn not_delivered(reason: String) -> String {
+    format!(
+        "{reason}. No text was written to any control. The complete result is in the fallback text box. Review and copy it to the intended input."
     )
 }
 
@@ -387,6 +633,11 @@ pub struct Application {
     glossary_path: PathBuf,
     glossary: glossary::Glossary,
     glossary_note: Option<String>,
+    refine_port: Option<Arc<dyn RefineText>>,
+    refine_job: Option<mpsc::Receiver<RefineOutcome>>,
+    /// The confirmed append a later refine may replace. Cleared at every new capture,
+    /// completion and refine, so it can never describe a stale result.
+    delivery_memory: Option<DeliveryMemory>,
 }
 
 impl Application {
@@ -438,6 +689,8 @@ impl Application {
                 endpoint: None,
                 backend: backend.clone(),
                 timing: Timing::default(),
+                refine: Refine::Unavailable(NO_REFINE_PORT.into()),
+                refined_text: None,
             },
             audio,
             transcriber,
@@ -457,6 +710,9 @@ impl Application {
             glossary_path,
             glossary: glossary::Glossary::default(),
             glossary_note: None,
+            refine_port: None,
+            refine_job: None,
+            delivery_memory: None,
         }
     }
 
@@ -497,6 +753,59 @@ impl Application {
         self
     }
 
+    /// Connect the optional 精修 port. Without one the refine entry stays
+    /// unavailable and local recognition is untouched; with one, a request still
+    /// only happens when the user explicitly asks for it.
+    pub fn with_refine(mut self, refine: Arc<dyn RefineText>) -> Self {
+        self.refine_port = Some(refine);
+        self.snapshot.refine = match self.refine_availability() {
+            Ok(()) => Refine::Unavailable("No complete result is available to refine yet.".into()),
+            Err(reason) => Refine::Unavailable(reason),
+        };
+        self
+    }
+
+    /// Whether the connected port can run at all. Availability never performs
+    /// network work: the DeepSeek implementation only checks for the local key.
+    fn refine_availability(&self) -> Result<(), String> {
+        match self.refine_port.as_ref() {
+            Some(port) => port.availability(),
+            None => Err(NO_REFINE_PORT.into()),
+        }
+    }
+
+    /// Record a finished refine. `Refine::Running` and `Phase::Result` are the only
+    /// states the worker can finish from; the local result is only replaced after a
+    /// confirmed write or when there was no target at all.
+    fn apply_refine_outcome(&mut self, outcome: RefineOutcome) {
+        self.delivery_memory = None;
+        match outcome {
+            RefineOutcome::Applied { refined, note } => {
+                self.snapshot.text = refined;
+                self.snapshot.refined_text = None;
+                self.snapshot.refine = Refine::Applied;
+                self.snapshot.detail =
+                    format!("Refine applied. {note} Nothing is sent automatically.");
+            }
+            RefineOutcome::NotApplied { refined, reason } => {
+                self.snapshot.refined_text = Some(refined);
+                self.snapshot.refine = Refine::NotApplied(reason.clone());
+                let reason = reason.trim_end_matches('.').trim_end();
+                self.snapshot.detail = format!(
+                    "Refine was not written back: {reason}. The refined text is in the expanded panel and the complete local result is unchanged. Nothing is sent automatically."
+                );
+            }
+            RefineOutcome::Failed { reason } => {
+                self.snapshot.refined_text = None;
+                self.snapshot.refine = Refine::Failed(reason.clone());
+                let reason = reason.trim_end_matches('.').trim_end();
+                self.snapshot.detail = format!(
+                    "Refine failed: {reason}. The complete local result is unchanged and remains available; nothing was appended again or sent."
+                );
+            }
+        }
+    }
+
     /// What the application is doing right now, phrased for refusal messages that
     /// must not claim "nothing is being captured" while a capture is running.
     fn activity(&self) -> &'static str {
@@ -515,6 +824,13 @@ impl Application {
             Control::Toggle => Control::Start,
             other => other,
         };
+        // A refine may be running while the user asks for another capture. Refusing
+        // the start is the simplest honest rule: the refine worker owns the delivery
+        // memory and a capture would clear it mid-flight.
+        if matches!(control, Control::Start) && self.refine_job.is_some() {
+            self.snapshot.detail = "Refine is still running; the current result is unchanged. Wait for the refined text before starting a new capture.".into();
+            return;
+        }
         match control {
             Control::Start if self.recording.is_none() && self.completion.is_none() => {
                 if self.retry.is_some() {
@@ -567,6 +883,14 @@ impl Application {
                         self.snapshot.delivery = None;
                         self.snapshot.retained_audio.clear();
                         self.snapshot.retry_available = false;
+                        // A new capture starts a new article: the previous append can
+                        // no longer be refined or replaced.
+                        self.delivery_memory = None;
+                        self.snapshot.refined_text = None;
+                        self.snapshot.refine = Refine::Unavailable(
+                            "Playback is being captured; stop and wait for the complete result before refining."
+                                .into(),
+                        );
                         self.snapshot.detail = self.with_glossary_note(format!(
                             "{}{}",
                             capture_scope(self.snapshot.endpoint.as_ref()),
@@ -725,6 +1049,7 @@ impl Application {
                                 save_error: None,
                                 directory,
                                 timing,
+                                memory: None,
                             })
                         }
                         Ok(text) => {
@@ -734,11 +1059,11 @@ impl Application {
                                 .map(|e| e.to_string());
                             timing.save_ms = Some(elapsed_ms(save_started));
                             let delivery_started = Instant::now();
-                            let (delivery, detail) = match &save_error {
+                            let outcome = match &save_error {
                                 // Saving first means a storage failure never changes a target.
-                                Some(error) => not_delivered(format!(
+                                Some(error) => DeliveryOutcome::fallback(not_delivered(format!(
                                     "Could not save the current result: {error}"
-                                )),
+                                ))),
                                 None => deliver(target, &text),
                             };
                             timing.delivery_ms = Some(elapsed_ms(delivery_started));
@@ -746,15 +1071,75 @@ impl Application {
                             Completion::Finished(Completed {
                                 text,
                                 description: audio.description,
-                                delivery: Some(delivery),
-                                detail,
+                                delivery: Some(outcome.delivery),
+                                detail: outcome.detail,
                                 save_error,
                                 directory,
                                 timing,
+                                memory: outcome.memory,
                             })
                         }
                     };
                     let _ = tx.send(completion);
+                });
+            }
+            Control::Refine => {
+                if self.refine_job.is_some() {
+                    self.snapshot.detail = "Refine is already running; the current result is unchanged. Wait for the refined text before asking again.".into();
+                    return;
+                }
+                if self.recording.is_some() {
+                    self.snapshot.refine = Refine::Unavailable(
+                        "Playback is being captured; stop and wait for the complete result before refining."
+                            .into(),
+                    );
+                    self.snapshot.detail = "Refine is unavailable while playback is being captured. Stop the capture and wait for the complete result; the current result is unchanged.".into();
+                    return;
+                }
+                if self.completion.is_some() {
+                    self.snapshot.refine = Refine::Unavailable(
+                        "The previous capture is still processing locally; wait for the complete result before refining."
+                            .into(),
+                    );
+                    self.snapshot.detail = "Refine is unavailable while the current playback is still being processed locally. The current result is unchanged.".into();
+                    return;
+                }
+                // The entry is only enabled for a complete result that the port can
+                // actually refine; every other state is refused explicitly rather
+                // than silently doing nothing.
+                if !matches!(self.snapshot.refine, Refine::Available) {
+                    let reason = self
+                        .snapshot
+                        .refine
+                        .reason()
+                        .unwrap_or("no complete result is available")
+                        .trim_end_matches('.')
+                        .trim_end()
+                        .to_string();
+                    self.snapshot.detail = format!(
+                        "Refine is unavailable: {reason}. The current result is unchanged and can still be copied."
+                    );
+                    return;
+                }
+                let Some(refine) = self.refine_port.clone() else {
+                    self.snapshot.refine = Refine::Unavailable(NO_REFINE_PORT.into());
+                    self.snapshot.detail = format!(
+                        "Refine is unavailable: {NO_REFINE_PORT} The current result is unchanged."
+                    );
+                    return;
+                };
+                // Only the transcript text is handed to the port. The target memory
+                // moves to the worker so the target read/write never blocks the UI.
+                let text = self.snapshot.text.clone();
+                let memory = self.delivery_memory.take();
+                let current_result = self.runtime.join("current-result.txt");
+                let (tx, rx) = mpsc::channel();
+                self.refine_job = Some(rx);
+                self.snapshot.refine = Refine::Running;
+                self.snapshot.refined_text = None;
+                self.snapshot.detail = "Refining the current result through the configured DeepSeek API; only the transcript text is sent, never the audio. The local result stays available meanwhile.".into();
+                thread::spawn(move || {
+                    let _ = tx.send(refine_delivery(refine, text, memory, current_result));
                 });
             }
             Control::Retry => {
@@ -891,18 +1276,20 @@ impl Application {
                     save_error: None,
                     directory,
                     timing,
+                    memory: None,
                 }),
                 Ok(text) => match fs::write(&current_result, &text) {
                     Ok(()) => {
-                        let (delivery, detail) = deliver(target, &text);
+                        let outcome = deliver(target, &text);
                         Completion::Finished(Completed {
                             text,
                             description: audio.description,
-                            delivery: Some(delivery),
-                            detail,
+                            delivery: Some(outcome.delivery),
+                            detail: outcome.detail,
                             save_error: None,
                             directory,
                             timing,
+                            memory: outcome.memory,
                         })
                     }
                     Err(error) => {
@@ -1045,6 +1432,25 @@ impl Application {
     }
 
     pub fn poll(&mut self) {
+        if let Some(job) = &self.refine_job {
+            match job.try_recv() {
+                Ok(outcome) => {
+                    self.refine_job = None;
+                    self.apply_refine_outcome(outcome);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.refine_job = None;
+                    self.delivery_memory = None;
+                    self.snapshot.refined_text = None;
+                    self.snapshot.refine = Refine::Failed(
+                        "the refine worker stopped unexpectedly before reporting a correction"
+                            .into(),
+                    );
+                    self.snapshot.detail = "Refine failed: the worker stopped unexpectedly before reporting a correction. The complete local result is unchanged and remains available; nothing was appended again or sent.".into();
+                }
+            }
+        }
         if self.preparation.is_some() {
             let received = self.preparation.as_ref().unwrap().try_recv();
             match received {
@@ -1155,6 +1561,14 @@ impl Application {
                 self.record_latency("NoSpeech", &completed.timing, &completed.directory);
                 self.snapshot.retained_audio.clear();
                 self.snapshot.retry_available = false;
+                // The previous result is kept, but it is not what this capture
+                // produced: refine stays off until a complete result exists again.
+                self.delivery_memory = None;
+                self.snapshot.refined_text = None;
+                self.snapshot.refine = Refine::Unavailable(
+                    "The latest capture contained no speech, so there is no complete result to refine."
+                        .into(),
+                );
                 match fs::remove_dir_all(&completed.directory) {
                     Ok(()) => {
                         self.snapshot.phase = Phase::NoSpeech;
@@ -1174,6 +1588,15 @@ impl Application {
                 self.snapshot.timing = completed.timing.clone();
                 self.snapshot.text = completed.text;
                 self.snapshot.delivery = completed.delivery;
+                // Only a confirmed append leaves a target that a later refine may
+                // safely replace; a fallback result still offers refine but has no
+                // target to write back to.
+                self.delivery_memory = completed.memory;
+                self.snapshot.refined_text = None;
+                self.snapshot.refine = match self.refine_availability() {
+                    Ok(()) => Refine::Available,
+                    Err(reason) => Refine::Unavailable(reason),
+                };
                 self.record_latency("Result", &completed.timing, &completed.directory);
                 let cleanup = if let Some(error) = &completed.save_error {
                     // A storage failure keeps the audio recoverable, as before.
@@ -1275,6 +1698,13 @@ impl Application {
             }
         }
         self.snapshot.phase = Phase::Failure;
+        // A failed operation leaves no complete result to refine, and no delivery
+        // memory that a later refine could act on.
+        self.delivery_memory = None;
+        self.snapshot.refined_text = None;
+        self.snapshot.refine = Refine::Unavailable(
+            "The latest operation failed, so there is no complete result to refine.".into(),
+        );
         let error = error.trim_end_matches('.').to_string();
         self.snapshot.detail = if self.snapshot.retained_audio.is_empty() {
             error
