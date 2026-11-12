@@ -8,6 +8,10 @@ param(
     [string]$Model = '',
     [string]$VadModel = '',
     [ValidateSet('host', 'cli')][string]$Backend = 'host',
+    # The dev run uses the glossary shipped in the repository; pass -Glossary to
+    # try a different file. A missing file still means "no correction", never a
+    # failed launch.
+    [string]$Glossary = '',
     [switch]$Hidden,
     [ValidateSet('', 'start', 'stop', 'toggle', 'retry', 'cleanup', 'show', 'panel', 'copy', 'refine', 'quit')][string]$Control = ''
 )
@@ -49,6 +53,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the shared repository root.' }
 $repositoryRoot = Split-Path $commonGit -Parent
 if (-not $ToolsRoot) { $ToolsRoot = Join-Path $repositoryRoot '.tools' }
 if (-not $Runtime) { $Runtime = Join-Path $repositoryRoot '.artifacts\listen' }
+if (-not $Glossary) { $Glossary = Join-Path $projectRoot 'packaging\glossary.txt' }
 $engineKind = $Engine.Trim()
 $whisperPath = $false
 if ($engineKind -ieq 'whisper') {
@@ -68,7 +73,7 @@ if ($engineKind -ieq 'whisper') {
     if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
 }
 # Start-Process joins ArgumentList; quote literal Windows paths containing spaces.
-$quotedPaths = @($Runtime)
+$quotedPaths = @($Runtime, $Glossary)
 if ($whisperPath) {
     if (-not $Model) { throw 'The whisper.cpp fallback needs -Model.' }
     if (-not $VadModel) { throw 'The whisper.cpp fallback needs -VadModel.' }
@@ -87,7 +92,7 @@ function ConvertTo-QuotedWindowsPath([string]$Path) {
     # A trailing backslash must be doubled before the closing command-line quote.
     '"' + ([IO.Path]::GetFullPath($Path) -replace '(\\+)$', '$1$1') + '"'
 }
-$launchArguments = @('--runtime', (ConvertTo-QuotedWindowsPath $Runtime))
+$launchArguments = @('--runtime', (ConvertTo-QuotedWindowsPath $Runtime), '--glossary', (ConvertTo-QuotedWindowsPath $Glossary))
 if ($whisperPath) {
     $launchArguments += @('--engine', (ConvertTo-QuotedWindowsPath $whisperExecutable), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--backend', $Backend)
 }
@@ -96,5 +101,6 @@ $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -Windo
 Write-Output "Listen PID: $($process.Id)"
 Write-Output "Engine: $(if ($whisperPath) { $whisperExecutable } else { 'SenseVoice (default resident engine, sherpa-onnx)' })"
 Write-Output "Current status: $(Join-Path $Runtime 'status.txt')"
+Write-Output "Glossary: $Glossary"
 Write-Output "Panel text: $(Join-Path $Runtime 'panel.txt')"
 Write-Output 'Ctrl+Alt+R starts/stops capture. Click the capsule or use --control show to open the result panel; Listen stays in the tray.'

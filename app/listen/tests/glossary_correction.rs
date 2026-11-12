@@ -380,3 +380,38 @@ fn a_missing_glossary_file_delivers_the_uncorrected_text_without_a_warning() {
         "{result:?}"
     );
 }
+
+#[test]
+fn the_active_glossary_file_is_reported_for_status_txt() {
+    let runtime = Runtime::with_glossary("DeepSeek Harness\n");
+    let app = Application::new(
+        Arc::new(Playback),
+        Arc::new(Model::new(0)),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    assert_eq!(
+        app.glossary_status(),
+        runtime.0.join("glossary.txt").display().to_string(),
+        "status.txt must name the glossary that is actually used"
+    );
+}
+
+#[test]
+fn no_glossary_file_is_reported_as_none_and_still_delivers() {
+    let runtime = Runtime::new();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(Model::new(0)),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    assert_eq!(app.glossary_status(), "none");
+
+    let result = capture(&mut app);
+    assert_eq!(result.text, RAW);
+    assert!(
+        !result.detail.contains("Glossary correction is unavailable"),
+        "{result:?}"
+    );
+}

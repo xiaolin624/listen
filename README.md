@@ -48,7 +48,7 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 
 ## 术语表（专名校正）
 
-默认路径是 `<runtime>\glossary.txt`，可用 `--glossary` 指定。`#` 开头是注释，空行忽略；正式写法在前，可选别名（拼音、中文写法或顽固误写）放在 `|` 后，用逗号分隔：
+默认路径是 `<runtime>\glossary.txt`；如果它不存在，再找 `listen.exe` 旁边的 `glossary.txt`（复制出去的构建因此也能用上随包术语表）。开发启动器 `run-listen.ps1` 默认传入仓库里的 `packaging\glossary.txt`，可用 `-Glossary` 换文件；`listen.exe --glossary <file>` 仍然优先。`status.txt` 的 `glossary=` 行写明本次实际使用的文件，没有文件时为 `none`。`#` 开头是注释，空行忽略；正式写法在前，可选别名（拼音、中文写法或顽固误写）放在 `|` 后，用逗号分隔：
 
 ```text
 DeepSeek Harness | shen du qiu suo, 迪普西克
@@ -76,7 +76,7 @@ Rust | re
 | --- | --- |
 | `current-result.txt` | 当前完整 UTF-8 转写文本；成功后覆盖，不建立会议历史 |
 | `panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新，供自动化读取 |
-| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、各段耗时、进程 ID；不含转写正文 |
+| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、各段耗时、进程 ID；不含转写正文 |
 | `latency.jsonl` | 每次采集/失败的准备、采集启动、收尾、识别、保存、交付耗时；不含音频 |
 | 本次会话临时目录 | 采集音频与本地诊断；成功后删除，失败时保留以便人工恢复 |
 

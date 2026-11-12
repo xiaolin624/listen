@@ -757,7 +757,7 @@ pub struct Application {
     preparation_started: Option<Instant>,
     readiness: Arc<ReadinessSignal>,
     backend: Option<String>,
-    glossary_path: PathBuf,
+    glossary_paths: Vec<PathBuf>,
     glossary: glossary::Glossary,
     glossary_note: Option<String>,
     refine_port: Option<Arc<dyn RefineText>>,
@@ -811,7 +811,8 @@ impl Application {
             ),
         };
         let backend = transcriber.backend_note();
-        let glossary_path = glossary::default_path(&runtime);
+        let glossary_paths =
+            glossary::default_paths(&runtime, std::env::current_exe().ok().as_deref());
         Self {
             snapshot: Snapshot {
                 phase,
@@ -845,7 +846,7 @@ impl Application {
             preparation_started,
             readiness,
             backend,
-            glossary_path,
+            glossary_paths,
             glossary: glossary::Glossary::default(),
             glossary_note: None,
             refine_port: None,
@@ -854,18 +855,41 @@ impl Application {
         }
     }
 
-    /// Use a specific 术语表 file for this application. The default is
-    /// `<runtime>/glossary.txt`, or the process default set from `--glossary`.
+    /// Use a specific 术语表 file for this application. The default is the first
+    /// existing of `<runtime>/glossary.txt` and `glossary.txt` next to the
+    /// executable, unless the process default was set from `--glossary`.
     pub fn with_glossary(mut self, path: impl Into<PathBuf>) -> Self {
-        self.glossary_path = path.into();
+        self.glossary_paths = vec![path.into()];
         self
+    }
+
+    /// The 术语表 file currently used, if one exists. The runtime copy wins over
+    /// the copy next to the executable so a per-user edit still applies.
+    pub fn glossary_file(&self) -> Option<&Path> {
+        self.glossary_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .find(|path| path.is_file())
+    }
+
+    /// The `status.txt` spelling of the active 术语表: its path, or `none` when
+    /// no file exists (correction is then a silent no-op).
+    pub fn glossary_status(&self) -> String {
+        self.glossary_file()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
     }
 
     /// Read the glossary again so an edit applies to this capture without a
     /// restart. A malformed file is reported and never loses the capture: the
     /// transcript is still delivered, only without correction.
     fn reload_glossary(&mut self) {
-        match glossary::Glossary::load(&self.glossary_path) {
+        let Some(path) = self.glossary_file().map(Path::to_path_buf) else {
+            self.glossary = glossary::Glossary::default();
+            self.glossary_note = None;
+            return;
+        };
+        match glossary::Glossary::load(&path) {
             Ok(loaded) => {
                 self.glossary = loaded;
                 self.glossary_note = None;
