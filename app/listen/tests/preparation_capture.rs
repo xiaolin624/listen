@@ -6,7 +6,7 @@
 
 use listen::{
     AppResult, Application, CapturedAudio, Control, Delivery, LocalTranscriber, Phase,
-    PlaybackAudio, Preparation, Recording, TimedText,
+    PlaybackAudio, Preparation, Recording, Target, TargetSelection, TimedText,
     streaming::{SegmentConfig, SegmentStream, SegmentedAudioWriter},
 };
 use std::{
@@ -156,6 +156,67 @@ fn session_directories(runtime: &Runtime) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A single focused editor that accepts one complete append. Recording the number
+/// of replacements makes a duplicate delivery visible; there is no send or enter
+/// action at this boundary.
+struct Editor {
+    draft: Mutex<String>,
+    replace_calls: AtomicUsize,
+}
+impl Editor {
+    fn new(draft: &str) -> Arc<Self> {
+        Arc::new(Self {
+            draft: Mutex::new(draft.into()),
+            replace_calls: AtomicUsize::new(0),
+        })
+    }
+    fn draft(&self) -> String {
+        self.draft.lock().unwrap().clone()
+    }
+    fn replace_calls(&self) -> usize {
+        self.replace_calls.load(Ordering::SeqCst)
+    }
+}
+struct Selection(Arc<Editor>);
+struct BoundEditor(Arc<Editor>);
+impl TargetSelection for Selection {
+    fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
+        Ok(Some(Box::new(BoundEditor(self.0.clone()))))
+    }
+}
+impl Target for BoundEditor {
+    fn content(&mut self) -> AppResult<String> {
+        Ok(self.0.draft())
+    }
+    fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
+        let mut draft = self.0.draft.lock().unwrap();
+        if *draft != expected {
+            return Err("The target draft changed during output".into());
+        }
+        *draft = replacement.into();
+        self.0.replace_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A local model that would answer even before it reports readiness. Only the
+/// application's own readiness gate may decide when it is called, so a transcript
+/// from it after a failed preparation would be a fabricated result.
+struct EagerModel {
+    preparation: Mutex<Option<mpsc::Receiver<AppResult<String>>>>,
+}
+impl LocalTranscriber for EagerModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn prepare(&self) -> Option<mpsc::Receiver<AppResult<String>>> {
+        self.preparation.lock().unwrap().take()
+    }
+    fn transcribe(&self, _audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        Ok("fabricated result: the model was never prepared".into())
+    }
+}
+
 #[test]
 fn preparation_failure_during_capture_ends_in_failure_and_retains_the_whole_audio() {
     let runtime = Runtime::new();
@@ -212,8 +273,8 @@ fn preparation_failure_during_capture_ends_in_failure_and_retains_the_whole_audi
         state.phase == Phase::Failure && state.detail.contains("Local retry failed")
     });
     assert!(
-        retried.detail.contains("still being prepared"),
-        "{retried:?}"
+        retried.detail.contains("failed to prepare"),
+        "a retry must wait for the failed preparation instead of asking the engine: {retried:?}"
     );
     assert_eq!(retried.retained_audio, [retained.clone()]);
     assert!(retained.is_file());
@@ -329,12 +390,146 @@ fn preparation_finishing_while_local_processing_keeps_processing_and_delivers_th
     assert!(result.retained_audio.is_empty());
 }
 
+#[test]
+fn stop_before_preparation_finishes_waits_for_readiness_and_appends_the_result_once() {
+    let runtime = Runtime::new();
+    let (sender, receiver) = mpsc::channel();
+    let model = Arc::new(PreparingModel::new(receiver));
+    let editor = Editor::new("原有草稿");
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Selection(editor.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    app.dispatch(Control::Stop);
+    let processing = app.snapshot();
+    assert_eq!(processing.phase, Phase::Processing, "{processing:?}");
+    assert_eq!(
+        processing.preparation,
+        Preparation::Pending,
+        "{processing:?}"
+    );
+    assert!(
+        processing.detail.contains("still being prepared"),
+        "the processing state must not claim the model is ready: {processing:?}"
+    );
+    assert!(
+        processing.detail.contains("buffered audio"),
+        "the processing state must say the audio is buffered: {processing:?}"
+    );
+    assert!(
+        processing.detail.contains("no messages are sent"),
+        "{processing:?}"
+    );
+    assert_eq!(
+        editor.draft(),
+        "原有草稿",
+        "nothing may be delivered while waiting"
+    );
+    assert_eq!(editor.replace_calls(), 0);
+
+    // The stopped capture is recognized only after the model reports readiness.
+    model.mark_ready();
+    sender
+        .send(Ok("Resident local model is ready.".into()))
+        .unwrap();
+    let result = wait(&mut app, "result", |state| state.phase == Phase::Result);
+    assert_eq!(result.preparation, Preparation::Ready, "{result:?}");
+    assert_eq!(
+        result.text,
+        format!("complete capture of {CAPTURE_SAMPLES} samples")
+    );
+    assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
+    let draft = editor.draft();
+    assert_eq!(draft, format!("原有草稿\n{}", result.text));
+    assert_eq!(
+        draft.matches(&result.text).count(),
+        1,
+        "the complete transcript must be appended exactly once: {draft:?}"
+    );
+    assert_eq!(
+        editor.replace_calls(),
+        1,
+        "one append and no automatic send/enter action"
+    );
+    assert!(result.retained_audio.is_empty());
+}
+
+#[test]
+fn preparation_failure_after_stop_reports_failure_retains_audio_and_delivers_nothing() {
+    let runtime = Runtime::new();
+    let previous = "上一段完整转写。";
+    fs::write(runtime.0.join("current-result.txt"), previous).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let model = Arc::new(EagerModel {
+        preparation: Mutex::new(Some(receiver)),
+    });
+    let editor = Editor::new("原有草稿");
+    let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Selection(editor.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    app.dispatch(Control::Stop);
+    let processing = app.snapshot();
+    assert_eq!(processing.phase, Phase::Processing, "{processing:?}");
+    assert!(
+        processing.detail.contains("still being prepared"),
+        "{processing:?}"
+    );
+
+    sender
+        .send(Err("the resident model could not be loaded".into()))
+        .unwrap();
+    let failure = wait(&mut app, "preparation failure", |state| {
+        state.phase == Phase::Failure
+    });
+    assert_eq!(failure.preparation, Preparation::Failed, "{failure:?}");
+    assert!(
+        failure.detail.contains("failed to prepare")
+            && failure.detail.contains("could not be loaded"),
+        "{failure:?}"
+    );
+    assert_eq!(
+        failure.text, previous,
+        "a capture whose model never prepared must not be delivered: {failure:?}"
+    );
+    assert_eq!(failure.delivery, None, "{failure:?}");
+    assert_eq!(
+        failure.retained_audio.len(),
+        1,
+        "the stopped capture's audio must be retained: {failure:?}"
+    );
+    assert_eq!(
+        hound::WavReader::open(&failure.retained_audio[0])
+            .unwrap()
+            .duration() as usize,
+        CAPTURE_SAMPLES
+    );
+    assert!(failure.retry_available, "{failure:?}");
+    assert_eq!(editor.draft(), "原有草稿", "nothing may be delivered");
+    assert_eq!(editor.replace_calls(), 0);
+
+    // A retry must wait for the same failed preparation and keep the audio.
+    app.dispatch(Control::Retry);
+    let retried = wait(&mut app, "retry failure", |state| {
+        state.phase == Phase::Failure && state.detail.contains("Local retry failed")
+    });
+    assert!(retried.detail.contains("failed to prepare"), "{retried:?}");
+    assert_eq!(retried.retained_audio, failure.retained_audio);
+    assert!(retried.retry_available);
+    assert_eq!(editor.draft(), "原有草稿");
+    assert_eq!(editor.replace_calls(), 0);
+}
+
 /// The real capture path writes bounded windows and recognizes them before stop.
-/// This model waits for first-use preparation before it decodes a window, so the
-/// capture has to buffer the audio until the model reports readiness.
+/// With `wait_for_readiness` the fake queues a window until preparation reports
+/// ready; without it the fake rejects undecoded audio exactly like the real
+/// engine does before preparation, so only the application's gate can prevent it.
 struct WaitingStreamingModel {
     preparation: Mutex<Option<mpsc::Receiver<AppResult<String>>>>,
     ready: Arc<AtomicBool>,
+    wait_for_readiness: bool,
 }
 impl LocalTranscriber for WaitingStreamingModel {
     fn check_ready(&self) -> AppResult<()> {
@@ -356,12 +551,19 @@ impl LocalTranscriber for WaitingStreamingModel {
         audio: &CapturedAudio,
         _directory: &Path,
     ) -> AppResult<Vec<TimedText>> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.ready.load(Ordering::SeqCst) {
-            if Instant::now() >= deadline {
-                return Err("the local model never reported readiness".into());
+        if !self.ready.load(Ordering::SeqCst) {
+            if !self.wait_for_readiness {
+                return Err(
+                    "The local SenseVoice engine is not prepared; audio was not decoded".into(),
+                );
             }
-            thread::sleep(Duration::from_millis(1));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.ready.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return Err("the local model never reported readiness".into());
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
         let mut reader = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
         let samples = reader
@@ -466,6 +668,7 @@ fn streaming_capture_started_during_preparation_buffers_windows_then_recognizes_
     let model = Arc::new(WaitingStreamingModel {
         preparation: Mutex::new(Some(receiver)),
         ready: ready.clone(),
+        wait_for_readiness: true,
     });
     let (tx, rx) = mpsc::sync_channel(1);
     let mut app = Application::new(
@@ -523,6 +726,66 @@ fn streaming_capture_started_during_preparation_buffers_windows_then_recognizes_
 }
 
 #[test]
+fn streaming_capture_stopped_before_preparation_finishes_records_the_windows_after_readiness() {
+    let runtime = Runtime::new();
+    let (sender, receiver) = mpsc::channel();
+    let ready = Arc::new(AtomicBool::new(false));
+    // This fake would reject a window decoded before readiness, exactly like the
+    // real engine; only the application's gate can keep it from being called.
+    let model = Arc::new(WaitingStreamingModel {
+        preparation: Mutex::new(Some(receiver)),
+        ready: ready.clone(),
+        wait_for_readiness: false,
+    });
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut app = Application::new(
+        Arc::new(StreamingPlayback {
+            input: Mutex::new(Some(rx)),
+        }),
+        model,
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Toggle);
+    let mut samples = vec![1000; 1440];
+    samples.extend(vec![2000; 320]);
+    samples.extend(vec![3000; 960]);
+    samples.extend(vec![4000; 480]);
+    tx.send(samples).unwrap();
+    let buffering = wait(&mut app, "buffered playback", |state| {
+        state.progress.received_samples >= 3200
+    });
+    assert_eq!(
+        buffering.phase,
+        Phase::Capturing,
+        "a window that closed before readiness must not be decoded or treated as a failure: {buffering:?}"
+    );
+    assert_eq!(buffering.preparation, Preparation::Pending, "{buffering:?}");
+
+    app.dispatch(Control::Stop);
+    let processing = app.snapshot();
+    assert_eq!(processing.phase, Phase::Processing, "{processing:?}");
+    assert!(
+        processing.detail.contains("still being prepared")
+            && processing.detail.contains("buffered audio"),
+        "{processing:?}"
+    );
+
+    ready.store(true, Ordering::SeqCst);
+    sender
+        .send(Ok("Resident local model is ready.".into()))
+        .unwrap();
+    let result = wait(&mut app, "result", |state| state.phase == Phase::Result);
+    assert_eq!(result.text, "开始跨段 Rust 收尾。");
+    assert_eq!(result.preparation, Preparation::Ready);
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        session_directories(&runtime).is_empty(),
+        "success must clean every session audio directory"
+    );
+}
+
+#[test]
 fn streaming_preparation_failure_retains_the_buffered_windows_for_recovery() {
     let runtime = Runtime::new();
     let previous = "上一段完整转写。";
@@ -532,6 +795,7 @@ fn streaming_preparation_failure_retains_the_buffered_windows_for_recovery() {
     let model = Arc::new(WaitingStreamingModel {
         preparation: Mutex::new(Some(receiver)),
         ready: ready.clone(),
+        wait_for_readiness: true,
     });
     let (tx, rx) = mpsc::sync_channel(1);
     let mut app = Application::new(
@@ -582,8 +846,8 @@ fn streaming_preparation_failure_retains_the_buffered_windows_for_recovery() {
         state.phase == Phase::Failure && state.detail.contains("Local retry failed")
     });
     assert!(
-        retried.detail.contains("still being prepared"),
-        "{retried:?}"
+        retried.detail.contains("failed to prepare"),
+        "a retry must wait for the failed preparation instead of asking the engine: {retried:?}"
     );
     assert_eq!(retried.retained_audio, retained);
 
