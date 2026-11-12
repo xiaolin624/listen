@@ -6,9 +6,9 @@
 //! Esc, the caption's close button or the panel's own 关闭 button.
 //!
 //! The window never activates itself: opening uses `SW_SHOWNOACTIVATE`, so neither
-//! a poll-driven content update nor an automatic open (a fallback result or a
-//! failure) can take focus from the user. It only takes focus when the user clicks
-//! it, which is also how selecting and copying works.
+//! a poll-driven content update nor the automatic open of a fallback result can take
+//! focus from the user. It only takes focus when the user clicks it, which is also
+//! how selecting and copying works.
 //!
 //! Both text areas are read-only multiline `EDIT` controls; the panel never edits
 //! the 转写文本. Buttons only copy to the clipboard or dispatch the existing
@@ -594,7 +594,15 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_DPICHANGED => {
-                let suggested = *(lparam.0 as *const RECT);
+                // The suggested rectangle is optional: a null lparam must not be
+                // dereferenced. `capsule_window` guards the same message the same
+                // way; the panel keeps its current geometry and only relayouts.
+                let suggested = lparam.0 as *const RECT;
+                if suggested.is_null() {
+                    layout(hwnd);
+                    return LRESULT(0);
+                }
+                let suggested = *suggested;
                 release_font(hwnd);
                 let _ = SetWindowPos(
                     hwnd,

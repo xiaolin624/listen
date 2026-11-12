@@ -86,6 +86,9 @@ thread_local! {
 pub struct Capsule {
     hwnd: HWND,
     capture_excluded: bool,
+    /// Why the platform refused to hide the capsule from screen capture, so the
+    /// application can tell the user instead of only reporting a zero status key.
+    capture_exclusion_error: Option<String>,
     startup_ms: u64,
 }
 
@@ -94,6 +97,11 @@ impl Capsule {
     /// means the capsule is visible in screen sharing, which `status.txt` reports.
     pub fn capture_excluded(&self) -> bool {
         self.capture_excluded
+    }
+
+    /// The platform's reason when the capsule could not be excluded from capture.
+    pub fn capture_exclusion_error(&self) -> Option<&str> {
+        self.capture_exclusion_error.as_deref()
     }
 
     /// Measured process start to first presented capsule frame.
@@ -187,7 +195,9 @@ pub fn create(runtime: &Path, state: CapsuleState) -> Result<Capsule, String> {
             None,
         )
         .map_err(|error| format!("Cannot create the status capsule: {error}"))?;
-        let capture_excluded = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok();
+        let capture_exclusion = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let capture_excluded = capture_exclusion.is_ok();
+        let capture_exclusion_error = capture_exclusion.err().map(|error| error.to_string());
 
         let window = Window::new(hwnd, runtime.to_path_buf(), state, scale)?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -198,6 +208,7 @@ pub fn create(runtime: &Path, state: CapsuleState) -> Result<Capsule, String> {
         Ok(Capsule {
             hwnd,
             capture_excluded,
+            capture_exclusion_error,
             startup_ms,
         })
     }

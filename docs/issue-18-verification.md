@@ -30,13 +30,14 @@ UTF-8 文本，按行处理：
 ```text
 # 以 # 开头的行是注释；空行忽略
 DeepSeek Harness | shen du qiu suo, 迪普西克
-WASAPI | waapp, wa-sa-pi
-WASAPI loopback | waapp loop back
+WASAPI | waapp
+WASAPI loopback
 CUDA | ku da, ku
 GPU
 ```
 
 - 正式写法在前，`|` 后是可选别名，逗号分隔；只写正式写法也合法。
+- 2026-11-12 审查修复后，打包术语表只保留算法**无法推断**的别名：`wa-sa-pi` 归一化后等于正式写法 `WASAPI`，`waapp loop back` 由 `WASAPI loopback` 近似匹配召回，二者已删除；`shen du qiu suo`、`迪普西克`（拼音/汉字）与 `re`、`ku`、`ku da`（短别名/中文邻接）保留。证明见 `glossary::tests::the_shipped_canonical_forms_alone_catch_the_removed_variants` 与 [审查修复记录](issue-review-fixes.md)。
 - 解析时会去掉 UTF-8 BOM、行首尾空白和行尾的 `\r`，因此 Windows 记事本保存的 CRLF 文件可用。
 - 文件缺失：空术语表，文本原样交付，不算错误。
 - 文件存在但不可读或格式错误（缺正式写法、多个 `|`、没有字母/数字、同一行混用拉丁与 CJK）：`load` 返回带**文件路径和行号**的错误；应用把它写进快照 `detail`，采集继续，交付未校正文本。

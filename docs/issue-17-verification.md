@@ -1,5 +1,10 @@
 # Issue #17 验证：SenseVoice 常驻识别引擎
 
+> **2026-11-12 v0.2 审查修复更正。** 本文的“中英混合不差于记录的 whisper”一项是**旧记录比较**，不是同一次真实引擎对比：在 `ticket/v0.2-review-fixes` 上新增了默认忽略的真引擎对比测试
+> `sense_voice_is_not_worse_than_whisper_on_mandarin_and_the_mixed_outcome_is_stated`，同一条 WAV 分别经 whisper 与 SenseVoice 实测（CER，忽略大小写/标点）：
+> **普通话 SenseVoice 0.000 / whisper 0.378（SenseVoice 不差）**；**中英混合 SenseVoice 0.167 / whisper 0.130（whisper 在英文专名上更好）**。
+> 中英混合的术语表链路由独立测试 `the_shipped_glossary_repairs_the_production_chain_for_mixed_chinese_english` 覆盖，不再称为“不差于 whisper”。详见 [审查修复记录](issue-review-fixes.md)。
+
 2026-11-12。分支 `ticket/issue-17`（工作树 `E:\luyin\.worktrees\issue-17`），
 `integration/v0.2` 已合入 #16/#18/#22。机器：11th Gen Intel Core i5-11400H @ 2.70 GHz，
 Windows 11 26200，x64；**CPU 支持 AVX2**，`std::arch::is_x86_feature_detected!("avx2")`

@@ -2,15 +2,17 @@
 
 2026-11-12。工作树 `E:\luyin\.worktrees\issue-20`，分支 `ticket/issue-20`，基线 `99363ac`（`integration/v0.2`，含 #19 常驻状态胶囊）；报告前确认 `integration/v0.2` 尖端仍是 `99363ac`，`git merge integration/v0.2` 为 `Already up to date`。主工作树未改动。
 
+> **2026-11-12 v0.2 审查修复更正。** 本文原先声称“自动化验收不再依赖窗口类名/控件 ID”，但 `verify-panel.ps1` 当时仍通过 `GetDlgItem`/`BM_CLICK`/窗口类名做验收断言；现已在 `ticket/v0.2-review-fixes` 上修正：验收断言只走控制通道，窗口级检查单独标注为 `ui` 自检，唯一保留的旧窗口检查是标注 `REMOVAL CHECK` 的删除断言。同时按审查意见，`Phase::Failure` 不再自动打开面板（只有无目标回退结果自动打开）。本文的计数与证据已按本轮重跑更新，见 [审查修复记录](issue-review-fixes.md)。
+
 ## 结论摘要
 
 - 单击状态胶囊展开/收起第二个窗口——展开结果面板；面板也可由托盘左键、托盘菜单「打开结果面板」、`--control show` 和 `--control panel` 打开。Esc、标题栏关闭按钮和面板内「关闭」都能收起。
 - 面板显示两部分：上方是状态区（当前阶段、一句人话说明、实时采集进度、应用给出的完整 `detail`），下方是**完整当前转写文本**；两者都是只读多行 EDIT，可滚动、可选择、可 Ctrl+C，程序内没有任何改动这段文字的路径。
 - 按钮：`复制完整结果`（只写剪贴板，不粘贴、不发送）、`重试本地识别`、`清理失败音频`、`精修（即将可用）`（明确置灰的占位，等 #21 接线）、`关闭`。重试/清理的可用性与托盘菜单共用 `panel::recovery_available`，两个表面不会不一致。
-- 没有目标输入框时结果只出现在面板里并可复制；`Delivery::Fallback` 的结果和任何 `Phase::Failure` 会自动打开面板（每次事件只自动打开一次，用户关掉后不会每 100 ms 重开），成功追加从不自动打开，自动打开不抢焦点。
+- 没有目标输入框时结果只出现在面板里并可复制；**只有** `Delivery::Fallback` 的结果会自动打开面板（每次事件只自动打开一次，用户关掉后不会每 100 ms 重开）。成功追加从不自动打开；`Phase::Failure` 也不自动打开——失败时胶囊变红，由用户点开面板查看原因（#20 故事 10）。自动打开不抢焦点。
 - 原详情窗口（`ListenCaptureToCopyWindowV1`、状态 EDIT、备用文本框、五个按钮）已不存在；运行中的进程只有三个顶层窗口：胶囊、结果面板、隐藏的属主窗口。代码与脚本里不再引用旧窗口类名或旧控件 ID。
-- 自动化验收不再依赖窗口类名/控件 ID：`--control`、`status.txt`、`panel.txt`、`current-result.txt` 覆盖面板的全部可观察行为。#24 可直接按本文“自动化契约”驱动。
-- 真实 `listen.exe` 桌面验收：`scripts\verify-panel.ps1` **86 项检查全部通过**；回归运行 #19 的 `scripts\verify-capsule.ps1` **40 项检查全部通过**。全套测试 **122 passed / 12 ignored**，`cargo fmt --check` 通过，release 构建成功。
+- 自动化验收（acceptance）**只走控制通道**：`--control show|panel|copy|start|stop|retry|cleanup|quit`、`status.txt`、`panel.txt`、`current-result.txt`。`scripts\verify-panel.ps1` 把检查分成三组并在结果里分别计数：`acceptance`（控制通道）、`ui`（窗口级自检）和 `removal`。唯一保留的旧窗口断言是**删除检查**：`ListenCaptureToCopyWindowV1` 不再存在，输出中标注 `REMOVAL CHECK`。#24 可按本文“自动化契约”驱动；`ui` 自检不属于验收，#24 不得依赖。
+- 真实 `listen.exe` 桌面验收：`scripts\verify-panel.ps1` **PASS**——验收（控制通道）43/43、窗口级自检 42/42、删除检查 1/1。全套测试与格式、构建结果见下文。
 
 ## 实现
 
@@ -20,17 +22,17 @@
 - 采集进度行用 `Snapshot::progress.received_samples`、`recognized_segments`、`pending_segments` 现算，写在长 `detail` 之前，打开面板即可看到“已接收 N 秒”，不需要滚动。
 - `result_text(&Snapshot)`：完整转写文本；为空时给占位符（第一次使用、只有失败时）。
 - `text(&Snapshot)`：`status_text + 空行 + result_text`，即 `panel.txt` 的完整内容，也是面板两个只读框的拼接。
-- `auto_open_key(&Snapshot) -> Option<String>`：`Failure` 与 `Result+Fallback` 各给出一个稳定 key（失败按 `detail`、回退结果按完整文本）。GUI 记住上次已处理的 key：同一事件不会反复打开，用户关掉后保持关闭；下一次新的失败/新的回退结果会重新打开；成功追加返回 `None`。
+- `auto_open_key(&Snapshot) -> Option<String>`：**只对 `Result+Fallback`** 给出稳定 key（按完整文本）。GUI 记住上次已处理的 key：同一事件不会反复打开，用户关掉后保持关闭；下一次新的回退结果会重新打开；成功追加和任何 `Phase::Failure` 都返回 `None`。
 - `actions(&Snapshot)`：`copy = 有文本`；`retry`/`cleanup = recovery_available`；`refine` 在 #21 之前恒为 `false`。
 - `recovery_available`：非采集/非处理/非准备中且有保留音频；托盘菜单与面板按钮共用。
 - `position(capsule, work, width, height, gap)`：水平以胶囊为中心，优先放在胶囊下方；下方放不下时放上方；都放不下时夹到工作区底部。始终夹进胶囊所在显示器的工作区，不覆盖任务栏、不出屏。`size(scale)` 按 `dpi/96` 缩放（640×480 逻辑像素）。
 
-单元测试 17 个（`panel.rs`）＋1 个（`panel_window.rs` 的命令映射），覆盖：追加/回退区分、无语音时保留上一次结果、采集实时进度、失败原因与保留音频路径、准备失败不显示成就绪、空结果占位、自动打开的触发与去重、按钮可用性、托盘/面板可用性一致、DPI 缩放、上/下/夹取/多显示器/所有胶囊位置都在工作区内。
+单元测试 23 个（`panel.rs`，含本轮新增的 notice 渲染与“只有回退结果自动打开”断言）＋1 个（`panel_window.rs` 的命令映射），覆盖：追加/回退区分、无语音时保留上一次结果、采集实时进度、失败原因与保留音频路径、准备失败不显示成就绪、空结果占位、自动打开的触发与去重（仅 Fallback）、按钮可用性、托盘/面板可用性一致、DPI 缩放、上/下/夹取/多显示器/所有胶囊位置都在工作区内。
 
 ### 2. 面板窗口（`app/listen/src/panel_window.rs`）
 
 - 第二个顶层窗口，类名 `ListenResultPanelV1`（实现私有；验收不使用它）。`WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN`，扩展样式 `WS_EX_TOOLWINDOW | WS_EX_TOPMOST`：不进入任务栏/Alt+Tab，和胶囊一样置顶，但**没有** `WS_EX_NOACTIVATE`，所以用户点它时可以获得焦点去选择、Ctrl+C。
-- 打开：`ShowWindow(SW_SHOWNOACTIVATE)` + `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE)`。轮询更新、失败/回退自动打开都走这条路径，不会抢焦点。只有在用户自己点击面板时才会激活。
+- 打开：`ShowWindow(SW_SHOWNOACTIVATE)` + `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE)`。轮询更新与回退结果自动打开都走这条路径，不会抢焦点。只有在用户自己点击面板时才会激活。
 - 两个只读 `EDIT`：`ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL`，`EM_SETLIMITTEXT` 提到 `0x7ffffffe`。`Panel::apply` 只在文本真正变化时 `SetWindowTextW`，并在替换前后保存/恢复选择区与首个可见行，所以采集进度每 100 ms 更新也不会把用户正在读/选的位置弹回顶部。
 - 按钮行按 DPI 缩放布局；字体用 `Microsoft YaHei UI`（`CreateFontW`，失败时退回系统字体），`WM_DPICHANGED` 时重建字体并按建议矩形重排。
 - 位置在每次显示前重算：胶囊所在显示器的工作区、同显示器、工作区内夹取；`WM_SIZE`/`WM_DPICHANGED` 只做子控件布局。
@@ -46,7 +48,7 @@
 - 每次轮询（100 ms，快照变化时）：
   - 用同一份快照生成 `panel.txt`，内容变化才写；面板未打开时也写，所以自动化无需打开面板即可读取。
   - `status.txt` 保留全部既有键，新增 `panel_visible=1|0` 与 `panel_error=<创建失败原因，通常为空>`。
-  - 自动打开：`panel::auto_open_key` 与上次不同且非空时 `open_panel()`（创建/定位/填充/`ShowWindow` 均不激活）。
+  - 自动打开：`panel::auto_open_key` 与上次不同且非空时 `open_panel()`（创建/定位/填充/`ShowWindow` 均不激活）；只有回退结果会触发，失败不触发。
   - 把快照推给已存在的面板（文本 + 按钮可用性）。
 - 消息循环在面板可见时对每条消息调用 `IsDialogMessageW(panel, ...)`：Esc 关闭面板、Tab 在只读文本框与按钮之间移动；不属于面板的消息继续原样 `TranslateMessage`/`DispatchMessage`。
 - 退出：面板窗口随 `Ui` 销毁；隐藏属主窗口销毁时其 owned window（面板）一并销毁。
@@ -69,55 +71,63 @@
 | `runtime\status.txt` | 保留全部既有键；新增 `panel_visible=1\|0` 和 `panel_error=`（面板窗口创建失败时的原因，正常为空） |
 | `runtime\current-result.txt` | 语义不变：只保存完整当前转写文本 |
 
-面板可见性判定：轮询 `status.txt` 的 `panel_visible=`，需要等“文本”时轮询 `panel.txt`；需要“结果本身”时用 `current-result.txt`。**不要**用窗口类名 `ListenResultPanelV1`、控件 ID 或 UIA 来驱动验收——`scripts\verify-panel.ps1` 只在读回“可见文字是否等于 panel.txt”、按真实按钮、发 Esc 这些自检动作中使用私有类名/控件 ID，属于实现自检，不属于契约。
+面板可见性判定：轮询 `status.txt` 的 `panel_visible=`，需要等“文本”时轮询 `panel.txt`；需要“结果本身”时用 `current-result.txt`。**不要**用窗口类名 `ListenResultPanelV1`、控件 ID 或 UIA 来驱动验收。
+
+`scripts\verify-panel.ps1` 的检查分为三组，`panel-verification.json` 里每项都带 `kind`：
+
+| 组 | 用途 | 是否属于 #20 验收 |
+| --- | --- | --- |
+| `acceptance` | 只用 `--control`、`status.txt`、`panel.txt`、`current-result.txt`、剪贴板、进程退出码 | **是**，#24 可依赖 |
+| `ui` | 窗口级自检：置顶/工具窗样式、同显示器与工作区、不抢焦点、`panel.txt` 与两个只读控件逐字符一致、按钮可用性、胶囊单击/Esc/托盘菜单、截图 | 否，#24 不得依赖 |
+| `removal` | 唯一保留的旧窗口断言：`ListenCaptureToCopyWindowV1` 不再存在，输出中标注 `REMOVAL CHECK` | 删除检查，不是验收 oracle |
+
+也就是说：**验收断言全是控制通道**；窗口类名/控件 ID 只出现在明确标注的 `ui` 自检和那一条 `removal` 删除检查里。控制器与断言分开——采集仍需要真实桌面（聚焦探针窗口、播放一段音频）作为**场景搭建**，但所有断言只读契约文件。
 
 ## 验收证据
 
 ### 命令与结果
 
 ```powershell
-& E:\luyin\.artifacts\run-cargo.ps1 -Task Test     -Manifest E:\luyin\.worktrees\issue-20\app\listen\Cargo.toml
-& E:\luyin\.artifacts\run-cargo.ps1 -Task Build    -Manifest E:\luyin\.worktrees\issue-20\app\listen\Cargo.toml
-& E:\luyin\.artifacts\run-cargo.ps1 -Task CheckFormat -Manifest E:\luyin\.worktrees\issue-20\app\listen\Cargo.toml
-& E:\luyin\.worktrees\issue-20\scripts\verify-panel.ps1
-& E:\luyin\.worktrees\issue-20\scripts\verify-capsule.ps1
+& E:\luyin\.artifacts\run-cargo.ps1 -Task Test       -Manifest <worktree>\app\listen\Cargo.toml -TargetDir E:\luyin\.artifacts\cargo-target-review-fixes
+& E:\luyin\.artifacts\run-cargo.ps1 -Task Build      -Manifest <worktree>\app\listen\Cargo.toml -TargetDir E:\luyin\.artifacts\cargo-target-review-fixes
+& E:\luyin\.artifacts\run-cargo.ps1 -Task CheckFormat -Manifest <worktree>\app\listen\Cargo.toml -TargetDir E:\luyin\.artifacts\cargo-target-review-fixes
+& <worktree>\scripts\verify-panel.ps1 -Exe E:\luyin\.artifacts\cargo-target-review-fixes\release\listen.exe -Runtime E:\luyin\.artifacts\issue-review-fixes\panel-runtime -Evidence E:\luyin\.artifacts\issue-review-fixes
 ```
 
-- 测试：lib 38 + bin 23（胶囊 5 + 面板 18）+ 27 + 4 + 6 + 4 + 11 + 2 + 7 = **122 passed, 0 failed, 12 ignored**；新增 18 个面板测试，旧测试无改动。
+- 测试（v0.2 审查修复后）：**163 passed, 0 failed, 14 ignored**；较基线 156 passed / 13 ignored 新增 7 个测试（4 个复制失败/胶囊无法隐藏的用户提示、1 个回填 300 ms 预算、1 个面板 notice 渲染、1 个打包术语表冗余别名验证），并新增 1 个默认忽略的真引擎 whisper 对比测试。
 - 格式：`cargo fmt --check` 退出码 0。
-- 构建：`Finished release profile ... in 9.1s`，该 release `listen.exe` 用于下面的桌面验收。
-- `verify-panel.ps1`：**Result: PASS (86 checks, 0 failures)**，证据 `.artifacts\issue-20\panel-verification.json`。
-- `verify-capsule.ps1`（#19 回归）：**Result: PASS (40 checks, 0 failures)**，证据 `.artifacts\issue-19\capsule-verification.json`。
+- 构建：release `listen.exe` 用于下面的桌面验收。
+- `verify-panel.ps1`：**Result: PASS**——验收（控制通道）43/43、窗口级自检 42/42、删除检查 1/1，证据 `.artifacts\issue-review-fixes\panel-verification.json`。
+- `verify-capsule.ps1`（#19 回归）：#20 合并时 40/40 通过，本轮未重跑（胶囊窗口未改动），记录见 `.artifacts\issue-19\capsule-verification.json`。
 
 ### 截图
 
 | 证据 | 内容 |
 | --- | --- |
-| `.artifacts\issue-20\panel-ready.png` | 就绪态面板：状态说明、完整 `detail`、占位结果、复制禁用、精修置灰 |
-| `.artifacts\issue-20\panel-capturing.png` | 采集中：`正在采集（实时进度）`、`已接收 1.5 秒音频；识别窗口已完成 0 个，待处理 0 个。`、设备 `detail` |
-| `.artifacts\issue-20\panel-fallback.png` | 无目标回退结果：`已完成：结果只在面板中`、原因、完整结果文本、复制可用 |
-| `.artifacts\issue-20\panel-failure.png` | 模型缺失失败：`失败`、完整失败原因（含缺失模型路径）、复制/重试/清理均禁用 |
-| `.artifacts\issue-20\tray-menu.png` | 托盘菜单：`打开结果面板` 在第一位，开始/停止、重试（灰）、清理（灰）、分隔线、退出 |
+| `.artifacts\issue-review-fixes\panel-ready.png` | 就绪态面板：状态说明、完整 `detail`、占位结果、复制禁用、精修置灰 |
+| `.artifacts\issue-review-fixes\panel-capturing.png` | 采集中：`正在采集（实时进度）`、实时接收秒数、设备 `detail` |
+| `.artifacts\issue-review-fixes\panel-fallback.png` | 无目标回退结果：`已完成：结果只在面板中`、原因、完整结果文本、复制可用 |
+| `.artifacts\issue-review-fixes\panel-failure.png` | 模型缺失失败：`失败`、完整失败原因（含缺失模型路径）、复制/重试/清理均禁用 |
+| `.artifacts\issue-review-fixes\tray-menu.png` | 托盘菜单：`打开结果面板` 在第一位，开始/停止、重试（灰）、清理（灰）、分隔线、退出 |
 
 面板尺寸 800×600（125% DPI 下的 640×480 逻辑像素），窗口矩形 `560,91–1360,691`，位于胶囊 `822,48 275×33` 下方 10 设备像素（8 逻辑像素 × 1.25）；同一显示器工作区内。
 
 ### 真实链路验收流程（`verify-panel.ps1` 实际执行）
 
-1. 新运行时目录启动 `listen.exe`（默认 SenseVoice），等待 `Ready`。检查 `panel.txt` 已存在、`panel_visible=0`、全部旧 `status.txt` 键仍在、`panel_error=` 为空、面板窗口在请求前不可见、没有旧类名窗口。
-2. `--control show`：面板出现；`panel_visible=1`；`WS_EX_TOOLWINDOW|WS_EX_TOPMOST`、与胶囊同显示器、完全位于工作区、DPI 与胶囊一致、胶囊没有被移动；前台窗口不变（记录句柄 67294，`took_focus=false`）；`panel.txt` 与两个只读控件拼接逐字符相等；复制按钮禁用、精修按钮禁用。
+1. 新运行时目录启动 `listen.exe`（默认 SenseVoice），等待 `Ready`。检查 `panel.txt` 已存在、`panel_visible=0`、全部既有 `status.txt` 键（含本轮的 `notice`、`timing_capture_start_ms`）仍在、`panel_error=` 为空；随后做唯一的旧窗口删除检查。
+2. `--control show`：`panel_visible=1`（验收）；窗口级自检另查 `WS_EX_TOOLWINDOW|WS_EX_TOPMOST`、与胶囊同显示器、完全位于工作区、DPI 与胶囊一致、胶囊没有被移动、前台窗口没有被 Listen 抢走（只在“变成前台”时判失败）、`panel.txt` 与两个只读控件拼接逐字符相等、复制按钮禁用、精修按钮禁用。
 3. `--control copy`（无结果）：剪贴板哨兵值保持不变。
-4. `--control panel` 收起、再展开；胶囊单击收起、再展开；Esc 收起；托盘左键展开。
-5. 托盘右键菜单：菜单窗口出现；菜单句柄可读；6 项（含分隔线）；第一项文本等于「打开结果面板」；重试/清理此时置灰；`WM_CANCELMODE` 关闭；随后按菜单会发出的 `WM_COMMAND(ID_SHOW=104)` 打开面板。
-6. 采集：聚焦一个无编辑能力的探针窗口（保证本次采集不绑定任何可写目标，避免在共享桌面上误写别的应用），`--control start`，播放 `zh-term.wav` 到默认多媒体端点；打开面板并等待 1.5 s：`panel.txt` 含采集 `detail` 与实时接收秒数（本次 1.5 s）。随后收起面板，证明回退结果是**自己**打开面板的。
-7. `--control stop`：轮询到 `Processing` 时 `panel.txt` 含 `Processing locally`；结束后 `Phase=Result`、`detail` 含 `fallback text box`、`panel_visible=1`、面板可见、前台不是 Listen；`current-result.txt` 非空；`panel.txt` 含完整结果与原因，且与可见文本一致；结果控件文本与 `current-result.txt` 逐字符相等；复制按钮启用、重试/清理禁用。
-8. `--control copy` 与面板内真实 `复制完整结果` 按钮（`BM_CLICK`）都把完整结果放进剪贴板（与 `current-result.txt` 相等）。
-9. 静音采集：收起面板后 `start→2 s→stop`，得到 `NoSpeech`；`current-result.txt` 不变；`panel_visible=0`（不自动打开）；`panel.txt` 含 `No valid speech detected` 且仍保留上一次结果。
-10. `--control quit` 干净退出；无残留进程。
-11. 失败自动打开：新运行时目录、`--sensevoice-model <missing>` 启动；`Phase=Failure`、`preparation=Failed`；`panel_visible=1` 且面板可见（面板此前从未创建过，证明首次自动创建路径）；`panel.txt` 含完整失败原因，与可见文本一致；复制/重试/清理禁用、精修禁用；自动打开不抢焦点；`--control quit` 干净退出。
+4. `--control panel` 收起、再展开（验收，看 `panel_visible`）；胶囊单击、Esc、托盘左键/托盘菜单（窗口级自检）。
+5. 采集：聚焦一个无编辑能力的探针窗口（保证本次采集不绑定任何可写目标，避免在共享桌面上误写别的应用），`--control start`；`status.txt` 记录 `timing_capture_start_ms` 且小于 1 s；播放 `zh-term.wav` 到默认多媒体端点；打开面板并等待 1.5 s：`panel.txt` 含采集 `detail` 与实时接收秒数。随后收起面板，证明回退结果是**自己**打开面板的。
+6. `--control stop`：在停止控制进程退出前就开始轮询，`Processing` 时 `panel.txt` 含 `Processing locally`；结束后 `Phase=Result`、`detail` 含 `expanded result panel`、`panel_visible=1`；`current-result.txt` 非空；`panel.txt` 含完整结果与原因，且（自检）与可见文本一致；复制按钮启用、重试/清理禁用。
+7. `--control copy` 把完整结果放进剪贴板（与 `current-result.txt` 相等）；面板内真实 `复制完整结果` 按钮（`BM_CLICK`）是窗口级自检。
+8. 静音采集：收起面板后 `start→2 s→stop`，得到 `NoSpeech`；`current-result.txt` 不变；`panel_visible=0`（不自动打开）；`panel.txt` 含 `No valid speech detected` 且仍保留上一次结果。
+9. `--control quit` 干净退出；无残留进程。
+10. **失败不再自动打开**：新运行时目录、`--sensevoice-model <missing>` 启动；`Phase=Failure`、`preparation=Failed`、`panel_visible=0`；`--control show` 后 `panel_visible=1`，`panel.txt` 含完整失败原因（与可见文本一致，自检）；复制/重试/清理禁用、精修禁用；`--control quit` 干净退出。
 
 ### 与胶囊的关系
 
-`--control show` 不再只是“把胶囊置顶”，而是打开面板；托盘左键同样打开面板。`verify-capsule.ps1` 的胶囊自检（样式、共享隐身、拖动位置、不抢焦点、托盘菜单打开/关闭）在合并后重跑仍 40/40 通过；胶囊点击现在会切换面板，但点击本身仍不改变前台窗口、不移动胶囊。
+`--control show` 不再只是“把胶囊置顶”，而是打开面板；托盘左键同样打开面板。胶囊点击现在会切换面板，但点击本身仍不改变前台窗口、不移动胶囊。`verify-capsule.ps1` 的胶囊自检在 #20 合并时 40/40 通过，本轮审查修复没有改动胶囊窗口，未重跑；胶囊单击/Esc/托盘菜单在本轮 `verify-panel.ps1` 的 `ui` 自检中通过。
 
 ## 旧窗口依赖清理
 
@@ -130,21 +140,22 @@
   - `scripts\verify-listen-package.ps1`：只读 `status.txt` 并调用 `--control quit`，不涉及窗口控件，未改。
   - `scripts\verify-capsule.ps1`：本就已迁到 `--control`/`status.txt`；仍在自检里用扩展样式找胶囊（#19 的私有查找），#24 不得使用。回归通过。
   - `scripts\verify-generic-editor.ps1`/`test-focused-editor.ps1`：针对外部编辑器的 UIA 验收，与 Listen 窗口无关，未改。
-- `status.txt` 的写节拍、`current-result.txt`、`latency.jsonl`、所有旧键与格式未变。
+- `status.txt` 的写节拍、`current-result.txt`、`latency.jsonl` 与全部既有键保持不变；本轮为审查修复新增 `notice=`（复制失败/胶囊无法从录屏隐藏时的用户提示）和 `timing_capture_start_ms=`（按下开始到进入采集的耗时）。旧键一个未删。
 
-## 留给 #21（精修）的部分
+## 精修（#21 已合并）
 
-- 面板上已有置灰的「精修（即将可用）」按钮（控件 ID 204）。#21 接线时：在 `panel::actions` 用快照里的精修可用性替换恒 `false`；让 `command_for_control(ID_REFINE)` 返回一个新命令；在 `gui::panel_command` 里分发到精修端口；把按钮文案改成可用态。
-- 精修结果回填与“目标被手改不覆盖”的安全边界在应用层（#21），面板只负责在不可追加时展示结果；`panel.txt` 会自动跟着快照走，不需要新增文件。
-- 单测 `only_the_documented_controls_produce_owner_commands` 明确断言 `ID_REFINE → None`，接线时需同步更新。
+- 面板上的「精修」按钮已接线：`Refine::Available` 时可用，`Running`/`Applied`/`NotApplied`/`Failed` 时置灰并显示原因；按钮命令经 `COMMAND_REFINE` 分发到应用层。
+- 精修结果回填与“目标被手改不覆盖”的安全边界在应用层（#21）；面板只负责在不可追加时展示精修文本。`panel.txt` 自动跟着快照走，没有新增文件。
+- 没有 `DEEPSEEK_API_KEY` 时按钮显示 `精修（不可用）`，本地识别不受影响。
 
 ## 偏差与风险
 
 - **面板常驻置顶**：需求要求“靠近胶囊、别被其他窗口盖住”，因此面板与胶囊一样 `WS_EX_TOPMOST`；用户关掉即消失。若后续觉得挡视线，可改普通 z-order，#20 的行为检查不受影响。
-- **自动打开用“事件 key”去重**：同一失败原因（相同 `detail`）不会在用户关闭后立刻重开；新的失败/新的回退结果会重开。这是刻意选择，避免每次轮询抢屏。
-- **共享桌面导致的前台检查抖动**：本机同时有其它 agent 在做 UI 自动化，验收中偶发前台窗口被外部改变；脚本对“打开面板不抢焦点”做最多 6 次短重试，最终证据运行第一次即稳定（记录前台 `0x106DE` 一类句柄）。真实单机不会遇到。
+- **自动打开用“事件 key”去重**：同一条回退结果不会在用户关闭后立刻重开；新的回退结果会重开。失败不再自动打开，所以不存在“每次轮询抢屏”的问题。这是刻意选择。
+- **共享桌面导致的前台检查抖动**：本机同时有其它 agent 在做 UI 自动化，窗口级自检中偶发前台窗口被外部改变；脚本把“打开面板不抢焦点”判为**只有 Listen 从非前台变成前台才失败**，并做最多 6 次短重试。它属于 `ui` 自检，不是验收。
 - **桌面追加路径未单独截图**：无目标/回退路径已真机验证；“成功追加不自动打开面板”由 `panel::auto_open_key` 的单元测试覆盖（`Appended → None`），真实追加路径留给 #24 的全量回归（那边本来就要覆盖目标追加）。
-- **真实识别内容质量不属 #20**：本次证据里的转写文本来自当前 SenseVoice + 术语表链路，个别词有误（例如 `deep harness`），属 #17/#18/#22 的质量范围；面板只保证“原样显示/复制应用给出的完整结果”。
+- **真实识别内容质量不属 #20**：本次证据里的转写文本来自当前 SenseVoice + 术语表链路，个别词有误（例如 `deep seek harness` 未命中内置条目时保持原样），属 #17/#18/#22 的质量范围；面板只保证“原样显示/复制应用给出的完整结果”。
 - **新旧实例共存**：`--control` 仍按窗口类名找实例（#19 行为），如果同时运行另一份 Listen 构建，控制命令可能落到那个实例。验收脚本要求本可执行文件的实例为唯一实例；没有改这个既有协议。
-- **根 `README.md` 与 `packaging\README.md` 仍描述 v0.1 主窗口**：本次只更新了代码/脚本与 `--control` 帮助文本，包与 README 属 #23 的交付物；`packaging\README.md` 未改，避免与 #23 冲突。
+- **README 已同步**：本轮修复把根 `README.md` 更新到 v0.2 现状，并把 `packaging\README.md` 改成如实描述“当前包仍是 whisper.cpp，换包是 #23”，不再声称 SenseVoice 已在交付包内。
+- **本轮未重跑 `verify-capsule.ps1`**：审查修复没有改动胶囊窗口；#20 合并时的 40/40 回归记录保留在 [issue-19 验证记录](issue-19-verification.md)。胶囊单击/Esc/托盘菜单在本轮 `verify-panel.ps1` 的 `ui` 自检里仍通过。
 - 未运行 `cargo clippy`：该工具链未安装 clippy 组件（离线环境无法补装）。

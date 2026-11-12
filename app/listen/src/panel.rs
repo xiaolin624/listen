@@ -169,6 +169,12 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     if !detail.is_empty() {
         lines.push(detail.to_string());
     }
+    // A condition outside the capture flow (a failed copy, a capsule the platform
+    // refused to hide from screen capture) is shown after the phase detail so the
+    // user reads what happened and what it means without opening a log file.
+    if let Some(notice) = &snapshot.notice {
+        lines.push(notice.text());
+    }
     // The refine state is an action line, not a phase: it says whether the 精修
     // button can act and, once it ran, whether the text was written back.
     if let Some(note) = refine_note(snapshot) {
@@ -211,14 +217,19 @@ pub fn text(snapshot: &Snapshot) -> String {
 
 /// Why (and when) the panel should open without the user clicking it.
 ///
+/// Only a fallback delivery qualifies: issue #20 asks for click-to-toggle and its
+/// story 5 wants a result with no valid target to be reachable without the user
+/// discovering the capsule. A failure does not open the panel — the capsule turns
+/// red and the user clicks it to read the reason (#20's story 10) — so a failure
+/// never steals the screen.
+///
 /// The key is stable for one event, so the caller can remember the last key it
-/// acted on: the same fallback result or the same failure never re-opens a panel the
-/// user has just closed, while a new failure or result does. `None` means "this
-/// state is not a reason to open". A successful append is never one: the text is
-/// already in the target and the capsule stays calm.
+/// acted on: the same fallback result never re-opens a panel the user has just
+/// closed, while a new fallback result does. `None` means "this state is not a
+/// reason to open". A successful append is never one: the text is already in the
+/// target and the capsule stays calm.
 pub fn auto_open_key(snapshot: &Snapshot) -> Option<String> {
     match snapshot.phase {
-        Phase::Failure => Some(format!("failure:{}", snapshot.detail)),
         Phase::Result if snapshot.delivery == Some(Delivery::Fallback) => {
             Some(format!("fallback:{}", snapshot.text))
         }
@@ -306,6 +317,7 @@ mod tests {
             timing: Timing::default(),
             refine: Refine::Unavailable("No DeepSeek API key is configured".into()),
             refined_text: None,
+            notice: None,
         }
     }
 
@@ -430,6 +442,31 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_is_rendered_in_the_status_block_and_never_hides_the_result() {
+        let mut state = result("完整结果", Delivery::Fallback);
+        state.notice = Some(listen::Notice::CopyFailed(
+            "the clipboard is locked by another application".into(),
+        ));
+        let shown = text(&state);
+        assert!(
+            shown.contains(
+                "Could not copy the result: the clipboard is locked by another application"
+            ),
+            "{shown}"
+        );
+        assert!(shown.contains("The clipboard was not replaced"), "{shown}");
+        assert!(shown.ends_with("完整结果"), "{shown}");
+
+        state.notice = Some(listen::Notice::CaptureExcluded("Access is denied".into()));
+        let shown = text(&state);
+        assert!(
+            shown.contains("could not be hidden from screen capture"),
+            "{shown}"
+        );
+        assert!(shown.contains("Access is denied"), "{shown}");
+    }
+
+    #[test]
     fn an_empty_result_gets_a_placeholder_but_the_status_stays_readable() {
         let state = snapshot(Phase::Ready, Preparation::Ready);
         assert_eq!(result_text(&state), "（还没有可复制的转写文本）");
@@ -437,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_open_fires_for_fallback_results_and_failures_only() {
+    fn auto_open_fires_only_for_a_fallback_result() {
         assert_eq!(
             auto_open_key(&result("完整文本", Delivery::Appended)),
             None,
@@ -448,16 +485,18 @@ mod tests {
             "a fallback result must be reachable immediately"
         );
 
+        // Issue #20 asks for a click-to-toggle panel; story 5 only wants the
+        // no-target fallback to be reachable without discovery. A failure already
+        // turns the capsule red, and the user opens the panel to read why.
         let mut failure = snapshot(Phase::Failure, Preparation::Ready);
         failure.detail = "Recognition failed".into();
-        let first = auto_open_key(&failure).expect("failure opens the panel");
         assert_eq!(
             auto_open_key(&failure),
-            Some(first.clone()),
-            "the same failure must not re-open a panel the user closed"
+            None,
+            "a failure must not open the panel by itself"
         );
-        failure.detail = "Recognition failed differently".into();
-        assert_ne!(auto_open_key(&failure), Some(first));
+        failure.retry_available = true;
+        assert_eq!(auto_open_key(&failure), None);
 
         for phase in [
             Phase::Preparing,
@@ -475,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn every_new_fallback_or_failure_produces_a_new_auto_open_key() {
+    fn every_new_fallback_result_produces_a_new_auto_open_key() {
         let first = auto_open_key(&result("第一段", Delivery::Fallback));
         let second = auto_open_key(&result("第二段", Delivery::Fallback));
         assert!(first.is_some() && second.is_some());

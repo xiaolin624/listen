@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)][ValidateSet('plain', 'rich')][string]$Target,
     [ValidateSet('normal', 'rebuild', 'readonly')][string]$Scenario = 'normal',
     [string]$ToolsRoot = '',
@@ -293,7 +293,7 @@ try {
     $expectedDelivery = if ($expectFallback) { 'Some(Fallback)' } else { 'Some(Appended)' }
     if ($delivery -ne $expectedDelivery) { throw "Delivery mismatch: expected $expectedDelivery, observed $delivery. Detail: $detail" }
     if ($expectFallback) {
-        if ($detail -notlike '*fallback text box*') { throw "Fallback detail did not explain the fallback result: $detail" }
+        if ($detail -notlike '*expanded result panel*') { throw "Fallback detail did not explain the fallback result: $detail" }
         if ($Scenario -eq 'rebuild' -and $detail -notlike '*no longer available*' -and $detail -notlike '*rebuilt*') {
             throw "Fallback detail did not explain the rebuilt target: $detail"
         }

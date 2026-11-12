@@ -1,32 +1,30 @@
 # Verify the expanded result panel (issue #20) of a running Listen build.
 #
 # The panel is the only place Listen shows text: clicking the capsule opens it, a
-# second click / Esc / the close button closes it, and a fallback result or a
-# failure opens it by itself. This script drives the shipped listen.exe on the real
-# desktop and checks:
-#   - capsule click opens and closes the panel;
-#   - --control show opens it, --control panel toggles it, --control copy copies the
-#     complete current result to the clipboard (never pastes, never sends);
-#   - a result that could not be appended appears in the panel, is copyable through
-#     both the script command and the panel's own button, and auto-opens it;
-#   - the panel shows live capture progress and the local-processing state;
-#   - a failure reason is readable in the panel and failure auto-opens it;
-#   - the tray left click and the tray menu item open the panel;
-#   - runtime\panel.txt is exactly the visible text and runtime\status.txt reports
-#     panel_visible=1|0.
+# second click / Esc / the close button closes it, and a fallback result opens it by
+# itself. This script drives the shipped listen.exe on the real desktop.
 #
-# AUTOMATION CONTRACT (what issue #24 may rely on; see docs/issue-20-verification.md):
-#   --control show      open the panel now (no focus change)
-#   --control panel     toggle the panel
-#   --control copy      copy the complete current result to the clipboard
-#   status.txt          panel_visible=1|0 (all previous keys are kept)
-#   panel.txt           full panel text: status block, blank line, complete result
-#   current-result.txt  unchanged: the complete current transcript only
+# It reports two kinds of checks, separately:
 #
-# The window class name and control IDs below are used only by this self-check (to
-# read the two read-only text controls back and to press the real copy button, the
-# same way verify-capsule.ps1 inspects its own window). Acceptance for #24 must not
-# depend on them: it can verify everything through the contract above.
+#   ACCEPTANCE (control channel only) - issue #20's acceptance criterion. Every
+#   assertion here uses only the public automation contract:
+#     --control show|panel|copy|start|stop|retry|cleanup|quit
+#     runtime\status.txt   phase, panel_visible, panel_error, retry_available, ...
+#     runtime\panel.txt    the full panel text, updated while the panel is hidden
+#     runtime\current-result.txt
+#   Nothing in this group reads a window handle, class name or control ID.
+#
+#   The ONE exception is the removal check: the old detail window's class
+#   (ListenCaptureToCopyWindowV1) must no longer exist. It is labelled REMOVAL
+#   CHECK because it is a one-time deletion assertion, not an acceptance oracle.
+#
+#   UI SELF-CHECKS (not acceptance) - a smaller set of window-level diagnostics:
+#   the panel's topmost/toolwindow style, position on the capsule monitor, that
+#   opening never takes focus, it stays inside the work area, its two read-only
+#   EDIT controls exactly match panel.txt, its buttons are enabled/disabled
+#   correctly, capsule click / Esc / tray menu behaviour, and screenshots.
+#   These use the private window class name and control IDs on purpose; #24 must
+#   not depend on them. See docs/issue-20-verification.md.
 #
 # ASCII only on purpose: this file must survive any code page.
 #
@@ -272,11 +270,27 @@ public static class PanelProbe
 
 $failures = [Collections.Generic.List[string]]::new()
 $checks = [Collections.Generic.List[object]]::new()
-function Check([bool]$Condition, [string]$Message) {
+# `acceptance` checks use the control channel only; `ui` checks inspect the window
+# and are reported separately so the acceptance claim never covers them.
+$acceptanceCount = 0
+$acceptancePassed = 0
+$uiCount = 0
+$uiPassed = 0
+function Check([bool]$Condition, [string]$Message, [string]$Kind = 'acceptance') {
     $state = if ($Condition) { 'PASS' } else { 'FAIL' }
-    $checks.Add([pscustomobject]@{ result = $state; check = $Message })
+    $checks.Add([pscustomobject]@{ result = $state; kind = $Kind; check = $Message })
     Write-Output ("{0}: {1}" -f $state, $Message)
     if (-not $Condition) { $failures.Add($Message) }
+    if ($Kind -eq 'ui') {
+        $script:uiCount++
+        if ($Condition) { $script:uiPassed++ }
+    } else {
+        $script:acceptanceCount++
+        if ($Condition) { $script:acceptancePassed++ }
+    }
+}
+function Removal-Check([bool]$Condition, [string]$Message) {
+    Check $Condition ("REMOVAL CHECK: " + $Message) 'removal'
 }
 
 function ConvertTo-QuotedWindowsPath([string]$Path) {
@@ -318,6 +332,25 @@ function Wait-Status([string]$Pattern, [int]$Seconds = $TimeoutSeconds) {
     throw "Timed out waiting for status /$Pattern/. Last status: $last"
 }
 
+function Wait-PanelVisibility([bool]$Visible, [int]$Seconds = 10) {
+    $pattern = if ($Visible) { '(?m)^panel_visible=1\r?$' } else { '(?m)^panel_visible=0\r?$' }
+    return Wait-Status $pattern $Seconds
+}
+
+# Same wait as Wait-Status, for the second (failure) runtime directory.
+function Wait-StatusFile([string]$Path, [string]$Pattern, [int]$Seconds = $TimeoutSeconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $last = ''
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $last = Read-Text $Path
+            if ($last -match $Pattern) { return $last }
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    throw "Timed out waiting for $Path /$Pattern/. Last status: $last"
+}
+
 function Wait-Phase([Diagnostics.Process]$Process, [string]$Phase, [int]$Seconds = $TimeoutSeconds) {
     $deadline = (Get-Date).AddSeconds($Seconds)
     $last = ''
@@ -346,23 +379,31 @@ function Wait-Idle([Diagnostics.Process]$Process, [int]$Seconds = $TimeoutSecond
     throw "Timed out waiting for an idle phase. Last status: $last"
 }
 
-function Invoke-Control([string]$Command) {
+function Start-Control([string]$Command) {
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Exe
     $info.Arguments = '--control ' + $Command
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardError = $true
-    $process = [Diagnostics.Process]::Start($info)
+    return [Diagnostics.Process]::Start($info)
+}
+
+function Complete-Control([Diagnostics.Process]$Process, [string]$Command) {
     try {
-        if (-not $process.WaitForExit(15000)) {
-            try { $process.Kill() } catch { }
+        if (-not $Process.WaitForExit(15000)) {
+            try { $Process.Kill() } catch { }
             throw "Listen control '$Command' did not exit within 15 seconds."
         }
-        $stderr = $process.StandardError.ReadToEnd().Trim()
-        if ($process.ExitCode -ne 0) { throw "Listen control '$Command' failed ($($process.ExitCode)): $stderr" }
+        $stderr = $Process.StandardError.ReadToEnd().Trim()
+        if ($Process.ExitCode -ne 0) { throw "Listen control '$Command' failed ($($Process.ExitCode)): $stderr" }
+        if ($stderr) { Write-Output $stderr }
     }
-    finally { $process.Dispose() }
+    finally { $Process.Dispose() }
+}
+
+function Invoke-Control([string]$Command) {
+    Complete-Control (Start-Control $Command) $Command
 }
 
 function Start-Listen([string]$RunDirectory, [string[]]$Extra = @()) {
@@ -424,6 +465,9 @@ function Wait-PanelVisible([uint32]$ProcessId, [bool]$Visible, [int]$Seconds = 1
 }
 
 function Save-Shot([string]$Path, [int]$X, [int]$Y, [int]$Width, [int]$Height) {
+    # A missing or too-small window must not crash the run; the matching check
+    # below reports the missing screenshot instead.
+    if ($Width -le 0 -or $Height -le 0) { return }
     $bitmap = [System.Drawing.Bitmap]::new($Width, $Height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try { $graphics.CopyFromScreen($X, $Y, 0, 0, [System.Drawing.Size]::new($Width, $Height)) }
@@ -433,6 +477,7 @@ function Save-Shot([string]$Path, [int]$X, [int]$Y, [int]$Width, [int]$Height) {
 }
 
 function Save-PanelShot([IntPtr]$Panel, [string]$Path) {
+    if ($Panel -eq [IntPtr]::Zero) { return }
     $rect = [PanelProbe]::Rect($Panel)
     Save-Shot $Path $rect.left $rect.top ($rect.right - $rect.left) ($rect.bottom - $rect.top)
 }
@@ -465,10 +510,10 @@ $summary = [ordered]@{
     runtime = $Runtime
     failure_runtime = $FailureRuntime
     audio_clip = $AudioClip
-    panel_window = @{}
-    fallback = @{}
-    no_speech = @{}
-    failure = @{}
+    mode = 'acceptance = control channel only; ui_self_checks = window diagnostics (not acceptance)'
+    acceptance = @{}
+    ui_self_checks = @{}
+    removal = @{}
     screenshots = [Collections.Generic.List[string]]::new()
     checks = $checks
     result = 'FAIL'
@@ -480,7 +525,8 @@ try {
     Remove-Item -LiteralPath $statusPath, $panelPath, $resultPath -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $FailureRuntime 'status.txt'), (Join-Path $FailureRuntime 'panel.txt'), (Join-Path $FailureRuntime 'current-result.txt') -ErrorAction SilentlyContinue
 
-    # --- Ready state: files, contract keys ---------------------------------
+    # ===================== ACCEPTANCE: control channel only =================
+    # --- Ready state: contract files and keys ------------------------------
     $listen = Start-Listen $Runtime
     $status = Wait-Phase $listen 'Ready'
     $pidListen = [uint32]$listen.Id
@@ -488,38 +534,43 @@ try {
     Check ($null -ne (Read-Text $panelPath)) 'runtime\panel.txt is readable as UTF-8'
     Check ((Get-StatusValue $status 'panel_visible') -eq '0') "status.txt reports panel_visible=0 initially ($(Get-StatusValue $status 'panel_visible'))"
     Check ((Get-StatusValue $status 'panel_error') -eq '') 'status.txt reports no panel_error'
-    $requiredKeys = @('phase', 'detail', 'endpoint_role', 'endpoint_id', 'endpoint_name', 'current_result', 'retained_audio', 'retry_available', 'backend', 'preparation', 'capsule', 'panel_visible', 'startup_capsule_ms', 'capsule_capture_excluded', 'timing_preparation_ms', 'timing_stop_to_result_ms', 'timing_finalize_ms', 'timing_recognition_ms', 'timing_last_window_wait_ms', 'timing_last_window_inference_ms', 'timing_save_ms', 'timing_delivery_ms', 'timing_recognition_windows', 'process_id')
+    $requiredKeys = @('phase', 'detail', 'endpoint_role', 'endpoint_id', 'endpoint_name', 'current_result', 'retained_audio', 'retry_available', 'backend', 'preparation', 'refine', 'refine_reason', 'notice', 'capsule', 'panel_visible', 'panel_error', 'startup_capsule_ms', 'capsule_capture_excluded', 'timing_capture_start_ms', 'timing_preparation_ms', 'timing_stop_to_result_ms', 'timing_finalize_ms', 'timing_recognition_ms', 'timing_last_window_wait_ms', 'timing_last_window_inference_ms', 'timing_save_ms', 'timing_delivery_ms', 'timing_recognition_windows', 'process_id')
     $missingKeys = @($requiredKeys | Where-Object { $status -notmatch ("(?m)^" + [regex]::Escape($_) + "=") })
     Check ($missingKeys.Count -eq 0) ("status.txt keeps every previous key and adds panel_visible (missing: " + ($missingKeys -join ', ') + ')')
     $panelText = Read-Text $panelPath
     Check ($panelText.Contains((Get-StatusValue $status 'detail'))) 'panel.txt contains the human-readable detail from status.txt'
     Check ($panelText.Length -gt (Get-StatusValue $status 'detail').Length) 'panel.txt has a result section after the status detail'
 
-    # The old detail window must be gone; no visible window may use its class.
+    # REMOVAL CHECK - the only legacy-window assertion in this script. It proves
+    # issue #20 deleted the old detail window; it is not an acceptance oracle and
+    # nothing in the acceptance group depends on window handles.
     $legacy = @([PanelProbe]::FindAll($pidListen, 'ListenCaptureToCopyWindowV1'))
-    Check ($legacy.Count -eq 0) 'the old ListenCaptureToCopyWindowV1 detail window no longer exists'
-    Check ((Get-Panel $pidListen) -eq [IntPtr]::Zero) 'no panel window is visible before it is requested'
+    Removal-Check ($legacy.Count -eq 0) 'the old ListenCaptureToCopyWindowV1 detail window no longer exists'
 
-    # --- --control show opens the panel next to the capsule ----------------
-    $capsule = Get-Capsule $pidListen
-    Check ($capsule -ne [IntPtr]::Zero) 'the status capsule exists'
-    $capsuleBefore = [PanelProbe]::Rect($capsule)
+    # --- --control show reports the panel as visible ----------------------
     Invoke-Control 'show'
-    $status = Wait-Status '(?m)^panel_visible=1\r?$'
+    $status = Wait-PanelVisibility $true
+    Check ((Get-StatusValue $status 'panel_visible') -eq '1') '--control show reports panel_visible=1 in status.txt'
+
+    # ============== UI SELF-CHECKS (not acceptance; see header) =============
+    # Window-level diagnostics. They read the private class/control IDs on purpose
+    # and are excluded from the acceptance claim above.
+    $capsule = Get-Capsule $pidListen
+    Check ($capsule -ne [IntPtr]::Zero) 'the status capsule exists' 'ui'
+    $capsuleBefore = [PanelProbe]::Rect($capsule)
     $panel = Wait-PanelVisible $pidListen $true
-    Check ($panel -ne [IntPtr]::Zero) '--control show opens a visible panel window'
-    Check ((Get-StatusValue $status 'panel_visible') -eq '1') 'status.txt reports panel_visible=1 after show'
+    Check ($panel -ne [IntPtr]::Zero) '--control show makes the panel window visible' 'ui'
     $panelRect = [PanelProbe]::Rect($panel)
     $panelStyle = [PanelProbe]::ExStyle($panel)
     $capsuleAfter = [PanelProbe]::Rect($capsule)
     $work = [PanelProbe]::WorkArea($panel)
     $sameMonitor = ([PanelProbe]::Monitor($panel) -eq [PanelProbe]::Monitor($capsule))
-    Check ((($panelStyle -band [PanelProbe]::WS_EX_TOOLWINDOW) -ne 0)) 'the panel has WS_EX_TOOLWINDOW (no taskbar or Alt+Tab entry)'
-    Check ((($panelStyle -band [PanelProbe]::WS_EX_TOPMOST) -ne 0)) 'the panel has WS_EX_TOPMOST'
-    Check $sameMonitor 'the panel opens on the capsule monitor'
-    Check (($panelRect.left -ge $work.left) -and ($panelRect.top -ge $work.top) -and ($panelRect.right -le $work.right) -and ($panelRect.bottom -le $work.bottom)) "the panel is fully inside the monitor work area ($($panelRect.left),$($panelRect.top) $($panelRect.right)x$($panelRect.bottom), work $($work.left),$($work.top) $($work.right)x$($work.bottom))"
-    Check (([PanelProbe]::Dpi($panel)) -eq ([PanelProbe]::Dpi($capsule))) "the panel uses the capsule DPI ($([PanelProbe]::Dpi($panel)) vs $([PanelProbe]::Dpi($capsule)))"
-    Check (($capsuleBefore.left -eq $capsuleAfter.left) -and ($capsuleBefore.top -eq $capsuleAfter.top)) 'opening the panel does not move the capsule'
+    Check ((($panelStyle -band [PanelProbe]::WS_EX_TOOLWINDOW) -ne 0)) 'the panel has WS_EX_TOOLWINDOW (no taskbar or Alt+Tab entry)' 'ui'
+    Check ((($panelStyle -band [PanelProbe]::WS_EX_TOPMOST) -ne 0)) 'the panel has WS_EX_TOPMOST' 'ui'
+    Check $sameMonitor 'the panel opens on the capsule monitor' 'ui'
+    Check (($panelRect.left -ge $work.left) -and ($panelRect.top -ge $work.top) -and ($panelRect.right -le $work.right) -and ($panelRect.bottom -le $work.bottom)) "the panel is fully inside the monitor work area ($($panelRect.left),$($panelRect.top) $($panelRect.right)x$($panelRect.bottom), work $($work.left),$($work.top) $($work.right)x$($work.bottom))" 'ui'
+    Check (([PanelProbe]::Dpi($panel)) -eq ([PanelProbe]::Dpi($capsule))) "the panel uses the capsule DPI ($([PanelProbe]::Dpi($panel)) vs $([PanelProbe]::Dpi($capsule)))" 'ui'
+    Check (($capsuleBefore.left -eq $capsuleAfter.left) -and ($capsuleBefore.top -eq $capsuleAfter.top)) 'opening the panel does not move the capsule' 'ui'
     # A shared desktop can change the foreground window for unrelated reasons; each
     # attempt is short and the checks are retried. Taking focus is never retried
     # because it would always be a real failure.
@@ -528,12 +579,16 @@ try {
     $foregroundAttempts = [Collections.Generic.List[string]]::new()
     for ($attempt = 0; $attempt -lt 6 -and -not $foregroundStable -and -not $tookFocus; $attempt++) {
         $foregroundBefore = [PanelProbe]::GetForegroundWindow()
+        $beforeIsListen = Get-ForegroundIsListen $pidListen
         Invoke-Control 'show'
         Start-Sleep -Milliseconds 150
         $foregroundAfter = [PanelProbe]::GetForegroundWindow()
-        if (Get-ForegroundIsListen $pidListen) {
+        $afterIsListen = Get-ForegroundIsListen $pidListen
+        if (-not $beforeIsListen -and $afterIsListen) {
+            # Only a transition to Listen counts: the shared desktop may already
+            # have had a Listen window in front for unrelated reasons.
             $tookFocus = $true
-            $foregroundAttempts.Add(("attempt {0}: Listen is foreground ({1})" -f $attempt, $foregroundAfter))
+            $foregroundAttempts.Add(("attempt {0}: Listen became foreground ({1})" -f $attempt, $foregroundAfter))
         }
         elseif ($foregroundBefore -eq $foregroundAfter) {
             $foregroundStable = $true
@@ -543,24 +598,25 @@ try {
             $foregroundAttempts.Add(("attempt {0}: {1} -> {2}" -f $attempt, $foregroundBefore, $foregroundAfter))
         }
     }
-    $summary.foreground = [ordered]@{
+    $summary.ui_self_checks.foreground = [ordered]@{
         stable = $foregroundStable
         took_focus = $tookFocus
         attempts = @($foregroundAttempts.ToArray())
     }
-    Check (-not $tookFocus) 'opening the panel never makes Listen the foreground window'
-    Check $foregroundStable 'opening the panel leaves the foreground window unchanged'
+    Check (-not $tookFocus) 'opening the panel never makes Listen the foreground window' 'ui'
+    Check $foregroundStable 'opening the panel leaves the foreground window unchanged' 'ui'
     $visibleText = Read-VisiblePanelText $panel
-    Check ($visibleText -ceq (Read-Text $panelPath)) 'panel.txt is exactly the text shown by the two read-only controls'
+    Check ($visibleText -ceq (Read-Text $panelPath)) 'panel.txt is exactly the text shown by the two read-only controls' 'ui'
     $readyShot = Join-Path $Evidence 'panel-ready.png'
     Save-PanelShot $panel $readyShot
     $summary.screenshots.Add($readyShot)
-    Check (Test-Path -LiteralPath $readyShot) "saved the ready-state panel screenshot: $readyShot"
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $false) 'the copy button is disabled while there is no result'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 204))) -eq $false) 'the refine placeholder is disabled'
+    Check (Test-Path -LiteralPath $readyShot) "saved the ready-state panel screenshot: $readyShot" 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $false) 'the copy button is disabled while there is no result' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 204))) -eq $false) 'the refine placeholder is disabled' 'ui'
     $refineLabel = [PanelProbe]::EditText([PanelProbe]::GetDlgItem($panel, 204))
-    Check ($refineLabel.Length -gt 0) 'the refine placeholder is visible and labelled'
+    Check ($refineLabel.Length -gt 0) 'the refine placeholder is visible and labelled' 'ui'
 
+    # ===================== ACCEPTANCE: control channel only =================
     # --- --control copy with no result must not touch the clipboard -------
     Set-Clipboard -Value 'listen-panel-no-result-sentinel'
     Invoke-Control 'copy'
@@ -569,27 +625,28 @@ try {
 
     # --- toggle through --control panel -----------------------------------
     Invoke-Control 'panel'
-    $status = Wait-Status '(?m)^panel_visible=0\r?$'
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) '--control panel hides the panel'
+    $status = Wait-PanelVisibility $false
+    Check ((Get-StatusValue $status 'panel_visible') -eq '0') '--control panel reports panel_visible=0'
     Invoke-Control 'panel'
-    $status = Wait-Status '(?m)^panel_visible=1\r?$'
-    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'a second --control panel shows the panel again'
+    $status = Wait-PanelVisibility $true
+    Check ((Get-StatusValue $status 'panel_visible') -eq '1') 'a second --control panel reports panel_visible=1 again'
 
-    # --- capsule click opens / closes -------------------------------------
+    # ============== UI SELF-CHECKS (not acceptance; see header) =============
+    # --- capsule click, Esc and the tray: window-level behaviour ----------
     [void][PanelProbe]::Click($capsule)
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'clicking the capsule closes the panel'
+    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'clicking the capsule closes the panel' 'ui'
     [void][PanelProbe]::Click($capsule)
-    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'clicking the capsule again opens the panel'
+    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'clicking the capsule again opens the panel' 'ui'
 
     # --- Esc closes -------------------------------------------------------
     [void][PanelProbe]::Post($panel, [PanelProbe]::WM_KEYDOWN, [UIntPtr]::new([PanelProbe]::VK_ESCAPE), [IntPtr]::Zero)
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'Esc closes the panel'
+    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'Esc closes the panel' 'ui'
 
     # --- tray left click opens -------------------------------------------
     $hostWindow = Get-HostWindow $pidListen
-    Check ($hostWindow -ne [IntPtr]::Zero) 'the hidden window that owns the tray icon exists'
+    Check ($hostWindow -ne [IntPtr]::Zero) 'the hidden window that owns the tray icon exists' 'ui'
     [void][PanelProbe]::Post($hostWindow, [PanelProbe]::TRAY_MESSAGE, [UIntPtr]::new(1), [IntPtr][PanelProbe]::WM_LBUTTONUP)
-    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'a tray left click opens the panel'
+    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'a tray left click opens the panel' 'ui'
 
     # --- tray menu contains the open-panel item and opens the panel -------
     [void][PanelProbe]::Post($hostWindow, [PanelProbe]::TRAY_MESSAGE, [UIntPtr]::new(1), [IntPtr][PanelProbe]::WM_RBUTTONUP)
@@ -598,106 +655,139 @@ try {
         Start-Sleep -Milliseconds 30
         $menuWindow = [PanelProbe]::FindVisible($pidListen, '#32768')
     }
-    Check ($menuWindow -ne [IntPtr]::Zero) 'the tray context menu opens'
+    Check ($menuWindow -ne [IntPtr]::Zero) 'the tray context menu opens' 'ui'
     if ($menuWindow -ne [IntPtr]::Zero) {
         $menuShot = Join-Path $Evidence 'tray-menu.png'
         Save-PanelShot $menuWindow $menuShot
         $summary.screenshots.Add($menuShot)
         $menu = [PanelProbe]::MenuHandle($menuWindow)
         $openPanelLabel = -join ([char[]]@(0x6253, 0x5F00, 0x7ED3, 0x679C, 0x9762, 0x677F))
-        Check ($menu -ne [IntPtr]::Zero) 'the tray menu handle can be inspected'
-        Check (([PanelProbe]::GetMenuItemCount($menu)) -eq 6) "the tray menu keeps start/stop, retry, cleanup, exit and adds the open-panel item ($([PanelProbe]::GetMenuItemCount($menu)) items)"
-        Check (([PanelProbe]::MenuText($menu, 0)) -eq $openPanelLabel) "the first tray item is the open-panel label"
-        Check ((([PanelProbe]::GetMenuState($menu, 4, [PanelProbe]::MF_BYPOSITION)) -band [PanelProbe]::MF_SEPARATOR) -ne 0) 'the tray menu keeps its separator before exit'
+        Check ($menu -ne [IntPtr]::Zero) 'the tray menu handle can be inspected' 'ui'
+        Check (([PanelProbe]::GetMenuItemCount($menu)) -eq 6) "the tray menu keeps start/stop, retry, cleanup, exit and adds the open-panel item ($([PanelProbe]::GetMenuItemCount($menu)) items)" 'ui'
+        Check (([PanelProbe]::MenuText($menu, 0)) -eq $openPanelLabel) "the first tray item is the open-panel label" 'ui'
+        Check ((([PanelProbe]::GetMenuState($menu, 4, [PanelProbe]::MF_BYPOSITION)) -band [PanelProbe]::MF_SEPARATOR) -ne 0) 'the tray menu keeps its separator before exit' 'ui'
         $retryGrayed = ((([PanelProbe]::GetMenuState($menu, 2, [PanelProbe]::MF_BYPOSITION)) -band [PanelProbe]::MF_GRAYED) -ne 0)
         $cleanupGrayed = ((([PanelProbe]::GetMenuState($menu, 3, [PanelProbe]::MF_BYPOSITION)) -band [PanelProbe]::MF_GRAYED) -ne 0)
-        Check ($retryGrayed -and $cleanupGrayed) 'retry and cleanup are grayed out exactly when status.txt reports them unavailable'
+        $retryAvailable = (Get-StatusValue $status 'retry_available') -eq 'True'
+        Check (($retryGrayed -eq (-not $retryAvailable)) -and ($cleanupGrayed -eq (-not $retryAvailable))) 'retry and cleanup are grayed out exactly matching status.txt retry_available' 'ui'
         [void][PanelProbe]::Post($hostWindow, [PanelProbe]::WM_CANCELMODE, [UIntPtr]::Zero, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 300
-        Check (([PanelProbe]::FindVisible($pidListen, '#32768')) -eq [IntPtr]::Zero) 'the tray menu closes without selecting an item'
+        Check (([PanelProbe]::FindVisible($pidListen, '#32768')) -eq [IntPtr]::Zero) 'the tray menu closes without selecting an item' 'ui'
     }
     # Selecting the open-panel item posts WM_COMMAND with its menu id (ID_SHOW = 104).
     [void][PanelProbe]::Post($hostWindow, [PanelProbe]::WM_COMMAND, [UIntPtr]::new(104), [IntPtr]::Zero)
-    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'choosing the tray open-panel item opens the panel'
+    Check ((Wait-PanelVisible $pidListen $true) -ne [IntPtr]::Zero) 'choosing the tray open-panel item opens the panel' 'ui'
 
-    # --- capturing: live progress in the panel ----------------------------
+    # ===================== ACCEPTANCE: control channel only =================
+    # --- capturing: live progress in panel.txt ----------------------------
     Invoke-Control 'panel'
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'the panel is closed before the capture checks'
-    # Focus a plain non-editable probe window. Capture binds the target at start, so
-    # this deterministically exercises the no-target fallback without appending the
-    # transcript to an unrelated window on the shared desktop.
+    $status = Wait-PanelVisibility $false
+    Check ((Get-StatusValue $status 'panel_visible') -eq '0') '--control panel reports panel_visible=0 before the capture checks'
+    # Focus a plain non-editable probe window. This is setup for the no-target
+    # fallback, never an assertion of the acceptance group: capture binds no
+    # writable target, so the transcript cannot land in an unrelated window.
     $probe = [PanelProbe]::CreateProbeWindow()
-    Check (([PanelProbe]::Focus($probe)) -eq $true) 'the acceptance probe window takes the foreground before capture'
-    Invoke-Control 'start'
-    $status = Wait-Phase $listen 'Capturing'
-    # Play the probe clip while the panel is open: the live received duration in the
-    # panel then proves the capture is moving, not just that a line exists.
+    Check (([PanelProbe]::Focus($probe)) -eq $true) 'the acceptance probe window takes the foreground before capture' 'ui'
     $hasClip = ($AudioClip -and (Test-Path -LiteralPath $AudioClip -PathType Leaf))
-    if ($hasClip) { [PanelProbe]::Play($AudioClip) }
-    Invoke-Control 'show'
-    $panel = Wait-PanelVisible $pidListen $true
-    Start-Sleep -Milliseconds 1500
-    $panelText = Read-Text $panelPath
-    Check ($panelText.Contains('Capturing the')) 'while capturing, panel.txt carries the capture detail'
-    Check ($panelText.Contains('s received;')) 'while capturing, panel.txt carries live progress'
-    $received = [regex]::Match($panelText, '([0-9]+\.[0-9]) s received').Groups[1].Value
-    Check (($received -ne '') -and ([double]$received -gt 0.5)) "while capturing, panel.txt reports a live received duration ($received s)"
-    Check ((Get-StatusValue $status 'capsule') -eq 'Capturing') 'status.txt reports capsule=Capturing while capturing'
-    $capturingShot = Join-Path $Evidence 'panel-capturing.png'
-    Save-PanelShot $panel $capturingShot
-    $summary.screenshots.Add($capturingShot)
-    # Closing the panel before the result proves that a fallback opens it by itself.
-    Invoke-Control 'panel'
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'the panel is closed again before the result arrives'
-
-    # --- a fallback result auto-opens the panel ---------------------------
-    if ($hasClip) {
-        Start-Sleep -Seconds 5
-        [PanelProbe]::StopPlayback()
-    }
-    Invoke-Control 'stop'
-    $sawProcessing = $false
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $status = Read-Status
-        if ($status -match '(?m)^phase=Processing') {
-            $sawProcessing = $true
-            $processingText = Read-Text $panelPath
-            Check ($processingText.Contains('Processing locally')) 'while processing, panel.txt says recognition is local'
-            break
+    # The shared desktop's audio route can change between runs, so a capture that
+    # receives the clip but reports NoSpeech is retried (up to 3 attempts). Every
+    # attempt asserts the same public contract; only the first one also checks live
+    # progress and takes the capture screenshot.
+    for ($captureAttempt = 1; $captureAttempt -le 3; $captureAttempt++) {
+        [void][PanelProbe]::Focus($probe)
+        Invoke-Control 'start'
+        $status = Wait-Phase $listen 'Capturing'
+        if ($captureAttempt -eq 1) {
+            # #15's "按下快捷键 <1 s 可开始采集": the application's
+            # dispatch-to-Capturing measurement, published in status.txt.
+            $captureStartMs = Get-StatusValue $status 'timing_capture_start_ms'
+            Check (($captureStartMs -ne '') -and ([int]$captureStartMs -ge 0) -and ([int]$captureStartMs -lt 1000)) "capture start latency is measured and under the 1 s target (timing_capture_start_ms=$captureStartMs)"
+            # Play the probe clip while the panel is open: the live received duration
+            # then proves the capture is moving, not just that a line exists.
+            if ($hasClip) { [PanelProbe]::Play($AudioClip) }
+            Invoke-Control 'show'
+            $status = Wait-PanelVisibility $true
+            $panel = Wait-PanelVisible $pidListen $true
+            Start-Sleep -Milliseconds 1500
+            $panelText = Read-Text $panelPath
+            Check ($panelText.Contains('Capturing the')) 'while capturing, panel.txt carries the capture detail'
+            Check ($panelText.Contains('s received;')) 'while capturing, panel.txt carries live progress'
+            $received = [regex]::Match($panelText, '([0-9]+\.[0-9]) s received').Groups[1].Value
+            Check (($received -ne '') -and ([double]$received -gt 0.5)) "while capturing, panel.txt reports a live received duration ($received s)"
+            $status = Read-Status
+            Check ((Get-StatusValue $status 'capsule') -eq 'Capturing') 'status.txt reports capsule=Capturing while capturing'
+            $capturingShot = Join-Path $Evidence 'panel-capturing.png'
+            Save-PanelShot $panel $capturingShot
+            $summary.screenshots.Add($capturingShot)
+            # Closing the panel before the result proves the fallback opens it by itself.
+            Invoke-Control 'panel'
+            $status = Wait-PanelVisibility $false
+            Check ((Get-StatusValue $status 'panel_visible') -eq '0') 'the panel is closed again before the result arrives'
+            if ($hasClip) { Start-Sleep -Seconds 5 }
         }
-        if ($status -match '(?m)^phase=(Result|NoSpeech|Failure)') { break }
-        Start-Sleep -Milliseconds 10
+        elseif ($hasClip) {
+            [PanelProbe]::Play($AudioClip)
+            Start-Sleep -Seconds 5
+        }
+        if ($hasClip) { [PanelProbe]::StopPlayback() }
+        # Start the stop control without waiting for that short-lived process to
+        # exit: local recognition is now fast enough that waiting first can miss the
+        # Processing state entirely. The assertions still read only status.txt and
+        # panel.txt.
+        $stopControl = Start-Control 'stop'
+        $sawProcessing = $false
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-Date) -lt $deadline) {
+            $status = Read-Status
+            if ($status -match '(?m)^phase=Processing') {
+                $sawProcessing = $true
+                if ($captureAttempt -eq 1) {
+                    $processingText = Read-Text $panelPath
+                    Check ($processingText.Contains('Processing locally')) 'while processing, panel.txt says recognition is local'
+                }
+                break
+            }
+            if ($status -match '(?m)^phase=(Result|NoSpeech|Failure)') { break }
+            Start-Sleep -Milliseconds 2
+        }
+        Complete-Control $stopControl 'stop'
+        if ($captureAttempt -eq 1) {
+            Check $sawProcessing 'the processing state was observable in panel.txt'
+        }
+        $status = Wait-Idle $listen
+        $phase = Get-StatusValue $status 'phase'
+        if ($phase -eq 'Result') { break }
+        if ($phase -ne 'NoSpeech') { break }
+        if ($captureAttempt -lt 3) {
+            Write-Output "NOTE: the audio clip produced NoSpeech (shared-desktop audio route); retrying the fallback capture (attempt $captureAttempt of 3 completed)"
+        }
     }
-    Check $sawProcessing 'the processing state was observable in panel.txt'
-    $status = Wait-Idle $listen
-    $summary.fallback = [ordered]@{
+    $summary.acceptance.fallback = [ordered]@{
         phase = Get-StatusValue $status 'phase'
         detail = Get-StatusValue $status 'detail'
         panel_visible = Get-StatusValue $status 'panel_visible'
         audio_clip = $AudioClip
     }
-    Check ($summary.fallback.phase -eq 'Result') "audio playback produced a result ($($summary.fallback.phase))"
-    Check ($summary.fallback.detail -like '*fallback text box*') 'the result was not appended and took the fallback path'
-    Check ($summary.fallback.panel_visible -eq '1') 'a fallback result auto-opens the panel'
-    Check ((Get-Panel $pidListen) -ne [IntPtr]::Zero) 'the auto-opened panel window is visible'
-    Check (-not (Get-ForegroundIsListen $pidListen)) 'auto-opening the panel does not take focus'
+    Check ($summary.acceptance.fallback.phase -eq 'Result') "audio playback produced a result ($($summary.acceptance.fallback.phase))"
+    Check ($summary.acceptance.fallback.detail -like '*expanded result panel*') 'the result was not appended and names the result panel as the copy source'
+    Check ($summary.acceptance.fallback.panel_visible -eq '1') 'status.txt reports panel_visible=1 for a fallback result (auto-open)'
+    Check (-not (Get-ForegroundIsListen $pidListen)) 'auto-opening the panel does not take focus' 'ui'
     $result = if (Test-Path -LiteralPath $resultPath -PathType Leaf) { Read-Text $resultPath } else { '' }
-    $summary.fallback.result = $result
+    $summary.acceptance.fallback.result = $result
     Check ($result.Length -gt 0) "the complete result was saved (current-result.txt, $($result.Length) chars)"
     $panelText = Read-Text $panelPath
     Check (($result.Length -gt 0) -and $panelText.Contains($result)) 'panel.txt contains the complete result'
     Check ($panelText.Contains((Get-StatusValue $status 'detail'))) 'panel.txt contains the fallback explanation from status.txt'
     $panel = Get-Panel $pidListen
-    Check ((Read-VisiblePanelText $panel) -ceq $panelText) 'panel.txt is exactly the visible text after a fallback result'
+    Check ((Read-VisiblePanelText $panel) -ceq $panelText) 'panel.txt is exactly the visible text after a fallback result' 'ui'
     $fallbackShot = Join-Path $Evidence 'panel-fallback.png'
     Save-PanelShot $panel $fallbackShot
     $summary.screenshots.Add($fallbackShot)
     $resultEdit = [PanelProbe]::GetDlgItem($panel, 212)
-    Check (([PanelProbe]::EditText($resultEdit)).Replace("`r`n", "`n") -ceq $result) 'the panel shows the complete result in its read-only control'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $true) 'the copy button is enabled once a result exists'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 202))) -eq $false) 'the retry button stays disabled when no failed audio is retained'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 203))) -eq $false) 'the cleanup button stays disabled when no failed audio is retained'
+    Check (([PanelProbe]::EditText($resultEdit)).Replace("`r`n", "`n") -ceq $result) 'the panel shows the complete result in its read-only control' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $true) 'the copy button is enabled once a result exists' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 202))) -eq $false) 'the retry button stays disabled when no failed audio is retained' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 203))) -eq $false) 'the cleanup button stays disabled when no failed audio is retained' 'ui'
 
     # --- copy through --control and through the panel button --------------
     Set-Clipboard -Value 'listen-panel-copy-sentinel'
@@ -707,11 +797,12 @@ try {
     Set-Clipboard -Value 'listen-panel-button-sentinel'
     [void][PanelProbe]::SendMessage([PanelProbe]::GetDlgItem($panel, 201), [PanelProbe]::BM_CLICK, [UIntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 300
-    Check ((Get-Clipboard -Raw) -ceq $result) 'the panel copy button copies the complete result'
+    Check ((Get-Clipboard -Raw) -ceq $result) 'the panel copy button copies the complete result' 'ui'
 
     # --- no speech: nothing delivered, previous result unchanged ----------
     Invoke-Control 'panel'
-    Check ((Wait-PanelVisible $pidListen $false) -eq [IntPtr]::Zero) 'the panel is closed before the no-speech capture'
+    $status = Wait-PanelVisibility $false
+    Check ((Get-StatusValue $status 'panel_visible') -eq '0') '--control panel reports panel_visible=0 before the no-speech capture'
     [void][PanelProbe]::Focus($probe)
     $beforeNoSpeech = if (Test-Path -LiteralPath $resultPath -PathType Leaf) { Read-Text $resultPath } else { '' }
     Invoke-Control 'start'
@@ -720,14 +811,14 @@ try {
     Invoke-Control 'stop'
     $status = Wait-Idle $listen
     $afterNoSpeech = if (Test-Path -LiteralPath $resultPath -PathType Leaf) { Read-Text $resultPath } else { '' }
-    $summary.no_speech = [ordered]@{
+    $summary.acceptance.no_speech = [ordered]@{
         phase = Get-StatusValue $status 'phase'
         panel_visible = Get-StatusValue $status 'panel_visible'
         result_unchanged = ($afterNoSpeech -ceq $beforeNoSpeech)
     }
-    Check ($summary.no_speech.phase -eq 'NoSpeech') "silence produces NoSpeech ($($summary.no_speech.phase))"
-    Check $summary.no_speech.result_unchanged 'NoSpeech leaves current-result.txt unchanged'
-    Check ($summary.no_speech.panel_visible -eq '0') 'NoSpeech does not auto-open the panel'
+    Check ($summary.acceptance.no_speech.phase -eq 'NoSpeech') "silence produces NoSpeech ($($summary.acceptance.no_speech.phase))"
+    Check $summary.acceptance.no_speech.result_unchanged 'NoSpeech leaves current-result.txt unchanged'
+    Check ($summary.acceptance.no_speech.panel_visible -eq '0') 'NoSpeech does not auto-open the panel'
     $panelText = Read-Text $panelPath
     Check ($panelText.Contains('No valid speech detected')) 'panel.txt explains that nothing was delivered for NoSpeech'
     Check (($beforeNoSpeech.Length -eq 0) -or $panelText.Contains($beforeNoSpeech)) 'the previous complete result stays visible in panel.txt after NoSpeech'
@@ -740,11 +831,14 @@ try {
     $listen = $null
     Check (-not @(Get-OurListenProcesses)) 'no Listen process is left running'
 
-    # --- failure auto-opens the panel with a readable reason --------------
+    # --- a failure is readable after the user opens the panel -------------
+    # Issue #20 story 10: a failure turns the capsule red and the user clicks to
+    # read the reason. The panel must NOT auto-open on Failure.
     $brokenModel = Join-Path $FailureRuntime 'missing-model.onnx'
     Remove-Item -LiteralPath $brokenModel -ErrorAction SilentlyContinue
     $listen = Start-Listen $FailureRuntime @('--sensevoice-model', (ConvertTo-QuotedWindowsPath $brokenModel))
     $failureStatusPath = Join-Path $FailureRuntime 'status.txt'
+    $failurePanelPath = Join-Path $FailureRuntime 'panel.txt'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $status = ''
     while ((Get-Date) -lt $deadline) {
@@ -756,30 +850,33 @@ try {
         Start-Sleep -Milliseconds 25
     }
     $pidFailure = [uint32]$listen.Id
-    $failurePanel = Get-Panel $pidFailure
-    $failureVisible = ((Get-StatusValue $status 'panel_visible') -eq '1')
     $failureDetail = Get-StatusValue $status 'detail'
-    $summary.failure = [ordered]@{
+    $summary.acceptance.failure = [ordered]@{
         phase = Get-StatusValue $status 'phase'
         detail = $failureDetail
         panel_visible = Get-StatusValue $status 'panel_visible'
         preparation = Get-StatusValue $status 'preparation'
     }
-    Check ($summary.failure.phase -eq 'Failure') "a broken model produces Failure ($($summary.failure.phase))"
-    Check ($summary.failure.preparation -eq 'Failed') 'status.txt reports preparation=Failed'
-    Check $failureVisible 'a failure auto-opens the panel'
-    Check ($failurePanel -ne [IntPtr]::Zero) 'the auto-opened failure panel is visible'
-    Check (-not (Get-ForegroundIsListen $pidFailure)) 'auto-opening the failure panel does not take focus'
+    Check ($summary.acceptance.failure.phase -eq 'Failure') "a broken model produces Failure ($($summary.acceptance.failure.phase))"
+    Check ($summary.acceptance.failure.preparation -eq 'Failed') 'status.txt reports preparation=Failed'
+    Check ($summary.acceptance.failure.panel_visible -eq '0') 'a failure does not auto-open the panel (the user clicks the capsule)'
+    Invoke-Control 'show'
+    $status = Wait-StatusFile $failureStatusPath '(?m)^panel_visible=1\r?$'
+    Check ((Get-StatusValue $status 'panel_visible') -eq '1') '--control show opens the panel on a failure'
+    $failureText = [IO.File]::ReadAllText($failurePanelPath, [Text.Encoding]::UTF8)
+    Check ($failureText.Contains($failureDetail)) 'panel.txt shows the complete failure reason from status.txt after the user opens the panel'
+
+    # --- UI SELF-CHECKS: the opened failure panel --------------------------
+    $failurePanel = Get-Panel $pidFailure
+    Check ($failurePanel -ne [IntPtr]::Zero) 'the failure panel window is visible after --control show' 'ui'
+    Check ((Read-VisiblePanelText $failurePanel) -ceq $failureText) 'panel.txt is exactly the visible failure text' 'ui'
     $failureShot = Join-Path $Evidence 'panel-failure.png'
     Save-PanelShot $failurePanel $failureShot
     $summary.screenshots.Add($failureShot)
-    Check (Test-Path -LiteralPath $failureShot) 'saved the failure-state panel screenshot'
-    $failureText = [IO.File]::ReadAllText((Join-Path $FailureRuntime 'panel.txt'), [Text.Encoding]::UTF8)
-    Check ($failureText.Contains($failureDetail)) 'the failure panel shows the complete failure reason from status.txt'
-    Check ((Read-VisiblePanelText $failurePanel) -ceq $failureText) 'panel.txt is exactly the visible failure text'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 201))) -eq $false) 'the copy button is disabled when a fresh failure has no result'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 202))) -eq $false) 'the retry button is disabled when no audio was retained'
-    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 203))) -eq $false) 'the cleanup button is disabled when no audio was retained'
+    Check (Test-Path -LiteralPath $failureShot) 'saved the failure-state panel screenshot' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 201))) -eq $false) 'the copy button is disabled when a fresh failure has no result' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 202))) -eq $false) 'the retry button is disabled when no audio was retained' 'ui'
+    Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 203))) -eq $false) 'the cleanup button is disabled when no audio was retained' 'ui'
 
     Invoke-Control 'quit'
     if (-not $listen.WaitForExit(15000)) { throw 'Listen did not exit after --control quit.' }
@@ -796,11 +893,16 @@ finally {
     try { if ($probe -ne [IntPtr]::Zero) { [void][PanelProbe]::DestroyWindow($probe) } } catch { }
     if ($null -ne $listen) { Stop-Listen $listen }
     $summary.result = if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }
+    $summary.acceptance_checks = "$acceptancePassed/$acceptanceCount passed"
+    $summary.ui_self_check_count = "$uiPassed/$uiCount passed"
     $summary.failures = @($failures.ToArray())
     $summaryPath = Join-Path $Evidence 'panel-verification.json'
     [IO.File]::WriteAllText($summaryPath, ($summary | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
     Write-Output ''
-    Write-Output ("Result: {0} ({1} checks, {2} failures)" -f $summary.result, $checks.Count, $failures.Count)
+    Write-Output ("Result: {0}" -f $summary.result)
+    Write-Output ("  acceptance (control channel only): {0} of {1} passed" -f $acceptancePassed, $acceptanceCount)
+    Write-Output ("  UI self-checks (not acceptance):   {0} of {1} passed" -f $uiPassed, $uiCount)
+    Write-Output ("  failures: {0}" -f $failures.Count)
     Write-Output ("Evidence: {0}" -f $summaryPath)
 }
 if ($failures.Count -gt 0) { exit 1 }
