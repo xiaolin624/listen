@@ -6,17 +6,26 @@ publish = false
 
 [dependencies]
 hound = "3.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 windows = { version = "0.62.2", features = [
+  "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Media_Audio",
   "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Variant",
   "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
+  "Win32_Security_Cryptography",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Accessibility",
   "Win32_UI_Controls",
   "Win32_UI_Shell",
+  "Win32_UI_Shell_PropertiesSystem",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -1,5 +1,5 @@
 use crate::{Config, WasapiPlayback, Whisper};
-use listen::{Application, Control, Phase, Snapshot};
+use listen::{Application, Control, Delivery, Phase, Snapshot, target::NativeTargets};
 use std::{cell::RefCell, fs, sync::Arc};
 use windows::{
     Win32::{
@@ -25,6 +25,8 @@ const ID_TOGGLE: usize = 101;
 const ID_COPY: usize = 102;
 const ID_EXIT: usize = 103;
 const ID_SHOW: usize = 104;
+const ID_RETRY: usize = 105;
+const ID_CLEANUP: usize = 106;
 
 struct Ui {
     app: Application,
@@ -32,6 +34,8 @@ struct Ui {
     status: HWND,
     result: HWND,
     toggle: HWND,
+    retry: HWND,
+    cleanup: HWND,
     copy: HWND,
     exit: HWND,
     explanation: HWND,
@@ -81,6 +85,8 @@ pub fn control(command: &str) -> Result<(), String> {
         "toggle" => 3,
         "show" => 4,
         "quit" => 5,
+        "retry" => 6,
+        "cleanup" => 7,
         _ => return Err(format!("Unknown control command: {command}")),
     };
     unsafe {
@@ -157,7 +163,7 @@ pub fn run(config: Config) -> Result<(), String> {
             };
         let explanation = child(
             w!("STATIC"),
-            "Ctrl+Alt+R 开始 / 停止  ·  直接采集默认播放设备的全部声音  ·  本地识别",
+            "Ctrl+Alt+R 开始 / 停止  ·  仅采集默认多媒体播放设备（不含默认通信设备）  ·  本地识别",
             WINDOW_STYLE::default(),
             110,
         )?;
@@ -203,6 +209,18 @@ pub fn run(config: Config) -> Result<(), String> {
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             ID_COPY,
         )?;
+        let retry = child(
+            w!("BUTTON"),
+            "重试本地识别",
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            ID_RETRY,
+        )?;
+        let cleanup = child(
+            w!("BUTTON"),
+            "清理失败音频",
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            ID_CLEANUP,
+        )?;
         let exit = child(
             w!("BUTTON"),
             "退出",
@@ -212,21 +230,26 @@ pub fn run(config: Config) -> Result<(), String> {
         let registration = RegisterHotKey(Some(hwnd), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'R' as u32).map_err(|e| format!("Ctrl+Alt+R: {e}. Release this shortcut in the other application, then restart Listen."));
         let app = Application::new(
             Arc::new(WasapiPlayback),
-            Arc::new(Whisper {
-                executable: config.engine,
-                model: config.model,
-                language: config.language,
-                threads: config.threads,
-            }),
+            Arc::new(Whisper::with_backend(
+                config.engine,
+                config.model,
+                config.vad_model,
+                config.language,
+                config.threads,
+                config.backend,
+            )),
             config.runtime.clone(),
             registration,
-        );
+        )
+        .with_targets(Arc::new(NativeTargets));
         let mut state = Ui {
             app,
             hwnd,
             status,
             result,
             toggle,
+            retry,
+            cleanup,
             copy,
             exit,
             explanation,
@@ -283,7 +306,7 @@ impl Ui {
         let icon_id = match state.phase {
             Phase::Failure => IDI_ERROR,
             Phase::Capturing => IDI_WARNING,
-            Phase::Processing => IDI_INFORMATION,
+            Phase::Processing | Phase::Preparing => IDI_INFORMATION,
             _ => IDI_APPLICATION,
         };
         let mut data = NOTIFYICONDATAW {
@@ -308,8 +331,10 @@ impl Ui {
             let _ = MoveWindow(self.label, 16, 182, width, 24, true);
             let _ = MoveWindow(self.result, 16, 210, width, (bottom - 224).max(120), true);
             let _ = MoveWindow(self.toggle, 16, bottom, 140, 32, true);
-            let _ = MoveWindow(self.copy, 168, bottom, 160, 32, true);
-            let _ = MoveWindow(self.exit, (width - 104).max(340), bottom, 120, 32, true);
+            let _ = MoveWindow(self.retry, 164, bottom, 150, 32, true);
+            let _ = MoveWindow(self.cleanup, 322, bottom, 150, 32, true);
+            let _ = MoveWindow(self.copy, 480, bottom, 160, 32, true);
+            let _ = MoveWindow(self.exit, (width - 136).max(648), bottom, 120, 32, true);
         }
     }
 
@@ -329,6 +354,10 @@ impl Ui {
                     || last.detail != state.detail
                     || last.text != state.text
                     || last.retained_audio != state.retained_audio
+                    || last.delivery != state.delivery
+                    || last.retry_available != state.retry_available
+                    || last.backend != state.backend
+                    || last.timing != state.timing
             });
             if !changed {
                 return;
@@ -344,6 +373,9 @@ impl Ui {
             );
             if self.quit_requested {
                 detail.push_str("\r\nFinishing the current operation before exiting.");
+            }
+            if let Some(backend) = &state.backend {
+                detail.push_str(&format!("\r\nBackend: {backend}"));
             }
             if !self.tray {
                 detail.push_str(
@@ -379,29 +411,95 @@ impl Ui {
                     "停止并转写"
                 } else if state.phase == Phase::Processing {
                     "正在本机转写…"
+                } else if state.phase == Phase::Preparing {
+                    "正在准备本地模型…"
                 } else {
                     "开始采集"
                 },
             );
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                 self.toggle,
-                state.phase != Phase::Processing,
+                !matches!(state.phase, Phase::Processing | Phase::Preparing),
+            );
+            let idle = !matches!(
+                state.phase,
+                Phase::Capturing | Phase::Processing | Phase::Preparing
+            );
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                self.retry,
+                idle && state.retry_available,
+            );
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                self.cleanup,
+                idle && state.retry_available,
             );
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                 self.copy,
                 !state.text.is_empty(),
             );
+            let timing = &state.timing;
             let status = format!(
-                "phase={:?}\ndetail={}\ncurrent_result={}\nretained_audio={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.role.as_str())
+                    .unwrap_or(""),
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.id.as_str())
+                    .unwrap_or(""),
+                state
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.name.as_str())
+                    .unwrap_or(""),
                 self.runtime.join("current-result.txt").display(),
                 state
                     .retained_audio
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
-                    .join(" | ")
+                    .join(" | "),
+                state.retry_available,
+                state.backend.as_deref().unwrap_or(""),
+                timing
+                    .preparation_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .stop_to_result_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .finalize_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .recognition_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .last_window_wait_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .last_window_inference_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .save_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing
+                    .delivery_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                timing.recognition_windows,
+                std::process::id()
             );
             if let Err(error) = fs::write(self.runtime.join("status.txt"), status) {
                 let _ = text(
@@ -427,16 +525,30 @@ impl Ui {
                         &mut icon.szInfo,
                         match state.phase {
                             Phase::Capturing => {
-                                "Capturing the default playback device. Ctrl+Alt+R stops."
+                                "Capturing the default multimedia playback endpoint. Ctrl+Alt+R stops."
                             }
                             Phase::Processing => {
                                 "Recognizing locally. Wait for the current result."
                             }
+                            Phase::Preparing => {
+                                "Preparing the local model. Capture starts after Ready."
+                            }
                             Phase::Result => {
-                                "Current result is available in the fallback text box. Copy and send manually."
+                                if state.delivery == Some(Delivery::Appended) {
+                                    "Appended to the original target. Review and send manually."
+                                } else {
+                                    "Check the original target, then use the complete fallback result."
+                                }
+                            }
+                            Phase::NoSpeech => {
+                                "No valid speech detected. Nothing was delivered; the previous result is unchanged."
                             }
                             Phase::Failure => {
-                                "The operation failed. Open Listen for details and retained audio paths."
+                                if state.retry_available {
+                                    "Recognition failed. The captured audio is retained; open Listen to retry locally."
+                                } else {
+                                    "The operation failed. Open Listen for details and retained audio paths."
+                                }
                             }
                             _ => "Ready. Ctrl+Alt+R starts playback capture.",
                         },
@@ -444,7 +556,10 @@ impl Ui {
                 }
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &icon);
             }
-            if phase_changed && matches!(state.phase, Phase::Result | Phase::Failure) {
+            if phase_changed
+                && (state.phase == Phase::Failure
+                    || (state.phase == Phase::Result && state.delivery != Some(Delivery::Appended)))
+            {
                 self.show();
             }
             self.last = Some(state.clone());
@@ -460,6 +575,8 @@ impl Ui {
                 1 => self.app.dispatch(Control::Start),
                 2 => self.app.dispatch(Control::Stop),
                 3 | ID_TOGGLE => self.app.dispatch(Control::Toggle),
+                6 | ID_RETRY => self.app.dispatch(Control::Retry),
+                7 | ID_CLEANUP => self.app.dispatch(Control::CleanupAudio),
                 4 | ID_SHOW => self.show(),
                 5 | ID_EXIT => {
                     self.quit_requested = true;
@@ -492,6 +609,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         };
         let _ = AppendMenuW(menu, MF_STRING, ID_SHOW, w!("显示当前结果"));
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, w!("开始 / 停止  Ctrl+Alt+R"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_RETRY, w!("重试本地识别"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_CLEANUP, w!("清理失败音频"));
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -531,7 +650,7 @@ unsafe extern "system" fn window_proc(
         }
         if message == WM_GETMINMAXINFO {
             let limits = &mut *(lparam.0 as *mut MINMAXINFO);
-            limits.ptMinTrackSize = POINT { x: 620, y: 500 };
+            limits.ptMinTrackSize = POINT { x: 900, y: 500 };
             return LRESULT(0);
         }
         let handled = UI.with(|slot| {

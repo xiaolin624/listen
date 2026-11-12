@@ -1,25 +1,34 @@
 use listen::{
-    AppResult, Application, CapturedAudio, Control, LocalTranscriber, Phase, PlaybackAudio,
-    Recording,
+    AppResult, Application, CapturedAudio, Control, Delivery, LocalTranscriber, Phase,
+    PlaybackAudio, Recording, Target, TargetSelection,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+const TRANSCRIPT: &str = "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀";
+
 struct Runtime(PathBuf);
 impl Runtime {
     fn new() -> Self {
+        // The wall clock alone is not unique: parallel tests can read the same
+        // tick, and one Runtime::drop would then delete another test's directory.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "listen-flow-{}-{}",
+            "listen-flow-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -121,6 +130,74 @@ fn hotkey_start_stop_delivers_complete_copyable_current_result_and_removes_tempo
     );
 }
 
+struct NoSpeechModel;
+impl LocalTranscriber for NoSpeechModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, _audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        Ok(" \r\n\t".into())
+    }
+}
+
+#[test]
+fn no_valid_speech_reports_no_speech_and_keeps_the_previous_copyable_result() {
+    let runtime = Runtime::new();
+    let previous = "原来的完整转写。\nReview the API response before sending.";
+    fs::write(runtime.0.join("current-result.txt"), previous).unwrap();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.snapshot().phase == Phase::Processing {
+        assert!(Instant::now() < deadline);
+        app.poll();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let result = app.snapshot();
+    assert_eq!(result.phase, Phase::NoSpeech);
+    assert!(result.detail.contains("No valid speech"), "{result:?}");
+    assert_eq!(result.text, previous);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        previous
+    );
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        !fs::read_dir(&runtime.0)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_dir()),
+        "successful no-speech recognition must clean its audio"
+    );
+    app.dispatch(Control::Stop);
+    assert_eq!(app.snapshot().text, previous);
+}
+
+#[test]
+fn no_speech_without_a_previous_result_leaves_the_fallback_empty_and_allows_another_capture() {
+    let runtime = Runtime::new();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    );
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::NoSpeech);
+    assert!(result.text.is_empty());
+    assert!(!runtime.0.join("current-result.txt").exists());
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    app.dispatch(Control::Toggle);
+    assert!(await_phase(&mut app, Phase::NoSpeech).text.is_empty());
+}
+
 struct FailedModel;
 impl LocalTranscriber for FailedModel {
     fn check_ready(&self) -> AppResult<()> {
@@ -166,6 +243,365 @@ fn local_backend_failure_keeps_recoverable_audio_and_explains_failure() {
         failure.retained_audio,
         "repeated stop must not lose recoverable audio"
     );
+}
+
+/// Fails the first `failures` recognition calls, then returns the known transcript.
+/// Every call records the exact audio path it was asked to recognize, so the test can
+/// prove that a retry reuses the retained capture instead of demanding a replay.
+struct RepairableModel {
+    failures: usize,
+    calls: AtomicUsize,
+    attempts: Mutex<Vec<(PathBuf, usize)>>,
+}
+impl RepairableModel {
+    fn new(failures: usize) -> Self {
+        Self {
+            failures,
+            calls: AtomicUsize::new(0),
+            attempts: Mutex::new(Vec::new()),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+impl LocalTranscriber for RepairableModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
+        let duration = wav.duration() as usize;
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.attempts
+            .lock()
+            .unwrap()
+            .push((audio.path.clone(), duration));
+        if call < self.failures {
+            Err("whisper.cpp process could not start: missing runtime DLL".into())
+        } else {
+            Ok(TRANSCRIPT.into())
+        }
+    }
+}
+
+#[test]
+fn failed_recognition_offers_retry_on_the_retained_audio_and_cleans_it_after_success() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    assert_eq!(failure.retained_audio.len(), 1);
+    let retained = failure.retained_audio[0].clone();
+    assert!(retained.is_file());
+    assert_eq!(model.calls(), 1);
+
+    app.dispatch(Control::Retry);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(!result.retry_available);
+    assert!(result.retained_audio.is_empty());
+    assert!(
+        !retained.exists(),
+        "a successful retry must clean its audio"
+    );
+    assert_eq!(model.calls(), 2);
+    let attempts = model.attempts.lock().unwrap();
+    assert_eq!(
+        attempts[0].0, retained,
+        "the failed attempt used this audio"
+    );
+    assert_eq!(
+        attempts[1].0, retained,
+        "the retry must reuse the same retained audio, not a new capture"
+    );
+    assert!(attempts[1].1 > 0);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    assert!(
+        !fs::read_dir(&runtime.0)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_dir()),
+        "a successful retry must leave no session audio directory"
+    );
+}
+
+#[test]
+fn a_retry_that_fails_again_keeps_the_same_audio_retryable_until_it_succeeds() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(2));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let first_failure = await_phase(&mut app, Phase::Failure);
+    let retained = first_failure.retained_audio[0].clone();
+    assert!(first_failure.retry_available);
+
+    app.dispatch(Control::Retry);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    // A held retry control must not start a second recognition on the same audio.
+    app.dispatch(Control::Retry);
+    assert!(app.snapshot().detail.contains("Still processing"));
+    let second_failure = await_phase(&mut app, Phase::Failure);
+    assert!(
+        second_failure.detail.contains("Local retry failed"),
+        "{second_failure:?}"
+    );
+    assert!(second_failure.retry_available);
+    assert_eq!(second_failure.retained_audio, [retained.clone()]);
+    assert!(second_failure.text.is_empty());
+    assert!(retained.is_file(), "a failed retry must keep its audio");
+    assert_eq!(model.calls(), 2);
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert!(!result.retry_available);
+    assert!(!retained.exists());
+    assert_eq!(model.calls(), 3);
+    let attempts = model.attempts.lock().unwrap();
+    assert!(
+        attempts.iter().all(|(path, _)| *path == retained),
+        "every retry must reuse the retained audio: {attempts:?}"
+    );
+}
+
+#[test]
+fn retry_delivers_to_the_target_bound_at_capture_start_not_to_later_focus() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available);
+
+    // The failed capture stays the only pending capture: starting another one
+    // cannot mix its target, result, or audio with the retry.
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Failure);
+    assert!(
+        app.snapshot()
+            .detail
+            .contains("before starting a new capture"),
+        "{:?}",
+        app.snapshot()
+    );
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
+    assert_eq!(result.text, TRANSCRIPT);
+    assert!(result.retained_audio.is_empty());
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "the retry must append only to the target bound at capture start"
+    );
+    assert_eq!(
+        desktop.drafts[1], "另一个输入框",
+        "the input focused at retry time must never receive the result"
+    );
+    assert_eq!(desktop.replace_calls, 1, "one retry performs one delivery");
+}
+
+#[test]
+fn retry_without_a_valid_original_target_uses_the_fallback_not_the_retry_time_focus() {
+    let runtime = Runtime::new();
+    let mut editors = Editors::with_drafts("原有草稿", "重试时获得焦点");
+    editors.focused = None;
+    let editors = Arc::new(Mutex::new(editors));
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    editors.lock().unwrap().focused = Some(1);
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("No supported editable target"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "重试时获得焦点"]);
+    assert_eq!(
+        desktop.replace_calls, 0,
+        "no target was bound, so the retry writes nothing"
+    );
+}
+
+#[test]
+fn cleaning_failed_audio_updates_the_state_and_prevents_invalid_retries() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableModel::new(2));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    let retained = failure.retained_audio[0].clone();
+    assert!(failure.retry_available);
+
+    app.dispatch(Control::CleanupAudio);
+    let cleared = app.snapshot();
+    assert_eq!(cleared.phase, Phase::Failure);
+    assert!(!cleared.retry_available);
+    assert!(cleared.retained_audio.is_empty());
+    assert!(
+        !retained.exists(),
+        "cleaning must delete the retained audio"
+    );
+    assert!(
+        cleared.detail.contains("deleted at your request"),
+        "{cleared:?}"
+    );
+
+    let calls_without_audio = model.calls();
+    app.dispatch(Control::Retry);
+    app.poll();
+    assert_eq!(
+        model.calls(),
+        calls_without_audio,
+        "a cleaned failure must not invoke the local model again"
+    );
+    let after_retry = app.snapshot();
+    assert_eq!(after_retry.phase, Phase::Failure);
+    assert!(after_retry.text.is_empty());
+    assert!(after_retry.detail.contains("No retained audio"));
+}
+
+#[test]
+fn unconfirmed_retry_write_keeps_one_fallback_and_later_controls_never_append_it_again() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().unconfirmed = true;
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("could not be confirmed"),
+        "{result:?}"
+    );
+    assert!(!result.retry_available);
+    assert_eq!(
+        editors.lock().unwrap().drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}")
+    );
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+
+    // The write was already attempted once for this result: a retry control must
+    // not append the same text again, and must not restore or revert the target.
+    for control in [Control::Retry, Control::Stop, Control::Retry] {
+        app.dispatch(control);
+    }
+    app.poll();
+    assert_eq!(app.snapshot().phase, Phase::Result);
+    assert_eq!(app.snapshot().text, TRANSCRIPT);
+    assert!(!app.snapshot().retry_available);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "an unconfirmed write must never be duplicated by a retry operation"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+    assert_eq!(model.calls(), 2, "a result-phase retry recognizes nothing");
+}
+
+/// The local model is unavailable on a retry until its readiness condition is
+/// repaired. Retrying must not invoke recognition while it is unavailable, and the
+/// same retained audio must still recover afterwards.
+struct RepairableReadinessModel {
+    ready: AtomicBool,
+    calls: AtomicUsize,
+}
+impl LocalTranscriber for RepairableReadinessModel {
+    fn check_ready(&self) -> AppResult<()> {
+        if self.ready.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("Local model is missing: ggml-small.bin".into())
+        }
+    }
+    fn transcribe(&self, _audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err("Local whisper.cpp recognition failed (exit code: 2)".into())
+        } else {
+            Ok(TRANSCRIPT.into())
+        }
+    }
+}
+
+#[test]
+fn retry_waits_for_the_local_condition_to_be_repaired_and_then_recovers_the_same_audio() {
+    let runtime = Runtime::new();
+    let model = Arc::new(RepairableReadinessModel {
+        ready: AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()));
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let failure = await_phase(&mut app, Phase::Failure);
+    assert!(failure.retry_available, "{failure:?}");
+    let retained = failure.retained_audio[0].clone();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+    // The local model is now unavailable: retrying reports that condition without
+    // invoking recognition, and the audio remains retryable.
+    model.ready.store(false, Ordering::SeqCst);
+    app.dispatch(Control::Retry);
+    let unavailable = await_phase(&mut app, Phase::Failure);
+    assert!(
+        unavailable.detail.contains("Local model is missing"),
+        "{unavailable:?}"
+    );
+    assert!(unavailable.retry_available);
+    assert_eq!(unavailable.retained_audio, [retained.clone()]);
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        1,
+        "an unavailable local model must not be invoked"
+    );
+
+    model.ready.store(true, Ordering::SeqCst);
+    app.dispatch(Control::Retry);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(!retained.exists());
 }
 
 #[test]
@@ -315,4 +751,640 @@ fn playback_open_error_never_claims_to_capture_and_preserves_the_device_error() 
     );
     app.dispatch(Control::Stop);
     assert_eq!(app.snapshot().phase, Phase::Failure);
+}
+
+/// A test editor is either writable, or it accepts reads but refuses writes the way
+/// a real UIA editor reports its own state. A capacity limit stores only a prefix of
+/// the requested value, and a concurrent edit is applied by the operator just before
+/// the tool's replace call, after the draft was already read.
+#[derive(Clone, Copy)]
+enum Blocked {
+    ReadOnly,
+    Disabled,
+}
+
+impl Blocked {
+    fn error(self) -> &'static str {
+        match self {
+            Blocked::ReadOnly => "The original target is read-only",
+            Blocked::Disabled => "The original target is disabled",
+        }
+    }
+}
+
+struct Editors {
+    focused: Option<usize>,
+    drafts: [String; 2],
+    available: [bool; 2],
+    blocked: [Option<Blocked>; 2],
+    limit: [Option<usize>; 2],
+    concurrent_edit: Option<String>,
+    unconfirmed: bool,
+    replace_calls: usize,
+}
+
+impl Editors {
+    fn with_drafts(first: &str, second: &str) -> Self {
+        Self {
+            focused: Some(0),
+            drafts: [first.into(), second.into()],
+            available: [true; 2],
+            blocked: [None; 2],
+            limit: [None; 2],
+            concurrent_edit: None,
+            unconfirmed: false,
+            replace_calls: 0,
+        }
+    }
+}
+
+struct Desktop(Arc<Mutex<Editors>>);
+struct BoundEditor {
+    editors: Arc<Mutex<Editors>>,
+    selected: usize,
+}
+
+impl TargetSelection for Desktop {
+    fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
+        let desktop = self.0.lock().unwrap();
+        let Some(selected) = desktop.focused else {
+            return Ok(None);
+        };
+        if !desktop.available[selected] {
+            return Err("The original target was destroyed before binding".into());
+        }
+        if let Some(blocked) = desktop.blocked[selected] {
+            return Err(blocked.error().into());
+        }
+        Ok(Some(Box::new(BoundEditor {
+            editors: self.0.clone(),
+            selected,
+        })))
+    }
+}
+
+impl Target for BoundEditor {
+    fn content(&mut self) -> AppResult<String> {
+        let desktop = self.editors.lock().unwrap();
+        if !desktop.available[self.selected] {
+            return Err("The original target was destroyed".into());
+        }
+        Ok(desktop.drafts[self.selected].clone())
+    }
+
+    fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
+        let mut desktop = self.editors.lock().unwrap();
+        desktop.replace_calls += 1;
+        if !desktop.available[self.selected] {
+            return Err("The original target was destroyed".into());
+        }
+        if let Some(blocked) = desktop.blocked[self.selected] {
+            return Err(blocked.error().into());
+        }
+        if let Some(edit) = desktop.concurrent_edit.take() {
+            desktop.drafts[self.selected].push_str(&edit);
+        }
+        if desktop.drafts[self.selected] != expected {
+            return Err(
+                "The target draft changed during output; no replacement was attempted".into(),
+            );
+        }
+        desktop.drafts[self.selected] = match desktop.limit[self.selected] {
+            Some(limit) => replacement.chars().take(limit).collect(),
+            None => replacement.into(),
+        };
+        if desktop.limit[self.selected].is_some() || desktop.unconfirmed {
+            return Err("The complete target output could not be confirmed".into());
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn hotkey_binds_original_editor_and_appends_complete_result_to_its_latest_draft() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.drafts[0] = "原有草稿\n采集中新增 Rust 123".into();
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        "原有草稿\n采集中新增 Rust 123\n第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(desktop.drafts[1], "另一个输入框");
+    assert!(result.detail.contains("appended"), "{result:?}");
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+}
+
+#[test]
+fn no_speech_never_appends_empty_lines_or_generated_text_to_a_bound_target() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(NoSpeechModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+    app.dispatch(Control::Start);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Stop);
+    let result = await_phase(&mut app, Phase::NoSpeech);
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "另一个输入框"]);
+    assert_eq!(result.delivery, None);
+    assert!(result.text.is_empty());
+}
+
+#[test]
+fn no_target_at_start_keeps_the_complete_fallback_and_does_not_retarget_later_focus() {
+    let runtime = Runtime::new();
+    let mut editors = Editors::with_drafts("原有草稿", "后来获得焦点");
+    editors.focused = None;
+    let editors = Arc::new(Mutex::new(editors));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("No supported editable target"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        result.text
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "后来获得焦点"]);
+    assert!(result.retained_audio.is_empty());
+}
+
+#[test]
+fn destroyed_original_target_keeps_the_full_result_and_never_uses_a_replacement() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.available[0] = false;
+        desktop.drafts[0] = "重建的相似输入框".into();
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("original target was destroyed"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["重建的相似输入框", "旁边输入框"]);
+}
+
+#[test]
+fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_the_append() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().unconfirmed = true;
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(SlowModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    app.dispatch(Control::Stop);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert!(result.detail.contains("could not be confirmed"));
+    assert!(result.detail.contains("Check the original target"));
+    assert!(result.detail.contains("not retried automatically"));
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        result.text
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        "原有草稿\n第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+}
+
+#[test]
+fn result_storage_failure_keeps_the_complete_text_and_audio_without_writing_the_target() {
+    let runtime = Runtime::new();
+    fs::create_dir(runtime.0.join("current-result.txt")).unwrap();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Failure);
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    assert!(result.detail.contains("Could not save the current result"));
+    assert_eq!(result.retained_audio.len(), 1);
+    assert!(result.retained_audio[0].is_file());
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
+}
+
+struct NumberedModel(AtomicUsize);
+impl LocalTranscriber for NumberedModel {
+    fn check_ready(&self) -> AppResult<()> {
+        Ok(())
+    }
+    fn transcribe(&self, audio: &CapturedAudio, _directory: &Path) -> AppResult<String> {
+        let wav = hound::WavReader::open(&audio.path).map_err(|e| e.to_string())?;
+        if wav.duration() == 0 {
+            return Err("no playback audio reached the local model".into());
+        }
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(format!(
+            "第 {index} 段完整转写：Rust 和 WASAPI。\nSecond line {index}. 🦀"
+        ))
+    }
+}
+
+#[test]
+fn read_only_target_during_capture_keeps_the_complete_fallback_without_writing_it() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.blocked[0] = Some(Blocked::ReadOnly);
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(result.detail.contains("read-only"), "{result:?}");
+    assert!(result.detail.contains("nothing was written"), "{result:?}");
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    {
+        let desktop = editors.lock().unwrap();
+        assert_eq!(desktop.drafts, ["原有草稿", "旁边输入框"]);
+        assert_eq!(desktop.replace_calls, 1, "a refused write is never retried");
+    }
+
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(
+        app.snapshot().text,
+        TRANSCRIPT,
+        "the fallback stays copyable"
+    );
+    assert_eq!(editors.lock().unwrap().drafts, ["原有草稿", "旁边输入框"]);
+}
+
+#[test]
+fn disabled_target_at_start_is_reported_without_writing_any_control() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    editors.lock().unwrap().blocked[0] = Some(Blocked::Disabled);
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(result.detail.contains("disabled"), "{result:?}");
+    assert!(
+        result.detail.contains("No text was written to any control"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts, ["原有草稿", "旁边输入框"]);
+    assert_eq!(
+        desktop.replace_calls, 0,
+        "a disabled target is never written"
+    );
+}
+
+#[test]
+fn capacity_limited_target_is_reported_as_truncated_and_keeps_the_complete_fallback() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.limit[0] = Some(30);
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    let intended = format!("原有草稿\n{TRANSCRIPT}");
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        !result.detail.contains("The complete result was appended"),
+        "a truncated write must never be reported as complete success: {result:?}"
+    );
+    assert!(result.detail.contains("truncated"), "{result:?}");
+    assert!(
+        result.detail.contains("not a complete delivery"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains(&format!(
+            "only 30 of {} characters",
+            intended.chars().count()
+        )),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("Check the original target"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("not retried automatically"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        intended.chars().take(30).collect::<String>(),
+        "the target keeps only the truncated prefix it accepted"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+}
+
+#[test]
+fn concurrent_target_edit_during_output_is_reported_unconfirmed_and_never_reverted() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(editors.clone())));
+
+    app.dispatch(Control::Toggle);
+    {
+        let mut desktop = editors.lock().unwrap();
+        desktop.concurrent_edit = Some("用户同时输入".into());
+        desktop.focused = Some(1);
+    }
+    app.dispatch(Control::Toggle);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert!(
+        result.detail.contains("could not be confirmed"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("may be partially written"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("Check the original target"),
+        "{result:?}"
+    );
+    assert!(
+        result.detail.contains("not retried automatically"),
+        "{result:?}"
+    );
+    assert_eq!(result.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        TRANSCRIPT
+    );
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0], "原有草稿用户同时输入",
+        "the operator's concurrent edit is kept and nothing is rolled back"
+    );
+    assert_eq!(desktop.drafts[1], "旁边输入框");
+    assert_eq!(desktop.replace_calls, 1);
+}
+
+#[test]
+fn repeated_stop_held_hotkey_and_processing_controls_deliver_each_result_once() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
+    let model = Arc::new(NumberedModel(AtomicUsize::new(0)));
+    let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    // A held or auto-repeating hotkey turns into several events: only the first can
+    // stop the capture; the rest arrive during local processing.
+    app.dispatch(Control::Toggle);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    for _ in 0..4 {
+        app.dispatch(Control::Toggle);
+    }
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    assert!(app.snapshot().detail.contains("Still processing"));
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+
+    let first = await_phase(&mut app, Phase::Result);
+    let once = editors.lock().unwrap().drafts[0].clone();
+    assert_eq!(once, format!("原有草稿\n{}", first.text));
+    assert_eq!(once.matches("Rust 和 WASAPI").count(), 1);
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+    assert_eq!(first.delivery, Some(Delivery::Appended));
+
+    // Lost key-up / repeated stop after the result must not append or re-enter.
+    for _ in 0..3 {
+        app.dispatch(Control::Stop);
+    }
+    app.poll();
+    assert!(app.snapshot().detail.contains("Not capturing"));
+    assert_eq!(app.snapshot().phase, Phase::Result);
+    assert_eq!(app.snapshot().text, first.text);
+    assert_eq!(editors.lock().unwrap().drafts[0], once);
+    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+
+    // A later capture binds the focus at its own start; it never reuses or mixes
+    // the previous target, result, or append.
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Toggle);
+    app.dispatch(Control::Toggle);
+    let second = await_phase(&mut app, Phase::Result);
+    assert_ne!(second.text, first.text);
+    let desktop = editors.lock().unwrap();
+    assert_eq!(desktop.drafts[0], once);
+    assert_eq!(desktop.drafts[1], format!("另一个输入框\n{}", second.text));
+    assert_eq!(desktop.replace_calls, 2);
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        second.text
+    );
+}
+
+/// An operator owns and focuses the fixture; the product receives no coordinates,
+/// HWND, DOM selector, application name, or alternate output adapter.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an operator-owned focused editor and LISTEN_EDITOR_HANDSHAKE"]
+fn selected_generic_editor_receives_complete_output_through_the_real_target_adapter() {
+    let handshake = PathBuf::from(
+        std::env::var_os("LISTEN_EDITOR_HANDSHAKE")
+            .expect("set LISTEN_EDITOR_HANDSHAKE to a fresh operator-owned directory"),
+    );
+    fs::create_dir_all(&handshake).unwrap();
+    let runtime = Runtime::new();
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(listen::target::NativeTargets));
+    fs::write(
+        handshake.join("ready"),
+        "Focus the owned editor, then create focused.",
+    )
+    .unwrap();
+    wait_for_operator(&handshake.join("focused"));
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    fs::write(
+        handshake.join("capturing"),
+        "Edit the draft, switch focus, then create stop.",
+    )
+    .unwrap();
+    wait_for_operator(&handshake.join("stop"));
+    app.dispatch(Control::Stop);
+    let result = await_phase(&mut app, Phase::Result);
+    fs::write(handshake.join("detail.txt"), &result.detail).unwrap();
+    fs::write(handshake.join("transcript.txt"), &result.text).unwrap();
+    fs::write(
+        handshake.join("delivery.txt"),
+        format!("{:?}", result.delivery),
+    )
+    .unwrap();
+    assert_eq!(
+        result.text,
+        "第一行：Rust 和 WASAPI。\nSecond line, review before sending. 🦀"
+    );
+    let expected = match std::env::var("LISTEN_EDITOR_EXPECT_FALLBACK").as_deref() {
+        Ok("1") => Delivery::Fallback,
+        _ => Delivery::Appended,
+    };
+    assert_eq!(result.delivery, Some(expected), "{}", result.detail);
+    assert!(result.retained_audio.is_empty());
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(app.snapshot().text, result.text);
+    fs::write(
+        handshake.join("finished"),
+        "Check the owned editor and send counters.",
+    )
+    .unwrap();
+}
+
+#[cfg(windows)]
+fn wait_for_operator(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "operator marker missing: {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }

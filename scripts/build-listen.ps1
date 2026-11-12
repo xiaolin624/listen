@@ -1,6 +1,6 @@
 param(
     [string]$ToolsRoot = '',
-    [ValidateSet('Build', 'Test', 'Format', 'CheckFormat')][string]$Task = 'Build'
+    [ValidateSet('Build', 'BuildHarness', 'Test', 'Quality', 'Format', 'CheckFormat')][string]$Task = 'Build'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -21,7 +21,9 @@ $cargo = Join-Path $env:CARGO_HOME 'bin\cargo.exe'
 $manifest = Join-Path $projectRoot 'app\listen\Cargo.toml'
 switch ($Task) {
     'Build' { & $cargo build --offline --locked --release --manifest-path $manifest }
+    'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session }
     'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture }
+    'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture }
     'Format' { & $cargo fmt --manifest-path $manifest }
     'CheckFormat' { & $cargo fmt --manifest-path $manifest --check }
 }
@@ -30,4 +32,9 @@ if ($Task -eq 'Build') {
     $output = Join-Path $projectRoot 'app\listen\target\release'
     Copy-Item -LiteralPath (Join-Path $toolchain 'bin\libunwind.dll') -Destination $output -Force
     Write-Output (Join-Path $output 'listen.exe')
+}
+if ($Task -eq 'BuildHarness') {
+    $output = Join-Path $projectRoot 'app\listen\target\release\examples'
+    Copy-Item -LiteralPath (Join-Path $toolchain 'bin\libunwind.dll') -Destination $output -Force
+    Write-Output (Join-Path $output 'long_session.exe')
 }

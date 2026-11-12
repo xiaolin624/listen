@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "sample_rate": 16000,
+  "samples": [
+    {
+      "id": "mandarin",
+      "kind": "speech",
+      "reference": "这段语音只在本机处理，不会上传到云端。请保留完整的发言内容，由我检查以后手动发送。",
+      "parts": [
+        { "culture": "zh-CN", "text": "这段语音只在本机处理，不会上传到云端。请保留完整的发言内容，由我检查以后手动发送。" }
+      ]
+    },
+    {
+      "id": "mixed-technical",
+      "kind": "speech",
+      "reference": "我们用 Rust 实现音频采集，通过 WASAPI loopback 获取声音。模型在本机运行，使用 CPU 和 CUDA 进行对照。",
+      "parts": [
+        { "culture": "zh-CN", "text": "我们用" },
+        { "culture": "en-US", "text": "Rust" },
+        { "culture": "zh-CN", "text": "实现音频采集，通过" },
+        { "culture": "en-US", "text": "WASAPI loopback" },
+        { "culture": "zh-CN", "text": "获取声音。模型在本机运行，使用" },
+        { "culture": "en-US", "text": "CPU" },
+        { "culture": "zh-CN", "text": "和" },
+        { "culture": "en-US", "text": "CUDA" },
+        { "culture": "zh-CN", "text": "进行对照。" }
+      ]
+    },
+    {
+      "id": "english-numbers",
+      "kind": "speech",
+      "reference": "The API uses Rust, Windows, Whisper, CPU and GPU. Version one point eight point two. Port eight zero eight zero. Retry three times, then wait two seconds.",
+      "parts": [
+        { "culture": "en-US", "text": "The API uses Rust, Windows, Whisper, CPU and GPU. Version one point eight point two. Port eight zero eight zero. Retry three times, then wait two seconds." }
+      ]
+    },
+    {
+      "id": "homophones",
+      "kind": "speech",
+      "reference": "请确认本机的音频设置。本季的项目已经完成。不要把本机写成本季。",
+      "parts": [
+        { "culture": "zh-CN", "text": "请确认本机的音频设置。本季的项目已经完成。不要把本机写成本季。" }
+      ]
+    },
+    {
+      "id": "multiline",
+      "kind": "speech",
+      "reference": "第一段，保留原来的草稿，不要自动发送。\nSecond line: review the API response.\n第三段，端口是八零八零，重试三次，等待两秒。",
+      "parts": [
+        { "culture": "zh-CN", "text": "第一段，保留原来的草稿，不要自动发送。" },
+        { "culture": "en-US", "text": "Second line: review the API response." },
+        { "culture": "zh-CN", "text": "第三段，端口是八零八零，重试三次，等待两秒。" }
+      ]
+    },
+    { "id": "silence", "kind": "silence", "seconds": 8, "reference": "" },
+    { "id": "instrumental", "kind": "instrumental", "seconds": 12, "reference": "" },
+    { "id": "notification", "kind": "notification", "seconds": 8, "reference": "" }
+  ]
+}
