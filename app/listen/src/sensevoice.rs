@@ -520,6 +520,7 @@ impl Drop for Resident {
 }
 
 /// A decoded speech segment inside one captured window.
+#[derive(Debug)]
 struct SpeechChunk {
     start_ms: u64,
     end_ms: u64,
@@ -535,6 +536,11 @@ struct Recognized {
     /// Captured for diagnostics; the current gate only needs `event`.
     _emotion: String,
     event: String,
+    /// Per-token text in order; the pinned build returns this together with
+    /// `timestamps`, which lets one whole-window decode keep mid-window spans.
+    tokens: Vec<String>,
+    /// Per-token start time in seconds, relative to the decoded audio.
+    timestamps: Vec<f32>,
 }
 
 /// A resident SenseVoiceSmall engine. `library` is the directory holding
@@ -629,6 +635,12 @@ impl SenseVoice {
             .collect()
     }
 
+    /// Decodes the whole captured window once, then attributes the decoded text
+    /// to the VAD utterances through the engine's token timestamps. Decoding the
+    /// whole window is what keeps sentence context at the start of a later
+    /// utterance ("请保留…" was lost when that utterance was decoded alone); the
+    /// token timestamps give `streaming.rs` the mid-window spans its overlap rule
+    /// needs, so no fabricated whole-window midpoint is ever used.
     fn recognize_chunks(&self, pcm: &[f32]) -> AppResult<Vec<SpeechChunk>> {
         let mut guard = self.resident.lock().unwrap_or_else(|e| e.into_inner());
         let resident = guard.as_mut().ok_or_else(|| {
@@ -638,6 +650,20 @@ impl SenseVoice {
         if segments.is_empty() {
             return Ok(Vec::new());
         }
+        let recognized = resident.recognize(pcm)?;
+        let Some(text) = accepted_text(&recognized) else {
+            return Ok(Vec::new());
+        };
+        if !recognized.tokens.is_empty() && recognized.tokens.len() == recognized.timestamps.len() {
+            let mut chunks =
+                token_chunks(&text, &recognized.tokens, &recognized.timestamps, &segments)?;
+            drop_implausible_tail(&mut chunks);
+            return Ok(chunks);
+        }
+        // A build that does not expose token timestamps cannot attribute one
+        // whole-window decode without inventing times; decode the VAD utterances
+        // separately instead (same engine, same gate, explicit fallback). The
+        // pinned v2.0.1 build always takes the token path above.
         let mut chunks = Vec::with_capacity(segments.len());
         for (start, samples) in segments {
             let decode_end = (start + samples + VAD_DECODE_TAIL_SAMPLES).min(pcm.len() as u64);
@@ -653,13 +679,13 @@ impl SenseVoice {
             let Some(text) = accepted_text(&recognized) else {
                 continue;
             };
-            let text = prefixed(&text);
             chunks.push(SpeechChunk {
                 start_ms: start * 1000 / SAMPLE_RATE as u64,
                 end_ms: (start + samples) * 1000 / SAMPLE_RATE as u64,
-                text,
+                text: prefixed(&text),
             });
         }
+        drop_implausible_tail(&mut chunks);
         Ok(chunks)
     }
 }
@@ -761,11 +787,46 @@ impl Resident {
                     )
                 })
         };
+        let count = unsafe { (*result.result).count };
+        let mut tokens = Vec::new();
+        let mut timestamps = Vec::new();
+        // Guard against a corrupt count before indexing the arrays; the pinned
+        // build returns one token per character or subword.
+        if count > 0 && count <= 1_000_000 {
+            let tokens_array = unsafe { (*result.result).tokens_arr };
+            if !tokens_array.is_null() {
+                for index in 0..count as usize {
+                    let pointer = unsafe { *tokens_array.add(index) };
+                    if pointer.is_null() {
+                        return Err(
+                            "The local SenseVoice engine returned a missing token; audio retained"
+                                .into(),
+                        );
+                    }
+                    let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
+                    tokens.push(std::str::from_utf8(bytes).map(str::to_owned).map_err(
+                        |error| {
+                            format!(
+                                "The local SenseVoice engine returned a token that is not valid UTF-8 ({error}); audio retained"
+                            )
+                        },
+                    )?);
+                }
+            }
+            let stamps = unsafe { (*result.result).timestamps };
+            if !stamps.is_null() {
+                for index in 0..count as usize {
+                    timestamps.push(unsafe { *stamps.add(index) });
+                }
+            }
+        }
         Ok(Recognized {
             text: field(unsafe { (*result.result).text }, "text")?,
             _lang: field(unsafe { (*result.result).lang }, "a language label")?,
             _emotion: field(unsafe { (*result.result).emotion }, "an emotion label")?,
             event: field(unsafe { (*result.result).event }, "an event label")?,
+            tokens,
+            timestamps,
         })
     }
 }
@@ -1173,6 +1234,104 @@ fn accepted_text(recognized: &Recognized) -> Option<String> {
     Some(text)
 }
 
+/// Partitions one whole-window decode back onto the VAD utterances using the
+/// engine's token start timestamps. Tokens are consumed in order; the boundary
+/// between two utterances is the middle of their silence gap, and the last
+/// utterance receives any trailing punctuation. No timestamp is fabricated, so
+/// the existing overlap-midpoint rule keeps working on real spans.
+fn token_chunks(
+    expected_text: &str,
+    tokens: &[String],
+    timestamps: &[f32],
+    segments: &[(u64, u64)],
+) -> AppResult<Vec<SpeechChunk>> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut chunks = Vec::with_capacity(segments.len());
+    let mut token_index = 0;
+    for (index, &(start, samples)) in segments.iter().enumerate() {
+        let end = start + samples;
+        let boundary = match segments.get(index + 1) {
+            Some(&(next_start, _)) if next_start > end => (end + next_start) / 2,
+            Some(_) => end,
+            None => u64::MAX,
+        };
+        let mut piece = String::new();
+        while token_index < tokens.len() {
+            let seconds = timestamps[token_index];
+            if !seconds.is_finite() {
+                token_index += 1;
+                continue;
+            }
+            let sample = (f64::from(seconds.max(0.0)) * SAMPLE_RATE as f64) as u64;
+            if sample >= boundary {
+                break;
+            }
+            piece.push_str(&tokens[token_index]);
+            token_index += 1;
+        }
+        let text = clean_transcript(&piece);
+        if !text.is_empty() {
+            chunks.push(SpeechChunk {
+                start_ms: start * 1000 / SAMPLE_RATE as u64,
+                end_ms: end * 1000 / SAMPLE_RATE as u64,
+                text: prefixed(&text),
+            });
+        }
+    }
+    let joined = join_chunk_texts(chunks.iter().map(|chunk| chunk.text.as_str()));
+    if normalized_characters(&joined) != normalized_characters(expected_text) {
+        return Err(
+            "The local SenseVoice engine returned token timestamps that do not cover its decoded text; audio retained"
+                .into(),
+        );
+    }
+    Ok(chunks)
+}
+
+fn normalized_characters(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// A final VAD utterance can be a noise burst that the detector called speech.
+/// If its decoded text is far denser than any human speaking rate, the text is a
+/// hallucination for that audio. Chinese characters count as one speech unit and
+/// Latin letters as a quarter (five letters per syllable), so the same threshold
+/// works for both scripts. It is deliberately generous (seven units per second
+/// plus one) and only applies to the last utterance.
+fn implausible_tail_text(text: &str, start_ms: u64, end_ms: u64) -> bool {
+    let units: f64 = text
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                0.25
+            } else if character.is_alphanumeric() {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    if units < 1.0 {
+        return false;
+    }
+    let seconds = end_ms.saturating_sub(start_ms) as f64 / 1000.0;
+    units > seconds * 7.0 + 1.0
+}
+
+fn drop_implausible_tail(chunks: &mut Vec<SpeechChunk>) {
+    let Some(last) = chunks.last() else {
+        return;
+    };
+    if implausible_tail_text(&last.text, last.start_ms, last.end_ms) {
+        chunks.pop();
+    }
+}
+
 /// A chunk that starts with a Latin word needs a leading space so concatenating
 /// independent spans does not glue it to the previous Chinese sentence.
 fn prefixed(text: &str) -> String {
@@ -1330,6 +1489,8 @@ mod tests {
             _lang: "<|zh|>".into(),
             _emotion: "<|NEUTRAL|>".into(),
             event: "<|Speech|>".into(),
+            tokens: Vec::new(),
+            timestamps: Vec::new(),
         };
         assert_eq!(accepted_text(&speech).as_deref(), Some("我们来做测试。"));
 
@@ -1374,6 +1535,71 @@ mod tests {
             "模型在本机运行。 CPU。"
         );
         assert_eq!(join_chunk_texts(Vec::<&str>::new()), "");
+    }
+
+    #[test]
+    fn whole_window_text_is_attributed_to_vad_spans_through_token_timestamps() {
+        let tokens: Vec<String> = ["这", "段", "语", "音"]
+            .iter()
+            .map(|token| token.to_string())
+            .collect();
+        let timestamps = [0.10f32, 0.30, 2.10, 2.30];
+        let segments = [(0u64, 16_000u64), (32_000, 16_000)];
+        let chunks = token_chunks("这段语音", &tokens, &timestamps, &segments).unwrap();
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(
+            (
+                chunks[0].start_ms,
+                chunks[0].end_ms,
+                chunks[0].text.as_str()
+            ),
+            (0, 1_000, "这段")
+        );
+        assert_eq!(
+            (
+                chunks[1].start_ms,
+                chunks[1].end_ms,
+                chunks[1].text.as_str()
+            ),
+            (2_000, 3_000, "语音")
+        );
+        assert_eq!(
+            join_chunk_texts(chunks.iter().map(|chunk| chunk.text.as_str())),
+            "这段语音"
+        );
+    }
+
+    #[test]
+    fn token_timestamps_that_do_not_cover_the_decoded_text_are_rejected() {
+        let tokens = vec!["这".to_string()];
+        let error = token_chunks("这段", &tokens, &[0.0], &[(0, 16_000)]).unwrap_err();
+        assert!(error.contains("do not cover"), "{error}");
+    }
+
+    #[test]
+    fn an_implausibly_dense_final_utterance_is_dropped() {
+        // 5 CJK characters + one Latin letter in 400 ms is 13 units/s.
+        assert!(implausible_tail_text("登录用户的I", 500, 900));
+        assert!(!implausible_tail_text("谢谢大家", 500, 1_000));
+        assert!(!implausible_tail_text("好", 0, 100));
+        assert!(!implausible_tail_text("The API uses Rust.", 0, 1_500));
+        assert!(!implausible_tail_text("这段语音只在本机处理。", 0, 2_200));
+
+        let mut chunks = vec![
+            SpeechChunk {
+                start_ms: 0,
+                end_ms: 2_200,
+                text: "这段语音只在本机处理。".into(),
+            },
+            SpeechChunk {
+                start_ms: 2_200,
+                end_ms: 2_600,
+                text: "登录用户的I".into(),
+            },
+        ];
+        drop_implausible_tail(&mut chunks);
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert_eq!(chunks[0].text, "这段语音只在本机处理。");
     }
 
     #[test]
