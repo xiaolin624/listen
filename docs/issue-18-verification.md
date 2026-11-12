@@ -147,7 +147,7 @@ GPU
   ```text
    300-term correction took 28.5608ms
   ```
-  多次运行（含合并 #17 后的完整套件）落在 26–36 ms。实现按“首/末字符桶 + 长度差 + token 数”先剪枝，候选只做短字符串 Levenshtein，且复用 DP 行缓冲；不对条目两两比较。
+  多次运行（含合并 #17 后的完整套件）落在 26–37 ms。实现按“首/末字符桶 + 长度差 + token 数”先剪枝，候选只做短字符串 Levenshtein，且复用 DP 行缓冲；不对条目两两比较。
 
 ## 正例（输入来自本机 sherpa-onnx SenseVoice q8 实测）
 
