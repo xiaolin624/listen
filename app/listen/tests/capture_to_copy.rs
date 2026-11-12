@@ -1332,7 +1332,7 @@ fn selected_generic_editor_receives_complete_output_through_the_real_target_adap
         runtime.0.clone(),
         Ok(()),
     )
-    .with_targets(Arc::new(listen::target::NativeTargets));
+    .with_targets(Arc::new(listen::target::NativeTargets::new()));
     fs::write(
         handshake.join("ready"),
         "Focus the owned editor, then create focused.",

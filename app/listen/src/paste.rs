@@ -263,6 +263,18 @@ fn select_all_copy(keys: &mut Keys<'_>) -> AppResult<()> {
     keys.chord(VK_CONTROL, VK_C)
 }
 
+/// Selects the editor's whole content without copying it. A caller that already
+/// holds the live draft (for example from the accessible value) only needs the
+/// selection, so it can collapse it to the end before an appending paste.
+pub fn select_all(guard: &dyn Fn() -> AppResult<()>) -> AppResult<()> {
+    let mut sink = RealKeys;
+    let mut keys = Keys {
+        sink: &mut sink,
+        guard,
+    };
+    keys.chord(VK_CONTROL, VK_A)
+}
+
 /// Selects the editor's whole content, copies it and collapses the caret to the
 /// end, returning the real draft as the application sees it.
 pub fn read_draft(guard: &dyn Fn() -> AppResult<()>) -> AppResult<String> {

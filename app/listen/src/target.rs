@@ -3,11 +3,22 @@
 //! only when a provider silently drops that write does it fall back to an appending
 //! clipboard paste that produces real editing events (see `crate::paste`). Both paths
 //! read the draft immediately before writing, confirm the result, and never send Enter.
+//!
+//! The first delivery to an editor keeps that order. If its fallback really pasted,
+//! the session remembers that this editor drops the direct write, and the next
+//! deliveries to the same editor go straight to the paste path: no write is attempted,
+//! so the two-second confirmation window and the late-apply race it guards against
+//! cannot happen again. The memory is keyed on the editor (process id plus UIA runtime
+//! id), never on the process alone, so another editor in the same application keeps
+//! the direct path.
 
 use crate::{AppResult, Target, TargetSelection, paste};
 use std::{
     cell::Cell,
+    collections::HashSet,
+    path::PathBuf,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -40,9 +51,177 @@ use windows::{
 /// Confirmation waits for the new accessible value; the write itself is never repeated.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a pasted value may take to appear in the accessible value before the
+/// slower clipboard read-back is used instead. Every waiting path is bounded.
+const PASTE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(300);
 /// The caller's wait covers the confirmation window plus the fallback paste sequence.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ANCESTORS: usize = 64;
+
+/// What the paste fallback did. The caller learns from this whether the editor
+/// really needed real editing keys, without guessing from a refusal or a late write.
+#[derive(Debug, PartialEq, Eq)]
+enum PasteOutcome {
+    /// The editor already held the complete intended value; no key was sent.
+    NotNeeded,
+    /// The transcript was appended with real editing keys and read back.
+    Appended,
+}
+
+/// Identity of one bound editor across the captures of a Listen session: the
+/// process id plus the UIA runtime id. The process id alone is not enough — a
+/// browser hosts a plain text field and a rich-text composer in the same process —
+/// so another editor never inherits this editor's paste-only path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct EditorKey {
+    process: u32,
+    runtime: Vec<i32>,
+}
+
+impl EditorKey {
+    fn label(&self) -> String {
+        let runtime = self
+            .runtime
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{}/{runtime}", self.process)
+    }
+}
+
+/// What this Listen session learned about the editors it bound.
+///
+/// Only an editor that actually appended through the keyboard fallback is
+/// remembered as dropping `ValuePattern.SetValue`. A refused write, a late write
+/// that landed inside the confirmation window, and a truncation teach nothing, so
+/// they keep the direct-write path.
+#[derive(Default)]
+struct DeliveryMemory {
+    dropped: Mutex<HashSet<EditorKey>>,
+}
+
+/// How many dropping editors one session remembers. A session that binds more than
+/// this many different dropping editors starts over instead of growing without
+/// bound; starting over only means the direct write is tried again (the safe side).
+const MAX_REMEMBERED_EDITORS: usize = 128;
+
+impl DeliveryMemory {
+    fn known_to_drop_set_value(&self, key: &EditorKey) -> bool {
+        self.dropped
+            .lock()
+            .map(|known| known.contains(key))
+            .unwrap_or(false)
+    }
+
+    fn remember_dropped(&self, key: &EditorKey) {
+        if let Ok(mut known) = self.dropped.lock() {
+            if known.len() >= MAX_REMEMBERED_EDITORS {
+                known.clear();
+            }
+            known.insert(key.clone());
+        }
+    }
+}
+
+/// The editor operations one delivery needs. `NativeEditor` implements them with
+/// real UIA and real key events; the unit tests implement them with a recording
+/// editor, so the write decision (direct write vs paste-only) can be tested
+/// without owning a desktop.
+trait WritableEditor {
+    /// The live draft as the editor's provider publishes it.
+    fn read_value(&mut self) -> AppResult<String>;
+    /// The same identity, enabled, writable and non-password checks the direct
+    /// write has always done before any output is attempted.
+    fn validate(&mut self) -> AppResult<()>;
+    /// One write attempt; `true` when the provider accepted the call.
+    fn write_value(&mut self, value: &str) -> bool;
+    /// Waits for the accessible value to show the complete replacement or a stable
+    /// truncated prefix. The write itself is never repeated.
+    fn await_confirmation(&mut self, previous: &str, intended: &str) -> AppResult<Confirmation>;
+    /// Appends the transcript with real editing keys and reads the result back.
+    /// `known_draft` is the live draft the caller just read, when this delivery
+    /// attempted no write, so the fallback does not read it a second time.
+    fn paste_append(
+        &mut self,
+        expected: &str,
+        replacement: &str,
+        known_draft: Option<&str>,
+        trace: &mut DeliveryTrace,
+    ) -> AppResult<PasteOutcome>;
+}
+
+/// Output for one delivery. The direct write is tried once; only an editor this
+/// session already saw appending through real editing keys goes straight to the
+/// paste fallback, and only a fallback that really pasted teaches that fact.
+fn replace_content<E: WritableEditor>(
+    editor: &mut E,
+    memory: &DeliveryMemory,
+    key: &EditorKey,
+    expected: &str,
+    replacement: &str,
+) -> AppResult<()> {
+    let mut trace = DeliveryTrace::begin(key.label());
+    let draft = editor.read_value()?;
+    if draft != expected {
+        return Err("The target draft changed during output; no replacement was attempted".into());
+    }
+    trace.lap("read");
+    if memory.known_to_drop_set_value(key) {
+        // This editor dropped the write earlier in this session, so no write is
+        // attempted at all: there is nothing that could apply late, and the draft
+        // just read is still the live draft. The fallback still reads the target
+        // again for its own plan and confirms the appended result.
+        editor.validate()?;
+        trace.lap("validate");
+        trace.style("paste_only");
+        let outcome = editor.paste_append(expected, replacement, Some(&draft), &mut trace)?;
+        trace.outcome(match outcome {
+            PasteOutcome::NotNeeded => "already_complete",
+            PasteOutcome::Appended => "appended_after_paste_only",
+        });
+        return Ok(());
+    }
+    let normalized = replacement.replace("\r\n", "\n").replace('\n', "\r\n");
+    editor.validate()?;
+    trace.lap("validate");
+    // One write attempt only. A provider may accept it, drop it, or store a
+    // truncated prefix when the editor has a smaller capacity.
+    let written = editor.write_value(&normalized);
+    trace.lap("write");
+    if written {
+        match editor.await_confirmation(expected, replacement)? {
+            Confirmation::Confirmed => {
+                trace.outcome("written");
+                return Ok(());
+            }
+            // Never paste into an editor that just reported a capacity limit: the
+            // fallback would append through the same limit.
+            Confirmation::Truncated(detail) => {
+                trace.outcome("truncated");
+                return Err(detail);
+            }
+            Confirmation::Unconfirmed => {}
+        }
+        trace.lap("confirm");
+    }
+    // Some providers expose a Value pattern but drop the write (a controlled
+    // rich-text composer restores its own state). Fall back to a real paste, which
+    // produces ordinary editing events, while the target still owns the foreground
+    // keyboard focus. Because a write was attempted, the fallback re-reads the draft
+    // through the clipboard before sending any key.
+    let outcome = editor.paste_append(expected, replacement, None, &mut trace)?;
+    if outcome == PasteOutcome::Appended {
+        // Only a fallback that really pasted proves that this editor drops the
+        // write. `NotNeeded` means the late write landed, which keeps the fast path.
+        memory.remember_dropped(key);
+    }
+    trace.outcome(match outcome {
+        PasteOutcome::NotNeeded => "already_complete",
+        PasteOutcome::Appended => "appended",
+    });
+    Ok(())
+}
 
 /// Outcome of waiting for the accessible value to show a completed write.
 enum Confirmation {
@@ -51,7 +230,93 @@ enum Confirmation {
     Unconfirmed,
 }
 
-pub struct NativeTargets;
+/// One delivery attempt's stage timings, appended as a JSON line to
+/// `LISTEN_DELIVERY_TRACE` when that environment variable names a file.
+///
+/// It exists to measure backfill latency on a real target: the line records where
+/// the delivery wait went (draft read, write attempt, confirmation polling,
+/// clipboard backup, draft read, paste, read-back) plus the editor's process id and
+/// UIA runtime id. Durations and numeric identities only; never the draft or the
+/// transcript. Without the variable it costs one environment lookup and no I/O.
+struct DeliveryTrace {
+    path: Option<PathBuf>,
+    editor: String,
+    started: Instant,
+    last: Instant,
+    stages: Vec<(&'static str, u64)>,
+    style: &'static str,
+    outcome: &'static str,
+}
+
+impl DeliveryTrace {
+    fn begin(editor: String) -> Self {
+        let now = Instant::now();
+        Self {
+            path: std::env::var_os("LISTEN_DELIVERY_TRACE").map(PathBuf::from),
+            editor,
+            started: now,
+            last: now,
+            stages: Vec::new(),
+            style: "direct",
+            outcome: "failed",
+        }
+    }
+
+    /// Records the time since the previous mark (or since the attempt started).
+    fn lap(&mut self, stage: &'static str) {
+        if self.path.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.last)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.stages.push((stage, elapsed));
+        self.last = now;
+    }
+
+    /// Why this attempt took the direct write path or the paste-only path.
+    fn style(&mut self, style: &'static str) {
+        self.style = style;
+    }
+
+    fn outcome(&mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for DeliveryTrace {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let total = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let stages = self
+            .stages
+            .iter()
+            .map(|(stage, milliseconds)| format!("\"{stage}\":{milliseconds}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let stages = if stages.is_empty() {
+            String::new()
+        } else {
+            format!(",{stages}")
+        };
+        let line = format!(
+            "{{\"editor\":\"{}\",\"style\":\"{}\",\"outcome\":\"{}\",\"total_ms\":{total}{stages}}}\n",
+            self.editor, self.style, self.outcome
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
 
 /// The foreground window, its root, and the keyboard focus observed when capture started.
 /// UIA is only touched from the dedicated MTA thread that receives this value.
@@ -114,16 +379,39 @@ impl Drop for RootIdentity {
     }
 }
 
+/// The foreground editor adapter. The selection is stateless; the one thing that
+/// survives across captures is the per-editor memory of which editors drop
+/// `ValuePattern.SetValue`, so repeated deliveries to the same target can skip the
+/// futile write and its confirmation window.
+pub struct NativeTargets {
+    memory: Arc<DeliveryMemory>,
+}
+
+impl Default for NativeTargets {
+    fn default() -> Self {
+        Self {
+            memory: Arc::new(DeliveryMemory::default()),
+        }
+    }
+}
+
+impl NativeTargets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl TargetSelection for NativeTargets {
     fn focused_target(&self) -> AppResult<Option<Box<dyn Target>>> {
         let Some(focus) = foreground_focus()? else {
             return Ok(None);
         };
+        let memory = self.memory.clone();
         let (requests, receive) = mpsc::channel();
         let (ready, initialized) = mpsc::channel();
         thread::spawn(move || {
             // UIA objects are created, used and released in this one windowless MTA.
-            let editor = match NativeEditor::bind(focus) {
+            let mut editor = match NativeEditor::bind(focus, memory) {
                 Ok(Some(editor)) => editor,
                 Ok(None) => {
                     let _ = ready.send(Ok(None));
@@ -329,13 +617,17 @@ struct NativeEditor {
     text: Option<IUIAutomationTextPattern>,
     automation: IUIAutomation,
     runtime_id: Vec<i32>,
+    /// The session-wide memory of editors that drop the direct write.
+    memory: Arc<DeliveryMemory>,
+    /// This editor's identity in that memory.
+    key: EditorKey,
     // Field order releases UIA references and the hook before leaving COM.
     _hook: LifetimeHook,
     _com: Com,
 }
 
 impl NativeEditor {
-    fn bind(focus: Focus) -> AppResult<Option<Self>> {
+    fn bind(focus: Focus, memory: Arc<DeliveryMemory>) -> AppResult<Option<Self>> {
         unsafe {
             if !focus.identity.matches() {
                 return Err("The selected target window was replaced before binding".into());
@@ -415,6 +707,10 @@ impl NativeEditor {
             };
             let text = element.GetCurrentPatternAs(UIA_TextPatternId).ok();
             let runtime_id = runtime_id(&element)?;
+            let key = EditorKey {
+                process: focus.process,
+                runtime: runtime_id.clone(),
+            };
             let editor = Self {
                 focus,
                 element,
@@ -422,6 +718,8 @@ impl NativeEditor {
                 text,
                 automation,
                 runtime_id,
+                memory,
+                key,
                 _hook: hook,
                 _com: com,
             };
@@ -553,35 +851,10 @@ impl NativeEditor {
         }
     }
 
-    fn replace(&self, expected: &str, replacement: &str) -> AppResult<()> {
-        if self.content()? != expected {
-            return Err(
-                "The target draft changed during output; no replacement was attempted".into(),
-            );
-        }
-        let normalized = replacement.replace("\r\n", "\n").replace('\n', "\r\n");
-        self.validate_writable()?;
-        // One write attempt only. A provider may accept it, drop it, or store a
-        // truncated prefix when the editor has a smaller capacity.
-        let written = unsafe {
-            self.value
-                .SetValue(&BSTR::from(normalized.as_str()))
-                .is_ok()
-        };
-        if written {
-            match self.confirmed(expected, replacement)? {
-                Confirmation::Confirmed => return Ok(()),
-                // Never paste into an editor that just reported a capacity limit: the
-                // fallback would append through the same limit.
-                Confirmation::Truncated(detail) => return Err(detail),
-                Confirmation::Unconfirmed => {}
-            }
-        }
-        // Some providers expose a Value pattern but drop the write (a controlled
-        // rich-text composer restores its own state). Fall back to a real paste,
-        // which produces ordinary editing events, while the target still owns the
-        // foreground keyboard focus.
-        self.paste_output(expected, replacement)
+    fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
+        let memory = self.memory.clone();
+        let key = self.key.clone();
+        replace_content(self, &memory, &key, expected, replacement)
     }
 
     /// Waits for the accessible value to show the complete replacement, or proves a
@@ -627,46 +900,118 @@ impl NativeEditor {
     /// The paste fallback only appends, so a draft that cannot be read through UIA
     /// is preserved instead of being replaced. Nothing is written unless the draft
     /// can be read first, and the editor is read back before the result is trusted.
-    fn paste_output(&self, expected: &str, replacement: &str) -> AppResult<()> {
+    ///
+    /// `known_draft` is the live draft the caller already read on a delivery that
+    /// attempted no write. It replaces the clipboard draft read, because no late
+    /// provider write can race this fallback, and only the caret still has to be
+    /// moved after the current text.
+    fn paste_output(
+        &self,
+        expected: &str,
+        replacement: &str,
+        known_draft: Option<&str>,
+        trace: &mut DeliveryTrace,
+    ) -> AppResult<PasteOutcome> {
         self.validate_identity()?;
         self.require_foreground_focus()?;
-        // A provider may have applied the earlier `SetValue` after the confirmation
-        // window closed. Re-read before touching the clipboard or sending any key.
-        if normalized(&self.content()?).trim_end() == normalized(replacement).trim_end() {
-            return Ok(());
-        }
-        // Never clear a clipboard whose previous content cannot be restored.
-        let backup = paste::ClipboardBackup::save()?;
-        let guard = || self.require_foreground_focus();
-        let draft = normalized(&paste::read_draft(&guard)?);
-        // The clipboard read used Ctrl+A, so leave the user with a caret even when
-        // no paste is needed. Every key event re-validates the bound target.
-        paste::collapse_to_end(&guard)?;
+        let (draft, backup) = match known_draft {
+            Some(known) => {
+                trace.lap("preflight");
+                // Never clear a clipboard whose previous content cannot be restored.
+                let backup = paste::ClipboardBackup::save()?;
+                trace.lap("backup");
+                let guard = || self.require_foreground_focus();
+                // No write was attempted, so the draft the caller just read is the
+                // live draft. Select and collapse it to the end so the append lands
+                // after the current text, exactly like the clipboard read did.
+                paste::select_all(&guard)?;
+                trace.lap("select_all");
+                paste::collapse_to_end(&guard)?;
+                trace.lap("collapse");
+                (normalized(known), backup)
+            }
+            None => {
+                // A provider may have applied the earlier `SetValue` after the
+                // confirmation window closed. Re-read before touching the clipboard
+                // or sending any key.
+                if normalized(&self.content()?).trim_end() == normalized(replacement).trim_end() {
+                    trace.lap("preflight");
+                    return Ok(PasteOutcome::NotNeeded);
+                }
+                trace.lap("preflight");
+                let backup = paste::ClipboardBackup::save()?;
+                trace.lap("backup");
+                let guard = || self.require_foreground_focus();
+                let draft = normalized(&paste::read_draft(&guard)?);
+                trace.lap("draft_read");
+                // The clipboard read used Ctrl+A and already collapsed the caret to
+                // the end, so collapsing again would send the same key twice for no
+                // observable difference.
+                (draft, backup)
+            }
+        };
         match plan_paste(expected, replacement, &draft)? {
             // The real draft already contains the complete intended text (for
             // example a late or normalized provider write). Pasting again would
             // duplicate the transcript.
             PastePlan::AlreadyComplete | PastePlan::NothingToAppend => {
                 drop(backup);
-                return Ok(());
+                Ok(PasteOutcome::NotNeeded)
             }
             PastePlan::Append { separator, text } => {
                 let payload = format!("{separator}{text}");
+                let guard = || self.require_foreground_focus();
                 paste::paste(&payload, &guard)?;
-                let observed = normalized(&paste::read_back(&guard)?);
-                paste::collapse_to_end(&guard)?;
-                drop(backup);
+                trace.lap("paste");
                 let wanted = format!("{draft}{payload}");
+                // The accessible value is the confirmation channel the direct-write
+                // path already trusts. An exact match proves the complete append; a
+                // provider that does not publish the pasted text in time falls back
+                // to the clipboard read-back below.
+                if self.confirm_pasted(&wanted, PASTE_CONFIRM_TIMEOUT)? {
+                    trace.lap("read_back_accessibility");
+                    drop(backup);
+                    return Ok(PasteOutcome::Appended);
+                }
+                trace.lap("read_back_accessibility");
+                let observed = normalized(&paste::read_back(&guard)?);
+                trace.lap("read_back");
+                paste::collapse_to_end(&guard)?;
+                trace.lap("collapse");
+                drop(backup);
                 if observed.trim_end() != wanted.trim_end() {
                     return Err(
                         "The complete target output could not be confirmed after the fallback write"
                             .into(),
                     );
                 }
-                Ok(())
+                Ok(PasteOutcome::Appended)
             }
         }
     }
+
+    /// Confirms a paste through the accessible value. Returns `false` when the
+    /// provider does not publish the complete pasted text inside `timeout`; the
+    /// caller then uses the clipboard read-back, which is the slow but universally
+    /// available channel. A read error also returns `false` so the caller reports
+    /// through the same read-back path.
+    fn confirm_pasted(&self, wanted: &str, timeout: Duration) -> AppResult<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.content() {
+                Ok(observed) if normalized(&observed).trim_end() == wanted.trim_end() => {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(_) => return Ok(false),
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(CONFIRM_INTERVAL);
+        }
+    }
+
     /// The fallback writer sends real key events, so it may only run while the bound
     /// editor itself still owns the foreground keyboard focus.
     fn require_foreground_focus(&self) -> AppResult<()> {
@@ -687,6 +1032,35 @@ impl NativeEditor {
             );
         }
         Ok(())
+    }
+}
+
+/// Real UIA and key operations for `replace_content`.
+impl WritableEditor for NativeEditor {
+    fn read_value(&mut self) -> AppResult<String> {
+        self.content()
+    }
+
+    fn validate(&mut self) -> AppResult<()> {
+        self.validate_writable()
+    }
+
+    fn write_value(&mut self, value: &str) -> bool {
+        unsafe { self.value.SetValue(&BSTR::from(value)).is_ok() }
+    }
+
+    fn await_confirmation(&mut self, previous: &str, intended: &str) -> AppResult<Confirmation> {
+        self.confirmed(previous, intended)
+    }
+
+    fn paste_append(
+        &mut self,
+        expected: &str,
+        replacement: &str,
+        known_draft: Option<&str>,
+        trace: &mut DeliveryTrace,
+    ) -> AppResult<PasteOutcome> {
+        self.paste_output(expected, replacement, known_draft, trace)
     }
 }
 
@@ -938,5 +1312,311 @@ mod tests {
                 text: "new".into()
             }
         );
+    }
+
+    /// What one direct write attempt does to the recording editor.
+    #[derive(Clone, Copy)]
+    enum FakeWrite {
+        /// The provider stores the complete new value.
+        Applied,
+        /// The provider reports success but keeps its own draft.
+        Dropped,
+        /// The provider applies the value during the confirmation wait.
+        AppliedLate,
+        /// The provider stores only a prefix of the value (capacity limit).
+        Truncated(usize),
+    }
+
+    /// A recording editor for the write-decision tests. It mimics what the real
+    /// adapter does — read the draft, accept or drop one write, wait for the write,
+    /// then append through the fallback — without owning a desktop.
+    struct FakeEditor {
+        draft: String,
+        write: FakeWrite,
+        pending: Option<String>,
+        calls: Vec<&'static str>,
+        writes: usize,
+        pastes: usize,
+        clipboard_draft_reads: usize,
+    }
+
+    impl FakeEditor {
+        fn new(draft: &str, write: FakeWrite) -> Self {
+            Self {
+                draft: draft.into(),
+                write,
+                pending: None,
+                calls: Vec::new(),
+                writes: 0,
+                pastes: 0,
+                clipboard_draft_reads: 0,
+            }
+        }
+    }
+
+    impl WritableEditor for FakeEditor {
+        fn read_value(&mut self) -> AppResult<String> {
+            self.calls.push("read");
+            Ok(self.draft.clone())
+        }
+
+        fn validate(&mut self) -> AppResult<()> {
+            self.calls.push("validate");
+            Ok(())
+        }
+
+        fn write_value(&mut self, value: &str) -> bool {
+            self.calls.push("write");
+            self.writes += 1;
+            match self.write {
+                FakeWrite::Applied => self.draft = normalized(value),
+                FakeWrite::Dropped => {}
+                FakeWrite::AppliedLate => self.pending = Some(normalized(value)),
+                FakeWrite::Truncated(limit) => {
+                    self.draft = normalized(value).chars().take(limit).collect();
+                }
+            }
+            true
+        }
+
+        fn await_confirmation(
+            &mut self,
+            _previous: &str,
+            intended: &str,
+        ) -> AppResult<Confirmation> {
+            self.calls.push("confirm");
+            match self.write {
+                FakeWrite::Applied | FakeWrite::AppliedLate => {
+                    if let Some(pending) = self.pending.take() {
+                        self.draft = pending;
+                    }
+                    Ok(Confirmation::Confirmed)
+                }
+                FakeWrite::Dropped => Ok(Confirmation::Unconfirmed),
+                FakeWrite::Truncated(_) => Ok(Confirmation::Truncated(format!(
+                    "The original target accepted only {} of {} characters; the appended text was truncated",
+                    self.draft.chars().count(),
+                    normalized(intended).chars().count()
+                ))),
+            }
+        }
+
+        fn paste_append(
+            &mut self,
+            expected: &str,
+            replacement: &str,
+            known_draft: Option<&str>,
+            _trace: &mut DeliveryTrace,
+        ) -> AppResult<PasteOutcome> {
+            self.calls.push("paste");
+            let draft = match known_draft {
+                // The delivery that attempted a write re-reads the draft through the
+                // clipboard; a paste-only delivery reuses the draft it just read.
+                Some(known) => normalized(known),
+                None => {
+                    self.clipboard_draft_reads += 1;
+                    normalized(&self.draft)
+                }
+            };
+            match plan_paste(expected, replacement, &draft)? {
+                PastePlan::AlreadyComplete | PastePlan::NothingToAppend => {
+                    Ok(PasteOutcome::NotNeeded)
+                }
+                PastePlan::Append { separator, text } => {
+                    self.draft = format!("{}{separator}{text}", self.draft);
+                    self.pastes += 1;
+                    Ok(PasteOutcome::Appended)
+                }
+            }
+        }
+    }
+
+    fn editor_key() -> EditorKey {
+        EditorKey {
+            process: 4242,
+            runtime: vec![42, 9001],
+        }
+    }
+
+    #[test]
+    fn the_first_delivery_to_a_target_that_drops_the_write_tries_once_then_pastes() {
+        // #25: the first delivery keeps the existing behaviour. One direct write is
+        // attempted, its confirmation window passes, and the real fallback appends.
+        let mut editor = FakeEditor::new("原有草稿", FakeWrite::Dropped);
+        let memory = DeliveryMemory::default();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿",
+            "原有草稿\n第一行",
+        )
+        .unwrap();
+        assert_eq!(
+            editor.calls,
+            ["read", "validate", "write", "confirm", "paste"]
+        );
+        assert_eq!(editor.draft, "原有草稿\n第一行");
+        assert_eq!(editor.writes, 1);
+        assert_eq!(editor.pastes, 1);
+        assert!(
+            memory.known_to_drop_set_value(&editor_key()),
+            "a fallback that really pasted is what teaches the session"
+        );
+    }
+
+    #[test]
+    fn a_second_delivery_to_the_same_dropping_target_skips_the_write() {
+        // #25: once this session has seen the editor append through real editing
+        // keys, the next delivery goes straight to the fallback, so the 2 s
+        // confirmation window is never entered again.
+        let mut editor = FakeEditor::new("原有草稿", FakeWrite::Dropped);
+        let memory = DeliveryMemory::default();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿",
+            "原有草稿\n第一行",
+        )
+        .unwrap();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿\n第一行",
+            "原有草稿\n第一行\n第二行",
+        )
+        .unwrap();
+        assert_eq!(
+            editor.calls,
+            [
+                "read", "validate", "write", "confirm", "paste", "read", "validate", "paste"
+            ],
+            "the second delivery must not attempt the direct write"
+        );
+        assert_eq!(editor.writes, 1);
+        assert_eq!(editor.pastes, 2);
+        assert_eq!(
+            editor.clipboard_draft_reads, 1,
+            "only the delivery that attempted a write needs the clipboard draft read"
+        );
+        assert_eq!(editor.draft, "原有草稿\n第一行\n第二行");
+        assert_eq!(
+            editor.draft.matches("第一行").count(),
+            1,
+            "no part of a transcript may be written twice"
+        );
+    }
+
+    #[test]
+    fn a_target_that_writes_directly_keeps_the_direct_path_on_every_delivery() {
+        let mut editor = FakeEditor::new("原有草稿", FakeWrite::Applied);
+        let memory = DeliveryMemory::default();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿",
+            "原有草稿\n第一行",
+        )
+        .unwrap();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿\n第一行",
+            "原有草稿\n第一行\n第二行",
+        )
+        .unwrap();
+        assert_eq!(
+            editor.calls,
+            [
+                "read", "validate", "write", "confirm", "read", "validate", "write", "confirm"
+            ]
+        );
+        assert_eq!(editor.writes, 2);
+        assert_eq!(editor.pastes, 0);
+        assert!(!memory.known_to_drop_set_value(&editor_key()));
+    }
+
+    #[test]
+    fn a_late_write_is_confirmed_without_a_paste_and_teaches_nothing() {
+        // A provider that applies the write during the confirmation window is not a
+        // dropping provider. Pasting would duplicate the transcript, and remembering
+        // it would needlessly move a direct-write target onto the paste path.
+        let mut editor = FakeEditor::new("原有草稿", FakeWrite::AppliedLate);
+        let memory = DeliveryMemory::default();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿",
+            "原有草稿\n第一行",
+        )
+        .unwrap();
+        assert_eq!(editor.pastes, 0);
+        assert_eq!(editor.draft, "原有草稿\n第一行");
+        assert!(!memory.known_to_drop_set_value(&editor_key()));
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿\n第一行",
+            "原有草稿\n第一行\n第二行",
+        )
+        .unwrap();
+        assert_eq!(
+            editor.writes, 2,
+            "the next delivery still uses the direct write"
+        );
+    }
+
+    #[test]
+    fn a_truncated_write_is_reported_without_pasting_and_is_not_remembered() {
+        let mut editor = FakeEditor::new("capacity draft", FakeWrite::Truncated(20));
+        let memory = DeliveryMemory::default();
+        let error = replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "capacity draft",
+            "capacity draft\nthe appended transcript",
+        )
+        .unwrap_err();
+        assert!(error.contains("truncated"), "{error}");
+        assert_eq!(
+            editor.pastes, 0,
+            "never paste into an editor that reported a capacity limit"
+        );
+        assert!(!memory.known_to_drop_set_value(&editor_key()));
+    }
+
+    #[test]
+    fn a_changed_draft_blocks_a_repeat_delivery_before_any_key_is_sent() {
+        let mut editor = FakeEditor::new("原有草稿", FakeWrite::Dropped);
+        let memory = DeliveryMemory::default();
+        replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "原有草稿",
+            "原有草稿\n第一行",
+        )
+        .unwrap();
+        let error = replace_content(
+            &mut editor,
+            &memory,
+            &editor_key(),
+            "a stale draft",
+            "a stale draft\n第二行",
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(
+            editor.pastes, 1,
+            "nothing may be appended when the draft is not the expected one"
+        );
+        assert_eq!(editor.draft, "原有草稿\n第一行");
     }
 }
