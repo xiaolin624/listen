@@ -355,6 +355,56 @@ fn stop_to_result_for_ten_seconds_of_speech_is_at_the_one_second_scale() {
 
 #[test]
 #[ignore = "requires the pinned SenseVoice engine and the generated quality corpus"]
+fn probe_wav_transcripts_are_recorded_for_the_verification_document() {
+    let _engine = engine_guard();
+    println!(
+        "AVX2 available: {}",
+        std::arch::is_x86_feature_detected!("avx2")
+    );
+    // The probe WAVs live beside the generated corpus under `.artifacts`.
+    let probe_directory = configured_path("LISTEN_QUALITY_CORPUS")
+        .parent()
+        .expect("the corpus path has a parent")
+        .join("asr-quality-probe");
+    assert!(
+        probe_directory.is_dir(),
+        "missing probe WAV directory: {}",
+        probe_directory.display()
+    );
+    let engine = sense_voice();
+    let receiver = engine
+        .prepare()
+        .expect("the resident SenseVoice engine must report preparation");
+    receiver
+        .recv_timeout(Duration::from_secs(120))
+        .expect("preparation must finish")
+        .expect("the pinned engine must load");
+    let directory = temp_runtime("probe-transcripts");
+    for sample in [
+        "zh-term",
+        "zh-term-degraded",
+        "en-term",
+        "en-term-degraded",
+        "en-sentence",
+        "en-sentence-degraded",
+    ] {
+        let audio = CapturedAudio {
+            path: probe_directory.join(format!("{sample}.wav")),
+            description: format!("probe fixture {sample}"),
+        };
+        let text = engine.transcribe(&audio, &directory).unwrap();
+        println!("probe transcript {sample}: {text}");
+        assert!(!text.trim().is_empty(), "{sample}: no transcript");
+        assert!(
+            !text.contains("<|"),
+            "{sample}: control tags leaked: {text}"
+        );
+    }
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires the pinned SenseVoice engine and the generated quality corpus"]
 fn timed_spans_follow_the_vad_utterances_instead_of_the_whole_window() {
     let _engine = engine_guard();
     let engine = sense_voice();
