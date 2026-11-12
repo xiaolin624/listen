@@ -716,6 +716,30 @@ Rust | re
     }
 
     #[test]
+    fn the_shipped_canonical_forms_alone_catch_the_removed_variants() {
+        // The matcher normalizes spaces, hyphens and case, and a multi-word canonical
+        // term is also matched by its distinctive leading word. Prove that two
+        // aliases are derivable before keeping the shipped list one-entry-per-term:
+        // `wa-sa-pi` normalizes to `wasapi` and `waapp loop back` is caught by
+        // `WASAPI loopback`, so neither variant needs its own alias.
+        let canonical_only: String = SHIPPED
+            .lines()
+            .map(|line| line.split('|').next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let glossary = Glossary::parse(&canonical_only).unwrap();
+        for (input, expected) in [
+            ("通过 wa-sa-pi 采集。", "通过 WASAPI 采集。"),
+            (
+                "通过waapp loop back获取声音。",
+                "通过WASAPI loopback获取声音。",
+            ),
+        ] {
+            assert_eq!(glossary.correct(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
     fn the_shipped_glossary_leaves_clean_chinese_and_ordinary_latin_text_alone() {
         let glossary = Glossary::parse(SHIPPED).unwrap();
         let cases = [

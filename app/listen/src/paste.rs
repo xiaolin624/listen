@@ -143,7 +143,7 @@ fn classify_clipboard(
     }
     if !text_format {
         return Err(
-            "The system clipboard holds non-text data (for example copied files or an image); the paste fallback was not used and that content was left untouched. Copy the complete result from the fallback text box instead."
+            "The system clipboard holds non-text data (for example copied files or an image); the paste fallback was not used and that content was left untouched. Copy the complete result from the expanded result panel instead."
                 .into(),
         );
     }
@@ -157,7 +157,7 @@ fn classify_clipboard(
                 _ => String::new(),
             };
             Err(format!(
-                "The system clipboard text could not be read{detail}, so the paste fallback was not used and the clipboard was left untouched. Copy the complete result from the fallback text box instead."
+                "The system clipboard text could not be read{detail}, so the paste fallback was not used and the clipboard was left untouched. Copy the complete result from the expanded result panel instead."
             ))
         }
     }

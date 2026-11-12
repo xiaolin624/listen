@@ -168,6 +168,9 @@ pub enum Preparation {
 /// refresh. `preparation_ms` covers first-use model loading only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
+    /// `Control::Start`/hotkey dispatch to `Phase::Capturing`, including binding the
+    /// target and starting the device. #15's target is under 1 s.
+    pub capture_start_ms: Option<u64>,
     pub preparation_ms: Option<u64>,
     pub stop_to_result_ms: Option<u64>,
     pub finalize_ms: Option<u64>,
@@ -250,6 +253,34 @@ impl Refine {
 const NO_REFINE_PORT: &str =
     "No DeepSeek refine connector is configured, so the current result cannot be refined.";
 
+/// A condition outside the capture state machine that the user must still see.
+/// It is reported separately from [`Snapshot::detail`] so a live capture's 100 ms
+/// progress rewrite cannot erase it, and from [`Phase`] because no phase changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// The clipboard copy failed. The previous clipboard content was not replaced,
+    /// so the user must not assume the result is pasteable.
+    CopyFailed(String),
+    /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed, so the resident
+    /// status capsule is visible to screen sharing and recordings.
+    CaptureExcluded(String),
+}
+
+impl Notice {
+    /// The one user-facing sentence. It always names the consequence, not just the
+    /// platform error.
+    pub fn text(&self) -> String {
+        match self {
+            Notice::CopyFailed(reason) => format!(
+                "Could not copy the result: {reason}. The clipboard was not replaced; the complete result is still in the panel and can be selected and copied by hand."
+            ),
+            Notice::CaptureExcluded(reason) => format!(
+                "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and local recognition are unaffected."
+            ),
+        }
+    }
+}
+
 /// Line endings are not part of a target's meaning: editors may report the same
 /// content with CRLF or LF, so every refine comparison uses this form.
 fn normalize_newlines(value: &str) -> String {
@@ -278,6 +309,10 @@ pub struct Snapshot {
     /// edited, or could not be confirmed unchanged). It is shown in the expanded
     /// panel while `text` keeps the complete local result.
     pub refined_text: Option<String>,
+    /// A user-visible problem outside the capture flow (a failed clipboard copy, a
+    /// capsule that cannot be hidden from screen capture). `None` when there is
+    /// nothing to report.
+    pub notice: Option<Notice>,
 }
 
 /// States which render route the capture is bound to and which routes are outside
@@ -292,7 +327,7 @@ fn capture_scope(endpoint: Option<&CaptureEndpoint>) -> String {
     }
 }
 
-const READY_DETAIL: &str = "Ready. Ctrl+Alt+R captures only the default multimedia playback endpoint; audio routed only to the default communication endpoint or another device is outside this capture. Closing the window keeps Listen in the tray.";
+const READY_DETAIL: &str = "Ready. Ctrl+Alt+R captures only the default multimedia playback endpoint; audio routed only to the default communication endpoint or another device is outside this capture. Closing the result panel keeps Listen running in the tray.";
 
 /// The honest local-processing detail while the stopped capture waits for the
 /// still-loading model. Nothing has been delivered or failed yet.
@@ -640,7 +675,7 @@ fn refine_delivery(
 /// Nothing was sent to the target because selection, reading, or saving failed first.
 fn not_delivered(reason: String) -> String {
     format!(
-        "{reason}. No text was written to any control. The complete result is in the fallback text box. Review and copy it to the intended input."
+        "{reason}. No text was written to any control. The complete result is in the expanded result panel. Review and copy it to the intended input."
     )
 }
 
@@ -654,7 +689,7 @@ fn failed_write(
     observed: AppResult<String>,
 ) -> (Delivery, String) {
     let advice = "Check the original target before copying; output is not retried automatically and the original text is not reverted.";
-    let fallback = "The complete result is in the fallback text box.";
+    let fallback = "The complete result is in the expanded result panel.";
     let observed = match observed {
         Ok(observed) => observed,
         Err(read_error) => {
@@ -792,6 +827,7 @@ impl Application {
                 timing: Timing::default(),
                 refine: Refine::Unavailable(NO_REFINE_PORT.into()),
                 refined_text: None,
+                notice: None,
             },
             audio,
             transcriber,
@@ -867,6 +903,36 @@ impl Application {
         self
     }
 
+    /// Copy the complete current result through the caller's clipboard writer. Only
+    /// the clipboard is written: never a target, never a keystroke. A failure is
+    /// surfaced as [`Notice::CopyFailed`] instead of being dropped, because a user
+    /// who asked for a copy must not be left assuming the clipboard is pasteable.
+    pub fn copy_result(&mut self, copy: impl FnOnce(&str) -> AppResult<()>) {
+        if self.snapshot.text.is_empty() {
+            return;
+        }
+        match copy(&self.snapshot.text) {
+            Ok(()) => {
+                if matches!(self.snapshot.notice, Some(Notice::CopyFailed(_))) {
+                    self.snapshot.notice = None;
+                }
+            }
+            Err(error) => {
+                self.snapshot.notice =
+                    Some(Notice::CopyFailed(error.trim_end_matches('.').to_string()));
+            }
+        }
+    }
+
+    /// Report that the platform refused to hide the resident capsule from screen
+    /// capture. The ADR promises the capsule is hidden from every screen share, so a
+    /// failure must not stay visible only as `capsule_capture_excluded=0`.
+    pub fn report_capture_exclusion(&mut self, reason: &str) {
+        self.snapshot.notice = Some(Notice::CaptureExcluded(
+            reason.trim_end_matches('.').to_string(),
+        ));
+    }
+
     /// Whether the connected port can run at all. Availability never performs
     /// network work: the DeepSeek implementation only checks for the local key.
     fn refine_availability(&self) -> Result<(), String> {
@@ -935,6 +1001,7 @@ impl Application {
         }
         match control {
             Control::Start if self.recording.is_none() && self.completion.is_none() => {
+                let start_requested = Instant::now();
                 if self.retry.is_some() {
                     self.snapshot.detail = "A failed capture's audio is retained for local retry. Retry local recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
                     return;
@@ -994,6 +1061,11 @@ impl Application {
                             "Playback is being captured; stop and wait for the complete result before refining."
                                 .into(),
                         );
+                        // A stale copy failure belongs to the previous result; the
+                        // capsule-exclusion warning is a session-wide fact and stays.
+                        if matches!(self.snapshot.notice, Some(Notice::CopyFailed(_))) {
+                            self.snapshot.notice = None;
+                        }
                         self.snapshot.detail = self.with_glossary_note(format!(
                             "{}{}",
                             capture_scope(self.snapshot.endpoint.as_ref()),
@@ -1001,6 +1073,7 @@ impl Application {
                         ));
                         self.snapshot.timing = Timing {
                             preparation_ms: self.snapshot.timing.preparation_ms,
+                            capture_start_ms: Some(elapsed_ms(start_requested)),
                             ..Timing::default()
                         };
                     }
@@ -1014,6 +1087,9 @@ impl Application {
             Control::Stop if self.recording.is_some() => {
                 let stop_at = Instant::now();
                 let preparation_ms = self.snapshot.timing.preparation_ms;
+                // Carry the start latency into the final record; it describes this
+                // capture and would otherwise be replaced when the result lands.
+                let capture_start_ms = self.snapshot.timing.capture_start_ms;
                 let recording = self.recording.take().unwrap();
                 let directory = self.session.take().unwrap();
                 let transcriber = self.transcriber.clone();
@@ -1041,6 +1117,7 @@ impl Application {
                     let recognition_ms = elapsed_ms(recognition_started);
                     let mut timing = Timing {
                         preparation_ms,
+                        capture_start_ms,
                         finalize_ms: Some(finalize_ms),
                         recognition_ms: Some(recognition_ms),
                         ..Timing::default()
@@ -1544,7 +1621,7 @@ impl Application {
         }
         self.fail(directory.as_deref(), message);
         if retryable {
-            self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the fallback text box is used if it is no longer valid.");
+            self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
         } else if streaming && recognized_segments > 0 {
             self.snapshot.detail.push_str(&format!(
                 "\nThis capture was partially recognized before the preparation failure ({recognized_segments} window(s) had been checkpointed). Those windows' audio was released after recognition, so automatic local retry is not offered here; the remaining audio paths are listed for manual recovery."
@@ -1764,7 +1841,7 @@ impl Application {
                 self.record_latency("Failure", &timing, &directory);
                 self.fail(Some(&directory), error);
                 if retryable {
-                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the fallback text box is used if it is no longer valid.");
+                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
                 } else if let Some(scope) = retry_scope {
                     self.snapshot.detail.push_str("\n");
                     self.snapshot.detail.push_str(&scope);
@@ -1788,6 +1865,7 @@ impl Application {
             "backend": self.snapshot.backend,
             "delivery": format!("{:?}", self.snapshot.delivery),
             "text_chars": self.snapshot.text.chars().count(),
+            "capture_start_ms": timing.capture_start_ms,
             "preparation_ms": timing.preparation_ms,
             "stop_to_result_ms": timing.stop_to_result_ms,
             "finalize_ms": timing.finalize_ms,
@@ -1852,7 +1930,7 @@ impl Application {
             if let Ok(text) = fs::read_to_string(&path) {
                 if !text.is_empty() {
                     self.snapshot.text = text;
-                    self.snapshot.detail.push_str(&format!(". The capture was interrupted, so this text is incomplete: it is shown in the fallback box and stored at {}. This is not a completed transcription.", path.display()));
+                    self.snapshot.detail.push_str(&format!(". The capture was interrupted, so this text is incomplete: it is shown in the expanded result panel and stored at {}. This is not a completed transcription.", path.display()));
                 }
             }
         }

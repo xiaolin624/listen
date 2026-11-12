@@ -177,7 +177,7 @@ pub fn run(config: Config) -> Result<(), String> {
         // state is deliberately "not ready yet" rather than a false "ready".
         let capsule = capsule_window::create(&config.runtime, CapsuleState::Preparing)?;
 
-        let app = Application::new(
+        let mut app = Application::new(
             Arc::new(WasapiPlayback),
             config.transcriber(),
             config.runtime.clone(),
@@ -188,6 +188,12 @@ pub fn run(config: Config) -> Result<(), String> {
         // reports itself unavailable and the refine entry stays disabled.
         .with_refine(Arc::new(DeepSeek::from_environment()));
         capsule.set_state(capsule_state(&app.snapshot()));
+        // The ADR promises the capsule is invisible to every screen share. If the
+        // platform refuses, say so in the panel/status instead of leaving only
+        // `capsule_capture_excluded=0` to be discovered by reading a file.
+        if let Some(reason) = capsule.capture_exclusion_error().map(str::to_string) {
+            app.report_capture_exclusion(&reason);
+        }
 
         let mut state = Ui {
             app,
@@ -300,9 +306,10 @@ impl Ui {
                 self.last_panel_text = panel_text;
             }
 
-            // A result that could not be appended and every failure open the panel
-            // by themselves, once per event: the text must be reachable without the
-            // user discovering the capsule. A successful append never does.
+            // A result that could not be appended opens the panel by itself once:
+            // the text must be reachable without the user discovering the capsule.
+            // A successful append and a failure never do; the capsule turns red for
+            // a failure and the user clicks it to read the reason.
             let auto_open = panel::auto_open_key(&state);
             if auto_open != self.last_auto_open {
                 if auto_open.is_some() {
@@ -326,6 +333,7 @@ impl Ui {
                     || last.timing != state.timing
                     || last.refine != state.refine
                     || last.refined_text != state.refined_text
+                    || last.notice != state.notice
             });
             let phase_changed = self
                 .last
@@ -347,8 +355,15 @@ impl Ui {
                 | Refine::Failed(reason) => reason.replace('\r', "").replace('\n', " "),
                 _ => String::new(),
             };
+            // A notice is a user-facing sentence with no key=value structure; it is
+            // one line so `status.txt` stays a simple contract.
+            let notice = state
+                .notice
+                .as_ref()
+                .map(|notice| notice.text().replace('\r', "").replace('\n', " "))
+                .unwrap_or_default();
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\nrefine={}\nrefine_reason={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -378,6 +393,7 @@ impl Ui {
                 preparation_name(state.preparation),
                 state.refine.name(),
                 refine_reason,
+                notice,
                 visual.name(),
                 if panel_visible { 1 } else { 0 },
                 panel_error,
@@ -387,6 +403,10 @@ impl Ui {
                 } else {
                     0
                 },
+                timing
+                    .capture_start_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 timing
                     .preparation_ms
                     .map(|value| value.to_string())
@@ -554,12 +574,11 @@ impl Ui {
         }
     }
 
-    /// Clipboard only: never pastes, never sends, never touches a target.
-    fn copy_result(&self) {
-        let text = self.app.snapshot().text;
-        if !text.is_empty() {
-            let _ = paste::copy_to_clipboard(&text);
-        }
+    /// Clipboard only: never pastes, never sends, never touches a target. A
+    /// platform refusal is reported through the snapshot, so the panel and
+    /// `status.txt` say the clipboard was not replaced.
+    fn copy_result(&mut self) {
+        self.app.copy_result(paste::copy_to_clipboard);
     }
 
     unsafe fn command(&mut self, id: usize) {

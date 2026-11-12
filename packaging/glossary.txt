@@ -14,17 +14,22 @@
 #
 # Keep one entry per term. The canonical form alone already catches common
 # mis-recognitions ("deep sea harnessness", "deep seek harness", "DeepSek
-# harnessness", "deepsek"); aliases are only for stubborn or non-Latin variants.
+# harnessness", "deepsek", "waapp loop back", "wa-sa-pi"); spaces, '-' and case are
+# normalized before matching. Aliases are only for what the matcher cannot infer:
+# pinyin/Chinese spellings and short forms next to Chinese text.
 
 # DeepSeek's harness product. "DeepSeek" itself is caught by the leading word,
 # and the pinyin/Chinese spellings are what a user may add for their own audio.
 DeepSeek Harness | shen du qiu suo, 迪普西克
 
-# Windows audio APIs. "waapp loop back" is the measured engine output.
-WASAPI | waapp, wa-sa-pi
-WASAPI loopback | waapp loop back
+# Windows audio APIs. "WASAPI loopback" already catches "waapp loop back" through
+# approximate matching, so that spelling is not listed; the standalone "waapp"
+# form keeps its alias because "WASAPI" is too short to match it approximately.
+WASAPI | waapp
+WASAPI loopback
 
-# CUDA is often heard as "ku" or "ku da" in Chinese speech.
+# CUDA is often heard as "ku" or "ku da" in Chinese speech; the canonical form is
+# too short for approximate matching, so the measured short forms stay.
 CUDA | ku da, ku
 
 GPU

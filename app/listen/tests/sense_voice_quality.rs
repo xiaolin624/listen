@@ -20,6 +20,7 @@ use listen::{
     PlaybackAudio, Recording, Snapshot,
     sensevoice::SenseVoice,
     streaming::{SegmentConfig, SegmentStream, SegmentedAudioWriter},
+    whisper::{Backend, Whisper},
 };
 use std::{
     fs,
@@ -219,15 +220,17 @@ fn a_mandarin_long_sentence_is_simplified_and_punctuated_at_the_application_boun
 
 #[test]
 #[ignore = "requires the pinned SenseVoice engine and the generated quality corpus"]
-fn mixed_chinese_english_keeps_technical_words_and_is_no_worse_than_whisper() {
+fn the_shipped_glossary_repairs_the_production_chain_for_mixed_chinese_english() {
     let _engine = engine_guard();
     let runtime = temp_runtime("mixed");
     // The integrated application corrects the transcript with the local glossary
     // (#18) before delivery. Write the entries that match this recording's
     // measured whole-window engine forms ("re", "waapp loop back") so this test
-    // exercises the real product chain: SenseVoice -> glossary -> result. The
-    // engine itself is still allowed to be imperfect on proper nouns; the
-    // glossary is the agreed mitigation (ADR 0001), not a hidden re-decode.
+    // exercises the real product chain: SenseVoice -> glossary -> result. It does
+    // not compare against whisper and does not claim "no worse than whisper"; the
+    // engine-comparison test below states that outcome honestly. The engine itself
+    // is still allowed to be imperfect on proper nouns; the glossary is the agreed
+    // mitigation (ADR 0001), not a hidden re-decode.
     fs::write(
         runtime.join("glossary.txt"),
         "Rust | re\nWASAPI loopback | waapp loop back\n",
@@ -267,6 +270,134 @@ fn mixed_chinese_english_keeps_technical_words_and_is_no_worse_than_whisper() {
     assert_simplified(&result.text);
     assert!(result.retained_audio.is_empty());
     fs::remove_dir_all(&runtime).unwrap();
+}
+
+/// The source sentence behind the generated `mandarin.wav` fixture. CER compares
+/// it with both engines' delivered text, ignoring case, spaces and punctuation so
+/// the comparison measures words, not formatting.
+const MANDARIN_REFERENCE: &str =
+    "这段语音只在本机处理，不会上传到云端，请保留完整的发言内容，由我检查以后手动发送。";
+
+/// The source sentence behind the generated `mixed-technical.wav` fixture.
+const MIXED_REFERENCE: &str = "我们用 Rust 实现音频采集，通过 WASAPI loopback 获取声音，模型在本机运行，使用 CPU 和 CUDA 进行对照。";
+
+fn whisper() -> Whisper {
+    Whisper::with_backend(
+        configured_path("LISTEN_WHISPER_CLI"),
+        configured_path("LISTEN_WHISPER_MODEL"),
+        configured_path("LISTEN_WHISPER_VAD"),
+        "zh".into(),
+        6,
+        Backend::ModelHost,
+    )
+}
+
+fn prepare(engine: &dyn LocalTranscriber) {
+    if let Some(receiver) = engine.prepare() {
+        receiver
+            .recv_timeout(Duration::from_secs(180))
+            .expect("preparation must finish")
+            .expect("the configured local engine must load");
+    }
+}
+
+/// CER characters: case-folded alphanumerics only. Punctuation is a formatting
+/// difference, not a recognition error, and is asserted separately where the
+/// product promises it (the Mandarin acceptance test).
+fn cer_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn character_error_rate(reference: &str, hypothesis: &str) -> f64 {
+    let reference = cer_chars(reference);
+    let hypothesis = cer_chars(hypothesis);
+    // Levenshtein distance over characters; expected values come from the source
+    // sentence above, not from the engine.
+    let mut previous: Vec<usize> = (0..=hypothesis.len()).collect();
+    let mut current = vec![0usize; hypothesis.len() + 1];
+    for (row, reference_character) in reference.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, hypothesis_character) in hypothesis.iter().enumerate() {
+            let substitution =
+                previous[column] + usize::from(reference_character != hypothesis_character);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[hypothesis.len()] as f64 / reference.len().max(1) as f64
+}
+
+/// #17's AC1 claims SenseVoice is "obviously better than the current whisper" on
+/// mixed Chinese/English. No other test asserts that against whisper itself, so
+/// this one runs the same WAV through both real engines and states the outcome:
+/// Mandarin is asserted not-worse, and the mixed English-proper-noun case asserts
+/// only what is actually observed (whisper is allowed to win there; the glossary,
+/// not this engine, owns proper nouns per ADR 0001).
+#[test]
+#[ignore = "requires both real engines, LISTEN_WHISPER_* and the generated quality corpus"]
+fn sense_voice_is_not_worse_than_whisper_on_mandarin_and_the_mixed_outcome_is_stated() {
+    let _engine = engine_guard();
+    let directory = temp_runtime("engine-comparison");
+    let sensevoice = sense_voice();
+    let whisper = whisper();
+    prepare(&sensevoice);
+    prepare(&whisper);
+
+    let mut measured = Vec::new();
+    for (label, sample, reference) in [
+        ("mandarin", "mandarin", MANDARIN_REFERENCE),
+        ("mixed-technical", "mixed-technical", MIXED_REFERENCE),
+    ] {
+        let audio = CapturedAudio {
+            path: corpus(sample),
+            description: format!("known offline WAV fixture {sample}"),
+        };
+        let sensevoice_text = sensevoice.transcribe(&audio, &directory).unwrap();
+        let whisper_text = whisper.transcribe(&audio, &directory).unwrap();
+        let sensevoice_cer = character_error_rate(reference, &sensevoice_text);
+        let whisper_cer = character_error_rate(reference, &whisper_text);
+        println!(
+            "{label}: sensevoice CER {sensevoice_cer:.3} => {sensevoice_text}\n{label}: whisper    CER {whisper_cer:.3} => {whisper_text}"
+        );
+        measured.push((label, sensevoice_cer, whisper_cer));
+    }
+
+    let mandarin = measured[0];
+    assert!(
+        mandarin.1 <= mandarin.2,
+        "SenseVoice must not be worse than whisper on Mandarin: SenseVoice CER {} vs whisper CER {}",
+        mandarin.1,
+        mandarin.2
+    );
+
+    // The mixed fixture's true outcome (measured 2026-11-12): SenseVoice keeps the
+    // Mandarin words and "CPU"/"音频采集", but whisper is stronger on the English
+    // proper nouns (`WASAPI loopback`): whisper CER 0.130 vs SenseVoice 0.167.
+    // SenseVoice also drops `CUDA` in this context. Assert exactly that instead of
+    // pretending SenseVoice wins everywhere; the glossary owns proper nouns
+    // (ADR 0001), which is why the production-chain test above exists separately.
+    let mixed = measured[1];
+    println!(
+        "mixed-technical outcome: SenseVoice CER {:.3}, whisper CER {:.3} (whisper wins on English proper nouns; the glossary owns those, not the engine)",
+        mixed.1, mixed.2
+    );
+    assert!(
+        mixed.2 < mixed.1,
+        "the mixed fixture is the honest counterexample (whisper CER {} < SenseVoice CER {}); if this flips, update the recorded outcome instead of silently weakening it",
+        mixed.2,
+        mixed.1
+    );
+    assert!(
+        mixed.1 > 0.0,
+        "the mixed fixture must show a real SenseVoice error so this is an honest comparison: {mixed:?}"
+    );
+
+    fs::remove_dir_all(&directory).unwrap();
 }
 
 /// Feeds a real captured WAV through the production bounded-window writer so a
@@ -538,7 +669,7 @@ fn probe_wav_transcripts_are_recorded_for_the_verification_document() {
 
 #[test]
 #[ignore = "requires the pinned SenseVoice engine and the generated quality corpus"]
-fn timed_spans_follow_the_vad_utterances_instead_of_the_whole_window() {
+fn one_mandarin_window_delivers_every_source_phrase_exactly_once() {
     let _engine = engine_guard();
     let engine = sense_voice();
     let receiver = engine
@@ -552,33 +683,33 @@ fn timed_spans_follow_the_vad_utterances_instead_of_the_whole_window() {
         path: corpus("mandarin"),
         description: "known offline WAV fixture".into(),
     };
-    let directory = temp_runtime("spans");
-    let spans = engine.transcribe_segment(&audio, &directory).unwrap();
-    let rendered: Vec<(u64, u64, String)> = spans
-        .iter()
-        .map(|span| (span.start_ms, span.end_ms, span.text.trim().to_string()))
+    let directory = temp_runtime("mandarin-once");
+    // Only the delivered text is asserted. #15's Testing Decisions forbid asserting
+    // engine-internal span timestamps; the long-capture test already proves the
+    // 30 s overlap merge keeps each phrase once across a real recording, and this
+    // proves the same property for one whole production window.
+    let text = engine.transcribe(&audio, &directory).unwrap();
+    println!("mandarin single-window result: {text}");
+    let normalized: String = text
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
         .collect();
-    assert!(
-        spans.len() >= 2,
-        "expected per-utterance spans: {rendered:?}"
-    );
-    let mut previous_end = 0;
-    for span in &spans {
-        assert!(span.start_ms < span.end_ms, "{rendered:?}");
-        assert!(
-            span.end_ms <= 10_800,
-            "span outside the window: {rendered:?}"
+    for phrase in [
+        "这段语音只在本机处理",
+        "不会上传到云端",
+        "保留完整的发言内容",
+        "由我检查以后手动发送",
+    ] {
+        assert_eq!(
+            normalized.matches(phrase).count(),
+            1,
+            "phrase {phrase:?} must appear exactly once in: {text}"
         );
-        assert!(
-            span.start_ms >= previous_end,
-            "spans must not overlap or reorder: {rendered:?}"
-        );
-        assert!(!span.text.trim().is_empty(), "{rendered:?}");
-        previous_end = span.end_ms;
     }
-    assert!(spans[0].start_ms < 500, "{rendered:?}");
-    assert!(spans.last().unwrap().end_ms > 9_000, "{rendered:?}");
-    println!("mandarin spans: {rendered:?}");
+    assert!(text.contains('，'), "{text}");
+    assert!(text.contains('。'), "{text}");
+    assert_simplified(&text);
     fs::remove_dir_all(&directory).unwrap();
 }
 
