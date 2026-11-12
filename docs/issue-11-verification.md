@@ -11,7 +11,7 @@
 - 状态序列观测到 `Preparing → Ready → Capturing → Processing → Result`；首次启动到 Ready 的模型准备为 618 ms（进程启动/轮询后约 1.1 秒）。同包首次/后续停止→结果 6674/6652 ms，没有额外的“准备后首次识别”冷启动。
 - 600 秒会话：22 个识别窗口、停止→结果 **6921 ms**、峰值积压 **1**、结束 spool **0 字节**；资源峰值/平均见下表。不是 60 分钟，也不是产品时长上限。
 - 真实识别质量仍保留已知错误（繁体/标点、`WASAPI loopback`→`Waze up high loop back`、`本季`→`本机`、英文句被译写等）；不宣称任意会议逐字零错误。
-- 包内三个二进制没有网络导入，真实采集期间 `listen.exe` 未加载网络模块。**提权防火墙临时封禁复验由主会话补做**，本文不把它标为已完成。
+- 包内三个二进制没有网络导入，真实采集期间 `listen.exe` 未加载网络模块。**提权防火墙临时封禁复验已于 2026-11-12 11:02 在用户批准的一次 UAC 下完成**：三条出站封禁规则生效期间，从交付包本身跑通完整流程（`Ready` 1.347 s、停止→结果 7.138 s、目标追加正确），规则随后删除并读回 `cleanup_complete: true`、残留 0 条。
 
 ## 环境与基线
 
@@ -100,7 +100,7 @@
 | # | 验收条件 | 本包证据 |
 | --- | --- | --- |
 | 1 | 可运行包、模型准备、缺失反馈；不需要开发脚本或独立推理命令 | 交付目录、`启动 Listen.cmd`、包内 README、manifest；launcher smoke；无模型/缺 libunwind/缺引擎 DLL 反馈；`listen.exe` 内部启动引擎 |
-| 2 | 模型就绪后（断网）从启动到目标交付真实流程，识别本地 | 包内真实采集/识别/交付；PE 导入无网络；运行期模块无网络；**提权防火墙封禁由主会话补做**；此前 #9 防火墙证据引用 |
+| 2 | 模型就绪后（断网）从启动到目标交付真实流程，识别本地 | 包内真实采集/识别/交付；PE 导入无网络；运行期模块无网络；**提权防火墙封禁三个包内二进制后重跑完整流程通过**（文末）；此前 #9 防火墙证据引用 |
 | 3 | 真实耳机和桌面/网页编辑区集成；记录通过和平台限制；不要求应用/来源选择 | 真实 WH-1000XM4 端点原生 EDIT 流程；Chrome textarea/contenteditable 流程；状态写明端点、no microphone、不要求选择应用；限制章节 |
 | 4 | 原文/采集中新增编辑保留、完整追加、无自动发送；目标失效/只读/超长/写入未确认备用输出 | 首次流程保留两份原文 + 采集中输入 + 完整追加一次；邻居/其他窗口不变；发送 0/Enter 0；只读、容量 40（39/54 截断）、目标销毁、silent 写入未确认回退 |
 | 5 | 失败重试、成功清理、无自动历史、设备中断、长时间和资源受压 | 假引擎失败/同 WAV 重试/修复后成功/清理；设备真实切换中断并还原；600 秒长会话；受限 spool/延迟压力 |
@@ -179,7 +179,7 @@
 
 - 包内 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 的 PE 导入表没有 `ws2_32`、`winhttp`、`wininet`、`urlmon`、`dnsapi`、`mswsock`，也没有 socket/connect/http 导入（`offline\pe-imports.txt`）。
 - 真实采集期间轮询包内 `listen.exe` 的已加载模块，记录在 `offline\module-evidence.json`：共 36 个模块（含 `whisper.dll`、`ggml*.dll`、`libunwind.dll` 和 VC++ 运行库），模块中没有上述网络 DLL。
-- **提权防火墙临时封禁 `listen.exe`、`whisper-cli.exe`、`vad-speech-segments.exe` 后重跑包内流程的步骤由主会话补做**。本文不把静态导入/模块证据写成防火墙实测；此前 #9 的防火墙封禁证据是另一环境记录，不能替代本包复验。
+- **提权防火墙临时封禁 `listen.exe`、`whisper-cli.exe`、`vad-speech-segments.exe` 后重跑包内流程已完成**，见文末“包内二进制的系统级强制禁网复验（2026-11-12）”。PE 导入/运行期模块与本条是独立证据，不能互相替代。
 
 ## 600 秒长会话与资源
 
@@ -290,7 +290,7 @@ status.txt
 
 ## 已知限制与未覆盖
 
-- **断网防火墙复验**：由主会话补做；本任务只提供无网络导入、无网络运行期模块的本地证据。
+- **断网防火墙复验**：已完成（文末）；三个包内二进制在系统级出站封禁下跑通完整流程。限制是短样本、单场景，不是长时间浸泡或物理断网。
 - **60 分钟真实耳机**：没有重复跑 60 分钟；600 秒是静默回放+包内引擎，60 分钟结论引用 #6 的历史记录。真实耳机连续 60 分钟未测。
 - **真实会议软件并发**：没有加入真实会议软件；600 秒在后台桌面、无其他会议负载下测得。真实视频/网络/共享屏幕负载未覆盖。
 - **GPU**：本机无 CUDA toolkit，`use_gpu=false`；没有 GPU 加速交付。
@@ -370,7 +370,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 - PE 导入：`listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`、`engine\whisper.dll` 都**没有** `ws2_32`/`winhttp`/`wininet`/`urlmon`/`dnsapi`/`mswsock` 名称；
 - 运行期：同一次打包运行中，三个进程共加载 **57 个模块，没有网络模块**。
 
-**未完成项（如实记录）**：本会话尝试用提权防火墙临时封禁包内三个二进制，但 UAC 提权被取消（`The operation was canceled by the user`），所以**打包产物没有在系统级强制禁网下运行过**。此前 `9faa9c3` 的强制禁网验收覆盖的是同一套采集与识别源码；#10 之后新增的进程内 host 只加载 `whisper.dll`，该 DLL 同样没有任何网络导入。如果要对这个包做同等强度的禁网验收，需要在有人在场时批准一次提权，然后用与 `.artifacts\offline-firewall-helper-package.ps1` 相同的步骤重跑。
+**当时未完成（如实记录）**：该轮尝试用提权防火墙临时封禁包内三个二进制，但 UAC 提权被取消（`The operation was canceled by the user`），所以当时**打包产物没有在系统级强制禁网下运行过**。**随后已补做（2026-11-12 11:02）**：用户批准一次 UAC 后，同一步骤重跑通过，规则已删除、残留 0；详见文末“包内二进制的系统级强制禁网复验（2026-11-12）”。
 ## 最终整体审查后的修复与回归（2026-11-12）
 
 本节的数字来自本工作树 `implement/final-review-fixes`（基线 `041019d`，修复提交 `87a75cf`）的离线锁定 release 构建和提交后重新打包的 `dist\Listen-0.1.0\`（含模型；`manifest.json` 记录 `git_commit=87a75cf…`、`git_dirty_at_package_time=false`）。证据在 `.artifacts/final-review-fixes\`。
@@ -405,7 +405,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 
 ### 仍未满足/未重跑
 
-- **SP-08 / T10 AC2**：打包产物**仍未**在系统级强制禁网下运行；本文只更新了静态/运行期证据的措辞，没有补做提权防火墙复验。#11 仍应保持 OPEN。
+- **SP-08 / T10 AC2**：已于 2026-11-12 补做通过——三个包内二进制在系统级出站封禁下跑通完整流程（文末）；本条不再是缺口。
 - **SP-09 / T10 AC7**：600 秒/资源数字来自 `examples\long_session.exe` harness + 包内引擎/模型，不是包内 `listen.exe` 的界面流程；本记录和发布说明已按此改写，但 T10 AC7 的严格字面要求仍未被 harness 测量满足。
 - **SP-11 / T9 AC5**：真实会议软件并发流畅度仍未验证；本轮未新增会议软件负载。
 - **准备时间**：新增的真实模型加载验证使默认 host 准备从约 0.57–0.71 s 增至约 1.45 s；8 样本/600 秒的停止→结果数字是准备改动前构建的记录，识别路径未变，但若要引用当前构建的完整延迟，应重新跑一次延迟验收。
@@ -414,12 +414,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\luyin\.worktrees\issu
 
 审查修复合并后（`cab4ef5`），用 `scripts\package-listen.ps1 -IncludeModels -SkipBuild` 从干净工作树重建了交付包，并用 `scripts\verify-listen-package.ps1` 重新校验：17 个文件、493,311,730 字节（不含 manifest），`Preparing → Ready`，`start_to_state_ms = 2027`，`control_quit_ok = true`，哈希校验 17/17。证据：`.artifacts\issue-11\package\verify-20261112-033626.json`。
 
-**打包产物的系统级禁网复验仍未完成**：本会话两次尝试用提权防火墙临时封禁包内 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`，两次 UAC 提权都被取消（`The operation was canceled by the user`），没有规则被创建（残留 0 条）。因此"包内二进制在系统级隔离下运行"这一条仍缺实测。
+## 包内二进制的系统级强制禁网复验（2026-11-12 11:02）
 
-替代证据（强度更高，但不能冒充同一条测试）：
+用 `.artifacts\offline-firewall-helper-final-package.ps1` 提权创建三条 `Outbound / Block / Program / 所有配置` 的临时规则，封禁 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`；规则状态写入 `rules-ready.json` 后，用 `.artifacts\issue-11-offline-driver\run-packaged-offline.ps1` 从 `dist\Listen-0.1.0` 启动并跑完整流程，随后写 `run-finished.signal`，辅助进程在 `finally` 中删除规则并写 `rules-removed.json`。
+
+| 观测 | 结果 |
+| --- | --- |
+| 临时规则 | 3 条，`Outbound` / `Block` / `Program` / `Profile=Any` / `Enabled=True`（`rules-ready.json`，03:02:24Z） |
+| 启动 | 直接运行包内 `listen.exe`（包内 engine/models；runtime 在包外），`Ready` **1.347 s** |
+| 后端 | 进程内常驻模型（加载 `whisper.dll`）；端点 `耳机 (WH-1000XM4)` |
+| 采集 | 默认多媒体端点播放 11.320 s 已知语音；`peak=0.92730`、`discontinuities=3` |
+| 停止→结果 | **7.138 s**（内部 `stop_to_result_ms=6996`，识别 6957 ms、1 个窗口、`delivery_ms=16`） |
+| 交付 | 原生多行 EDIT：原草稿保留，末尾追加转写恰一份；`target_ok=true`、`send=0`、`enter=0` |
+| 清理 | `cleanup_complete=true`、`still_present=[]`；事后查询残留 **0** 条（03:04:54Z） |
+
+证据：`.artifacts\offline-firewall-final\rules-ready.json`、`.artifacts\issue-11-offline-final\offline-package-evidence.json`、`.artifacts\offline-firewall-final\rules-removed.json`。
+
+可复现性说明：这次为最终包重跑驱动时，只改了 QA 脚本的两处健壮性问题——焦点改为先激活测试窗体再真实点击进入 EDIT（子控件不能直接 `SetForegroundWindow`），以及 `status.txt` / `current-result.txt` 被写入方短暂占用时重试读取。产品代码与包内二进制未改。
+
+替代证据（仍成立，但不替代上述实测）：
 
 - 包内 `listen.exe`、`engine\whisper-cli.exe`、`engine\vad-speech-segments.exe`、`engine\whisper.dll` 都没有任何 `ws2_32`/`mswsock`/`winhttp`/`wininet`/`urlmon`/`dnsapi` 导入；**没有 `ws2_32`/`mswsock` 就无法建立任何出站连接**。
 - 打包产物的真实运行中，相关进程共加载 57 个模块，没有网络模块。
 - 同一套采集与识别源码在 `9faa9c3` 上做过一次**系统级强制禁网**的完整 8 样本验收并全部通过。
 
-如果要对这个包补做同等强度的验收，需要在有人在场时批准一次提权，然后用 `.artifacts\offline-firewall-helper-final-package.ps1` 的同一套步骤重跑，跑完立即删除规则。
+为把本节写进包内 README 与仓库记录，之后用 `-SkipBuild` 重建了一次交付目录；重建前后的四个二进制 SHA-256 相同（`listen.exe` 96FF88F2…D8B7、`whisper-cli.exe` DC164875…14E8、`vad-speech-segments.exe` 92DDB93A…56CF、`whisper.dll` 4155EDB6…61FF），因此上面的实测适用于重建后的包。

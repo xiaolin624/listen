@@ -85,4 +85,4 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - 源码：<https://github.com/xiaolin624/listen>
 - 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交和是否包含模型。
 - 端到端验证、延迟、长会话和已知限制见仓库 `docs/issue-11-verification.md` 与 `docs/issue-11-release-notes.md`。
-- 本机断网封禁复验仍未完成；包内三个二进制没有网络导入，运行期只加载本机模块。静态/运行期证据见仓库 `docs/issue-11-verification.md`，不能替代系统级强制禁网实测。
+- 本机已在系统级出站封禁下复验：包内三个二进制没有网络导入，运行期只加载本机模块；三条临时出站封禁规则生效期间，从本包跑通真实采集→识别→交付，规则随后删除并读回无残留。证据见仓库 `docs/issue-11-verification.md`。
