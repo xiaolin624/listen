@@ -19,15 +19,27 @@ $env:RUSTFLAGS = '-C link-self-contained=yes'
 $env:PATH = (Join-Path $toolchain 'bin') + ';' + $env:PATH
 $cargo = Join-Path $env:CARGO_HOME 'bin\cargo.exe'
 $manifest = Join-Path $projectRoot 'app\listen\Cargo.toml'
-switch ($Task) {
-    'Build' { & $cargo build --offline --locked --release --manifest-path $manifest }
-    'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session }
-    'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture }
-    'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture }
-    'Format' { & $cargo fmt --manifest-path $manifest }
-    'CheckFormat' { & $cargo fmt --manifest-path $manifest --check }
+# cargo writes its progress to stderr. Under `$ErrorActionPreference = 'Stop'`
+# PowerShell turns that into a terminating error, so a successful build used to
+# be reported as a failure. Keep the strict policy for everything else and only
+# relax it around the native call, then judge the result by its exit code.
+$strict = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    switch ($Task) {
+        'Build' { & $cargo build --offline --locked --release --manifest-path $manifest 2>&1 | ForEach-Object { Write-Host $_ } }
+        'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session 2>&1 | ForEach-Object { Write-Host $_ } }
+        'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture 2>&1 | ForEach-Object { Write-Host $_ } }
+        'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture 2>&1 | ForEach-Object { Write-Host $_ } }
+        'Format' { & $cargo fmt --manifest-path $manifest 2>&1 | ForEach-Object { Write-Host $_ } }
+        'CheckFormat' { & $cargo fmt --manifest-path $manifest --check 2>&1 | ForEach-Object { Write-Host $_ } }
+    }
+    $code = $LASTEXITCODE
 }
-if ($LASTEXITCODE -ne 0) { throw "Listen $Task failed ($LASTEXITCODE)" }
+finally {
+    $ErrorActionPreference = $strict
+}
+if ($code -ne 0) { throw "Listen $Task failed ($code)" }
 if ($Task -eq 'Build') {
     $output = Join-Path $projectRoot 'app\listen\target\release'
     Copy-Item -LiteralPath (Join-Path $toolchain 'bin\libunwind.dll') -Destination $output -Force

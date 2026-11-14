@@ -39,6 +39,12 @@ if ($Control) {
         }
         $stderr = $process.StandardError.ReadToEnd().Trim()
         if ($process.ExitCode -ne 0) {
+            # Stopping something that is not running is not a failure: a restart
+            # sequence should not turn red just because the instance already exited.
+            if ($Control -eq 'quit' -and $stderr -match 'Listen is not running') {
+                Write-Output 'Listen is not running; nothing to stop.'
+                return
+            }
             throw "Listen control failed ($($process.ExitCode)): $stderr"
         }
         if ($stderr) { Write-Output $stderr }
