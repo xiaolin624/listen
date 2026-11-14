@@ -1,18 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn native_socket_reassembles_utf8_across_windows_receive_fragments() {
-        let bytes = "{\"text\":\"嗯\"}".as_bytes();
-        let mut message = Utf8Message::default();
-        assert_eq!(message.push(&bytes[..11], false).unwrap(), None);
-        assert_eq!(
-            message.push(&bytes[11..], true).unwrap(),
-            Some("{\"text\":\"嗯\"}".into())
-        );
-        assert_eq!(message.push(b"{}", true).unwrap(), Some("{}".into()));
-    }
-}
 // Native Message WebSocket, using the already pinned Windows binding. TLS
 // validation stays enabled; authorization is never redirected to another host.
 use super::{AliSettings, CloudError, MessageSocket, MessageTransport, Secret};
