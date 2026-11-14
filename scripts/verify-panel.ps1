@@ -743,7 +743,10 @@ try {
                 $sawProcessing = $true
                 if ($captureAttempt -eq 1) {
                     $processingText = Read-Text $panelPath
-                    Check ($processingText.Contains('Processing locally')) 'while processing, panel.txt says recognition is local'
+                    Check (
+                        $processingText.Contains('Processing locally') -or
+                        $processingText.StartsWith((-join [char[]](0x6b63, 0x5728, 0x672c, 0x673a, 0x8bc6, 0x522b)))
+                    ) 'while processing, panel.txt says recognition is local'
                 }
                 break
             }
