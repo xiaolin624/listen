@@ -129,7 +129,7 @@ def freeze(args):
                 raise ValueError(f"Key expression is not in the verified reference: {identity}")
         for equivalence in checked.get("number_equivalences", []):
             if (equivalence.get("verified") is not True or not equivalence.get("reason")
-                    or not number_pattern(equivalence["canonical"]).search(checked["reference"])
+                    or not number_pattern(equivalence["canonical"]).search(compact_text(checked["reference"]))
                     or not equivalence.get("variants")):
                 raise ValueError(f"Number-format equivalence needs a verified meaning and reason: {identity}")
             validate_number_equivalence(equivalence)
@@ -222,8 +222,13 @@ def verify_frozen(path, manifest):
     return None
 
 
+def compact_text(text):
+    # Inspect numeric adjacency after ignoring equivalent writing differences.
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).replace("\u2212", "-")
+
+
 def normalize(text):
-    text = unicodedata.normalize("NFKC", text).casefold().replace("\u2212", "-")
+    text = compact_text(text).casefold()
     kept = []
     for index, char in enumerate(text):
         before = text[index - 1] if index else ""
@@ -232,7 +237,7 @@ def normalize(text):
         # Symbols such as %, + and currency units are never discarded either.
         semantic = (char in "%‰‱"
                     or char in ".:/," and before.isdigit() and after.isdigit()
-                    or char == "-" and after.isdigit()
+                    or char == "-" and after.isnumeric()
                     or char == "#" and before.isascii() and before.isalpha())
         if (not char.isspace() and char not in "\ufeff\u200b\u200c\u200d"
                 and (not unicodedata.category(char).startswith("P") or semantic)):
@@ -241,6 +246,7 @@ def normalize(text):
 
 
 NUMBER_CHARS = "0-9零〇一二两三四五六七八九十百千万亿点"
+NUMBER_TOKEN_CHARS = NUMBER_CHARS + r"+\-"
 DIGITS = dict(zip("零〇一二两三四五六七八九", "001223456789"))
 
 
@@ -250,7 +256,7 @@ def numeric_signature(value):
     Unsupported colloquial numbers/time expressions remain content differences
     for human review, rather than accepting an arbitrary text replacement.
     """
-    value = re.sub(r"\s+", "", unicodedata.normalize("NFKC", value)).replace("−", "-")
+    value = compact_text(value)
     if value.startswith("百分之"):
         value = value[3:] + "%"
     for prefix in ("零下", "负"):
@@ -324,10 +330,13 @@ def validate_number_equivalence(entry):
 
 
 def number_pattern(value):
-    return re.compile(f"(?<![{NUMBER_CHARS}]){re.escape(value)}(?![{NUMBER_CHARS}])")
+    # An unsigned spelling must not match inside a signed number or range.
+    return re.compile(f"(?<![{NUMBER_TOKEN_CHARS}]){re.escape(compact_text(value))}"
+                      f"(?![{NUMBER_TOKEN_CHARS}])")
 
 
 def normalize_numbers(text, equivalences):
+    text = compact_text(text)
     differences = []
     for entry in equivalences:
         validate_number_equivalence(entry)
@@ -336,7 +345,7 @@ def normalize_numbers(text, equivalences):
             pattern = number_pattern(variant)
             if pattern.search(text):
                 differences.append({"canonical": canonical, "observed": variant})
-                text = pattern.sub(lambda match: canonical, text)
+                text = pattern.sub(lambda match: compact_text(canonical), text)
     return text, differences
 
 
