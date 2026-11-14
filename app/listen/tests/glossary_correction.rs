@@ -272,6 +272,27 @@ fn editing_the_glossary_applies_to_the_next_capture_without_a_restart() {
 }
 
 #[test]
+fn editing_the_glossary_during_capture_keeps_this_sessions_terms_fixed() {
+    let runtime = Runtime::with_glossary("DeepSeek Harness\n");
+    let mut app = Application::new(
+        Arc::new(Playback),
+        Arc::new(Model::new(0)),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_glossary(runtime.0.join("glossary.txt"));
+
+    app.dispatch(Control::Start);
+    fs::write(runtime.0.join("glossary.txt"), "DeepSeek\n").unwrap();
+    app.dispatch(Control::Stop);
+    assert_eq!(await_phase(&mut app, Phase::Result).text, CORRECTED);
+    assert_eq!(
+        capture(&mut app).text,
+        "We use the DeepSeek harnessness API."
+    );
+}
+
+#[test]
 fn a_retry_of_retained_audio_is_corrected_too() {
     let runtime = Runtime::with_glossary("DeepSeek Harness\n");
     let model = Arc::new(Model::new(1));

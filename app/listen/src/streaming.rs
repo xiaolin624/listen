@@ -1,6 +1,6 @@
 //! Bounded PCM windows shared by WASAPI capture and controlled playback devices.
 //! Recognition receives paths, never an accumulating in-memory recording.
-use crate::{AppResult, CapturedAudio, LocalTranscriber, ReadinessSignal, TimedText};
+use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText, recognition::ReadinessSignal};
 use std::{
     collections::VecDeque,
     fs::{self, File},
@@ -404,6 +404,7 @@ impl RecognitionWorker {
         transcriber: Arc<dyn LocalTranscriber>,
         directory: PathBuf,
         readiness: Arc<ReadinessSignal>,
+        stable: mpsc::SyncSender<String>,
     ) -> Self {
         let progress = stream.progress.clone();
         let state = progress.clone();
@@ -411,7 +412,7 @@ impl RecognitionWorker {
             // A crashing local backend is a recoverable failure, not a silent stall.
             // Report it at once so capture stops and its audio is retained.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                recognize(stream, transcriber, directory, readiness)
+                recognize(stream, transcriber, directory, readiness, stable)
             }));
             let result = match outcome {
                 Ok(result) => result,
@@ -446,8 +447,10 @@ fn recognize(
     transcriber: Arc<dyn LocalTranscriber>,
     directory: PathBuf,
     readiness: Arc<ReadinessSignal>,
+    stable: mpsc::SyncSender<String>,
 ) -> AppResult<RecognitionOutcome> {
     let mut committed = String::new();
+    let mut last_stable_len = 0;
     let mut tail = String::new();
     // Absolute sample position where the window that produced `tail` ended. A
     // later window that starts after this position cannot claim that text, so the
@@ -532,6 +535,10 @@ fn recognize(
         })?;
         fs::rename(&staged, directory.join("partial-result.txt"))
             .map_err(|e| format!("Cannot commit recoverable transcript checkpoint: {e}"))?;
+        if !committed.trim().is_empty() && committed.len() != last_stable_len {
+            let _ = stable.try_send(committed.trim().to_string());
+            last_stable_len = committed.len();
+        }
         let bytes = fs::metadata(&segment.audio.path)
             .map_err(|e| e.to_string())?
             .len();

@@ -95,6 +95,7 @@ mod tests {
         Snapshot {
             phase,
             preparation,
+            recognition: None,
             detail: String::new(),
             text: String::new(),
             retained_audio: Vec::new(),

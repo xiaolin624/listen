@@ -1,9 +1,9 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -13,6 +13,7 @@ pub mod deepseek;
 pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
+pub mod recognition;
 #[cfg(windows)]
 pub mod sensevoice;
 pub mod streaming;
@@ -24,7 +25,11 @@ pub mod whisper;
 pub mod whisper_host;
 #[cfg(windows)]
 pub mod whisper_timing;
-use streaming::{CaptureProgress, RecognitionWorker, SegmentStream};
+use recognition::{
+    LocalSessions, RecognitionSession, RecognitionSessions, SessionEvent, SessionId,
+    SessionRequest, SessionResult, SessionState, SessionUpdate,
+};
+use streaming::{CaptureProgress, SegmentStream};
 
 pub type AppResult<T> = Result<T, String>;
 
@@ -62,6 +67,7 @@ pub struct CaptureEndpoint {
     pub name: String,
 }
 
+#[derive(Clone)]
 pub struct CapturedAudio {
     pub path: PathBuf,
     pub description: String,
@@ -293,6 +299,8 @@ pub struct Snapshot {
     /// Whether first-use model preparation is pending, finished or failed. This
     /// remains observable in every phase, including `Capturing`.
     pub preparation: Preparation,
+    /// Recognition progress is separate from complete, deliverable text.
+    pub recognition: Option<SessionState>,
     pub detail: String,
     pub text: String,
     pub retained_audio: Vec<PathBuf>,
@@ -336,88 +344,6 @@ const PROCESSING_WHILE_PREPARING_DETAIL: &str = "The local recognition model is 
 /// The same waiting state after the model reported readiness but recognition is
 /// still running.
 const PROCESSING_READY_DETAIL: &str = "The local recognition model is ready. The buffered audio is being recognized locally; no messages are sent.";
-
-/// How long a recognition thread waits for first-use preparation before it gives
-/// up. It matches the harness-level preparation timeout used by the long-session
-/// example: a wedged preparation must never hang a recognition thread forever, and
-/// its buffered audio follows the normal retained-audio failure path instead.
-const READINESS_TIMEOUT: Duration = Duration::from_secs(120);
-
-enum ReadinessState {
-    Pending,
-    Ready,
-    Failed(String),
-}
-
-/// First-use preparation state shared with recognition threads. `poll` resolves it
-/// from the transcriber's preparation receiver. A capture started during
-/// preparation waits here before decoding anything, so buffered audio is recognized
-/// once the model is ready and is never decoded against an unprepared engine.
-pub(crate) struct ReadinessSignal {
-    state: Mutex<ReadinessState>,
-    changed: Condvar,
-}
-
-impl ReadinessSignal {
-    fn new(state: ReadinessState) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(state),
-            changed: Condvar::new(),
-        })
-    }
-    fn pending() -> Arc<Self> {
-        Self::new(ReadinessState::Pending)
-    }
-    fn ready() -> Arc<Self> {
-        Self::new(ReadinessState::Ready)
-    }
-    fn failed(error: &str) -> Arc<Self> {
-        Self::new(ReadinessState::Failed(error.to_string()))
-    }
-    fn resolve(&self, state: ReadinessState) {
-        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
-        self.changed.notify_all();
-    }
-    fn succeed(&self) {
-        self.resolve(ReadinessState::Ready);
-    }
-    fn fail(&self, error: &str) {
-        self.resolve(ReadinessState::Failed(error.to_string()));
-    }
-    /// Wait until preparation reports ready or failed. The wait is bounded, so a
-    /// preparation that never resolves becomes an explicit, retained-audio failure
-    /// instead of a hung worker.
-    pub(crate) fn wait(&self) -> AppResult<()> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let deadline = Instant::now()
-            .checked_add(READINESS_TIMEOUT)
-            .unwrap_or_else(Instant::now);
-        loop {
-            match &*state {
-                ReadinessState::Ready => return Ok(()),
-                ReadinessState::Failed(error) => {
-                    return Err(format!(
-                        "The local recognition model failed to prepare: {error}. The buffered audio was not decoded and is retained."
-                    ));
-                }
-                ReadinessState::Pending => {}
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(format!(
-                    "The local recognition model was still preparing after {} s, so the buffered audio was not decoded and is retained.",
-                    READINESS_TIMEOUT.as_secs()
-                ));
-            }
-            let remaining = deadline.duration_since(now);
-            let (guard, _) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|error| error.into_inner());
-            state = guard;
-        }
-    }
-}
 
 /// Capture details always say whether the local model is still loading, so a
 /// capture that started during preparation never reads like a ready capture.
@@ -739,84 +665,84 @@ fn failed_write(
 }
 
 /// The application boundary used by both global hotkey and complete-flow tests.
+struct ActiveSession {
+    id: SessionId,
+    directory: PathBuf,
+    handle: Box<dyn RecognitionSession>,
+    stopped: bool,
+    terminal: bool,
+    stop_requested: Option<Instant>,
+    retry_audio: Option<CapturedAudio>,
+}
+
 pub struct Application {
     snapshot: Snapshot,
-    audio: Arc<dyn PlaybackAudio>,
-    transcriber: Arc<dyn LocalTranscriber>,
+    sessions: Box<dyn RecognitionSessions>,
     runtime: PathBuf,
-    recording: Option<Box<dyn Recording>>,
-    recognition: Option<RecognitionWorker>,
-    progress: Option<Arc<streaming::Progress>>,
-    session: Option<PathBuf>,
+    active: Option<ActiveSession>,
+    next_session_id: u64,
     completion: Option<mpsc::Receiver<Completion>>,
     retry: Option<RetainedCapture>,
     control_error: Option<String>,
     targets: Option<Arc<dyn TargetSelection>>,
     bound_target: AppResult<Option<Box<dyn Target>>>,
-    preparation: Option<mpsc::Receiver<AppResult<String>>>,
-    preparation_started: Option<Instant>,
-    readiness: Arc<ReadinessSignal>,
-    backend: Option<String>,
     glossary_paths: Vec<PathBuf>,
     glossary: glossary::Glossary,
     glossary_note: Option<String>,
     refine_port: Option<Arc<dyn RefineText>>,
     refine_job: Option<mpsc::Receiver<RefineOutcome>>,
-    /// The confirmed append a later refine may replace. Cleared at every new capture,
-    /// completion and refine, so it can never describe a stale result.
     delivery_memory: Option<DeliveryMemory>,
 }
 
 impl Application {
+    /// The default remains entirely local. Only an explicit Refine control can
+    /// use the separately configured text-refine adapter.
     pub fn new(
         audio: Arc<dyn PlaybackAudio>,
         transcriber: Arc<dyn LocalTranscriber>,
         runtime: PathBuf,
         hotkey_registration: AppResult<()>,
     ) -> Self {
+        Self::with_recognition_sessions(
+            Box::new(LocalSessions::new(audio, transcriber)),
+            runtime,
+            hotkey_registration,
+        )
+    }
+
+    /// Use a recognition-session adapter while retaining the same application
+    /// controls, persistence, safe target delivery and result panel.
+    pub fn with_recognition_sessions(
+        mut sessions: Box<dyn RecognitionSessions>,
+        runtime: PathBuf,
+        hotkey_registration: AppResult<()>,
+    ) -> Self {
         let control_error = hotkey_registration.err();
+        let readiness = sessions.preparation();
         let initial_error = control_error
             .clone()
-            .map(|e| format!("Global hotkey unavailable: {e}"))
-            .or_else(|| transcriber.check_ready().err());
-        let backend = transcriber.backend_note();
-        let mut preparation = None;
-        let mut preparation_started = None;
-        let (phase, preparation_state, detail) = match &initial_error {
-            Some(error) => (Phase::Failure, Preparation::Failed, error.clone()),
-            None => match transcriber.prepare() {
-                Some(receiver) => {
-                    preparation = Some(receiver);
-                    preparation_started = Some(Instant::now());
-                    (
-                        Phase::Preparing,
-                        Preparation::Pending,
-                        "Preparing the local recognition model in the background; capture can start now and its audio is buffered until the model reports Ready.".into(),
-                    )
-                }
-                None => (
-                    Phase::Ready,
-                    Preparation::Ready,
-                    ready_detail(backend.as_deref()),
-                ),
-            },
+            .map(|error| format!("Global hotkey unavailable: {error}"))
+            .or(readiness.error);
+        let preparation = if initial_error.is_some() {
+            Preparation::Failed
+        } else {
+            readiness.state
         };
-        let readiness = match preparation_state {
-            Preparation::Pending => ReadinessSignal::pending(),
-            Preparation::Ready => ReadinessSignal::ready(),
-            Preparation::Failed => ReadinessSignal::failed(
-                initial_error
-                    .as_deref()
-                    .unwrap_or("the local model is unavailable"),
+        let (phase, detail) = match initial_error {
+            Some(error) => (Phase::Failure, error),
+            None if preparation == Preparation::Pending => (
+                Phase::Preparing,
+                "Preparing the local recognition model in the background; capture can start now and its audio is buffered until the model reports Ready.".into(),
             ),
+            None => (Phase::Ready, ready_detail(readiness.backend.as_deref())),
         };
-        let backend = transcriber.backend_note();
         let glossary_paths =
             glossary::default_paths(&runtime, std::env::current_exe().ok().as_deref());
         Self {
             snapshot: Snapshot {
                 phase,
-                preparation: preparation_state,
+                preparation,
+                recognition: None,
                 detail,
                 text: fs::read_to_string(runtime.join("current-result.txt")).unwrap_or_default(),
                 retained_audio: Vec::new(),
@@ -824,28 +750,24 @@ impl Application {
                 delivery: None,
                 retry_available: false,
                 endpoint: None,
-                backend: backend.clone(),
-                timing: Timing::default(),
+                backend: readiness.backend,
+                timing: Timing {
+                    preparation_ms: readiness.elapsed_ms,
+                    ..Timing::default()
+                },
                 refine: Refine::Unavailable(NO_REFINE_PORT.into()),
                 refined_text: None,
                 notice: None,
             },
-            audio,
-            transcriber,
+            sessions,
             runtime,
-            recording: None,
-            recognition: None,
-            progress: None,
-            session: None,
+            active: None,
+            next_session_id: 0,
             completion: None,
             retry: None,
             control_error,
             targets: None,
             bound_target: Ok(None),
-            preparation,
-            preparation_started,
-            readiness,
-            backend,
             glossary_paths,
             glossary: glossary::Glossary::default(),
             glossary_note: None,
@@ -853,6 +775,25 @@ impl Application {
             refine_job: None,
             delivery_memory: None,
         }
+    }
+
+    fn is_capturing(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|session| !session.stopped && !session.terminal)
+    }
+
+    fn is_processing(&self) -> bool {
+        self.completion.is_some()
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|session| session.stopped && !session.terminal)
+    }
+
+    fn next_id(&mut self) -> SessionId {
+        self.next_session_id += 1;
+        SessionId(self.next_session_id)
     }
 
     /// Use a specific 术语表 file for this application. The default is the first
@@ -1001,9 +942,9 @@ impl Application {
     /// What the application is doing right now, phrased for refusal messages that
     /// must not claim "nothing is being captured" while a capture is running.
     fn activity(&self) -> &'static str {
-        if self.recording.is_some() {
+        if self.is_capturing() {
             "Playback is being captured and buffered"
-        } else if self.completion.is_some() {
+        } else if self.is_processing() {
             "The previous capture is still being processed locally"
         } else {
             "Nothing is being captured"
@@ -1024,51 +965,54 @@ impl Application {
             return;
         }
         match control {
-            Control::Start if self.recording.is_none() && self.completion.is_none() => {
+            Control::Start if !self.is_capturing() && !self.is_processing() => {
                 let start_requested = Instant::now();
                 if self.retry.is_some() {
                     self.snapshot.detail = "A failed capture's audio is retained for local retry. Retry local recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
                     return;
                 }
-                // Capture the actual selection before readiness checks or any UI feedback.
+                // Bind once before any UI feedback. Recognition receives neither
+                // the target draft nor an editor identity.
                 self.bound_target = self
                     .targets
                     .as_ref()
                     .map_or(Ok(None), |targets| targets.focused_target());
                 self.snapshot.endpoint = None;
+                let mut started_directory = None;
                 let result = (|| {
                     if let Some(error) = &self.control_error {
                         return Err(format!("Global hotkey unavailable: {error}"));
                     }
-                    self.transcriber.check_ready()?;
-                    // The glossary is edited by hand between captures; re-read it
-                    // at every capture start rather than at process start.
                     self.reload_glossary();
-                    fs::create_dir_all(&self.runtime).map_err(|e| e.to_string())?;
+                    fs::create_dir_all(&self.runtime).map_err(|error| error.to_string())?;
                     let unique = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| error.to_string())?
                         .as_nanos();
                     let directory = self
                         .runtime
                         .join(format!("session-{}-{unique}", std::process::id()));
-                    fs::create_dir(&directory).map_err(|e| e.to_string())?;
-                    self.session = Some(directory.clone());
-                    self.recording = Some(self.audio.start(&directory)?);
-                    self.snapshot.endpoint = self
-                        .recording
-                        .as_ref()
-                        .and_then(|recording| recording.endpoint());
-                    if let Some(stream) = self.recording.as_mut().unwrap().take_segments() {
-                        self.progress = Some(stream.progress.clone());
-                        self.recognition = Some(RecognitionWorker::start(
-                            stream,
-                            self.transcriber.clone(),
-                            directory,
-                            self.readiness.clone(),
-                        ));
-                    }
-                    self.snapshot.progress = CaptureProgress::default();
+                    started_directory = Some(directory.clone());
+                    let id = self.next_id();
+                    let handle = self.sessions.start(SessionRequest {
+                        id,
+                        directory: directory.clone(),
+                        glossary: self.glossary.clone(),
+                    })?;
+                    let status = handle.status();
+                    self.snapshot.endpoint = status.endpoint;
+                    self.snapshot.recognition = Some(status.state);
+                    self.snapshot.progress = status.progress;
+                    self.snapshot.detail = self.with_glossary_note(status.detail);
+                    self.active = Some(ActiveSession {
+                        id,
+                        directory,
+                        handle,
+                        stopped: false,
+                        terminal: false,
+                        stop_requested: None,
+                        retry_audio: None,
+                    });
                     Ok::<_, String>(())
                 })();
                 match result {
@@ -1077,24 +1021,14 @@ impl Application {
                         self.snapshot.delivery = None;
                         self.snapshot.retained_audio.clear();
                         self.snapshot.retry_available = false;
-                        // A new capture starts a new article: the previous append can
-                        // no longer be refined or replaced.
                         self.delivery_memory = None;
                         self.snapshot.refined_text = None;
                         self.snapshot.refine = Refine::Unavailable(
-                            "Playback is being captured; stop and wait for the complete result before refining."
-                                .into(),
+                            "Playback is being captured; stop and wait for the complete result before refining.".into(),
                         );
-                        // A stale copy failure belongs to the previous result; the
-                        // capsule-exclusion warning is a session-wide fact and stays.
                         if matches!(self.snapshot.notice, Some(Notice::CopyFailed(_))) {
                             self.snapshot.notice = None;
                         }
-                        self.snapshot.detail = self.with_glossary_note(format!(
-                            "{}{}",
-                            capture_scope(self.snapshot.endpoint.as_ref()),
-                            preparation_note(self.snapshot.preparation)
-                        ));
                         self.snapshot.timing = Timing {
                             preparation_ms: self.snapshot.timing.preparation_ms,
                             capture_start_ms: Some(elapsed_ms(start_requested)),
@@ -1103,206 +1037,31 @@ impl Application {
                     }
                     Err(error) => {
                         self.bound_target = Ok(None);
-                        let directory = self.session.take();
-                        self.fail(directory.as_deref(), error);
+                        self.active = None;
+                        self.snapshot.recognition = Some(SessionState::Failed);
+                        self.fail(started_directory.as_deref(), error);
                     }
                 }
             }
-            Control::Stop if self.recording.is_some() => {
-                let stop_at = Instant::now();
-                let preparation_ms = self.snapshot.timing.preparation_ms;
-                // Carry the start latency into the final record; it describes this
-                // capture and would otherwise be replaced when the result lands.
-                let capture_start_ms = self.snapshot.timing.capture_start_ms;
-                let recording = self.recording.take().unwrap();
-                let directory = self.session.take().unwrap();
-                let transcriber = self.transcriber.clone();
-                let recognition = self.recognition.take();
-                let streaming = recognition.is_some();
-                let progress = self.progress.clone();
-                let target = std::mem::replace(&mut self.bound_target, Ok(None));
-                let current_result = self.runtime.join("current-result.txt");
-                let glossary = self.glossary.clone();
-                let readiness = self.readiness.clone();
-                let (tx, rx) = mpsc::channel();
-                self.completion = Some(rx);
+            Control::Stop if self.is_capturing() => {
+                let active = self.active.as_mut().unwrap();
+                active.stop_requested = Some(Instant::now());
+                active.stopped = true;
+                active.handle.stop();
+                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
                 self.snapshot.phase = Phase::Processing;
                 self.snapshot.detail = if self.snapshot.preparation == Preparation::Pending {
                     PROCESSING_WHILE_PREPARING_DETAIL.into()
                 } else {
                     "Processing locally; no messages are sent.".into()
                 };
-                thread::spawn(move || {
-                    let finalize_started = Instant::now();
-                    let captured = recording.finish();
-                    let finalize_ms = elapsed_ms(finalize_started);
-                    let recognition_started = Instant::now();
-                    let recognized = recognition.map(|worker| worker.finish());
-                    let recognition_ms = elapsed_ms(recognition_started);
-                    let mut timing = Timing {
-                        preparation_ms,
-                        capture_start_ms,
-                        finalize_ms: Some(finalize_ms),
-                        recognition_ms: Some(recognition_ms),
-                        ..Timing::default()
-                    };
-                    let audio = match captured {
-                        Ok(audio) => audio,
-                        Err(capture_error) => {
-                            let error = match &recognized {
-                                Some(Err(recognition_error)) => {
-                                    format!("{recognition_error}; {capture_error}")
-                                }
-                                _ => capture_error,
-                            };
-                            timing.stop_to_result_ms = Some(elapsed_ms(stop_at));
-                            let _ = tx.send(Completion::Failed {
-                                error,
-                                directory,
-                                retry: None,
-                                timing,
-                                retry_scope: None,
-                            });
-                            return;
-                        }
-                    };
-                    let (recognized, window_timing) = match recognized {
-                        Some(Ok(outcome)) => (Ok(outcome.text), Some(outcome.timing)),
-                        Some(Err(error)) => (Err(error), None),
-                        None => {
-                            let started = Instant::now();
-                            // A capture may start before first-use preparation
-                            // finishes; decoding waits for its outcome instead of
-                            // failing against an unprepared model.
-                            let result = readiness
-                                .wait()
-                                .and_then(|()| transcriber.transcribe(&audio, &directory));
-                            let elapsed = elapsed_ms(started);
-                            timing.recognition_ms = Some(elapsed);
-                            (
-                                result,
-                                Some(streaming::RecognitionTiming {
-                                    wait_ms: 0,
-                                    inference_ms: elapsed,
-                                    windows: 1,
-                                }),
-                            )
-                        }
-                    };
-                    if let Some(window) = &window_timing {
-                        timing.last_window_wait_ms = Some(window.wait_ms);
-                        timing.last_window_inference_ms = Some(window.inference_ms);
-                        timing.recognition_windows = window.windows;
-                    }
-                    // Correct only the final merged text, after recognition and
-                    // segmentation are finished: timestamps and window boundaries are
-                    // never touched by the glossary.
-                    let recognized = recognized.map(|text| glossary.correct(&text));
-                    let completion = match recognized {
-                        // Only an unfragmented capture can be retried as a whole. A
-                        // streamed session that has already consumed windows no longer
-                        // has their audio on disk, so its checkpoint stays a partial
-                        // result instead of pretending the remaining windows are whole.
-                        Err(error) => {
-                            let recognized_segments = progress
-                                .as_ref()
-                                .map(|progress| progress.snapshot().recognized_segments)
-                                .unwrap_or(0);
-                            let retained = if audio.path.is_file() {
-                                Some(CapturedAudio {
-                                    path: audio.path.clone(),
-                                    description: audio.description.clone(),
-                                })
-                            } else if streaming && recognized_segments == 0 {
-                                streaming::retained_audio_path(&directory).ok().map(|path| {
-                                    CapturedAudio {
-                                        path,
-                                        description: audio.description.clone(),
-                                    }
-                                })
-                            } else {
-                                None
-                            };
-                            let retry = retained.map(|audio| RetainedCapture {
-                                audio,
-                                directory: directory.clone(),
-                                target,
-                            });
-                            // A streamed session whose earlier windows were already
-                            // recognized and released cannot be retried as a whole.
-                            // Say so explicitly; the remaining audio paths are still
-                            // listed by `fail` for manual recovery.
-                            let retry_scope = if retry.is_none()
-                                && streaming
-                                && recognized_segments > 0
-                            {
-                                Some(format!(
-                                    "This capture was partially recognized before the failure ({recognized_segments} window(s) had been checkpointed). Those windows' audio was released after recognition, so automatic local retry is only offered when no recognition window has completed; it is not offered here. The recognized prefix above is incomplete, and the remaining audio paths are listed for manual recovery."
-                                ))
-                            } else {
-                                None
-                            };
-                            timing.stop_to_result_ms = Some(elapsed_ms(stop_at));
-                            Completion::Failed {
-                                error,
-                                directory,
-                                retry,
-                                timing,
-                                retry_scope,
-                            }
-                        }
-                        // Silence and non-speech leave the previous result and every
-                        // target untouched; nothing is saved or appended for them.
-                        Ok(text) if text.trim().is_empty() => {
-                            timing.stop_to_result_ms = Some(elapsed_ms(stop_at));
-                            Completion::Finished(Completed {
-                                text,
-                                description: audio.description,
-                                delivery: None,
-                                detail: String::new(),
-                                save_error: None,
-                                directory,
-                                timing,
-                                memory: None,
-                            })
-                        }
-                        Ok(text) => {
-                            let save_started = Instant::now();
-                            let save_error = fs::write(&current_result, &text)
-                                .err()
-                                .map(|e| e.to_string());
-                            timing.save_ms = Some(elapsed_ms(save_started));
-                            let delivery_started = Instant::now();
-                            let outcome = match &save_error {
-                                // Saving first means a storage failure never changes a target.
-                                Some(error) => DeliveryOutcome::fallback(not_delivered(format!(
-                                    "Could not save the current result: {error}"
-                                ))),
-                                None => deliver(target, &text),
-                            };
-                            timing.delivery_ms = Some(elapsed_ms(delivery_started));
-                            timing.stop_to_result_ms = Some(elapsed_ms(stop_at));
-                            Completion::Finished(Completed {
-                                text,
-                                description: audio.description,
-                                delivery: Some(outcome.delivery),
-                                detail: outcome.detail,
-                                save_error,
-                                directory,
-                                timing,
-                                memory: outcome.memory,
-                            })
-                        }
-                    };
-                    let _ = tx.send(completion);
-                });
             }
             Control::Refine => {
                 if self.refine_job.is_some() {
                     self.snapshot.detail = "Refine is already running; the current result is unchanged. Wait for the refined text before asking again.".into();
                     return;
                 }
-                if self.recording.is_some() {
+                if self.is_capturing() {
                     self.snapshot.refine = Refine::Unavailable(
                         "Playback is being captured; stop and wait for the complete result before refining."
                             .into(),
@@ -1310,7 +1069,7 @@ impl Application {
                     self.snapshot.detail = "Refine is unavailable while playback is being captured. Stop the capture and wait for the complete result; the current result is unchanged.".into();
                     return;
                 }
-                if self.completion.is_some() {
+                if self.is_processing() {
                     self.snapshot.refine = Refine::Unavailable(
                         "The previous capture is still processing locally; wait for the complete result before refining."
                             .into(),
@@ -1357,48 +1116,48 @@ impl Application {
                 });
             }
             Control::Retry => {
-                if self.preparation.is_some() {
+                if self.snapshot.preparation == Preparation::Pending {
                     let activity = self.activity();
                     self.snapshot.detail = format!(
                         "The local recognition model is still being prepared; wait until Listen reports Ready before retrying. {activity} and the current result is unchanged."
                     );
                     return;
                 }
-                if self.recording.is_some() {
+                if self.is_capturing() {
                     self.snapshot.detail = "Still capturing the current playback locally; stop it and wait for the result before retrying.".into();
                     return;
                 }
-                if self.completion.is_some() {
+                if self.is_processing() {
                     self.snapshot.detail = "Still processing the current playback locally; wait for the result before retrying.".into();
                     return;
                 }
                 self.retry_local_recognition();
             }
             Control::CleanupAudio => {
-                if self.preparation.is_some() {
+                if self.snapshot.preparation == Preparation::Pending {
                     let activity = self.activity();
                     self.snapshot.detail = format!(
                         "The local recognition model is still being prepared; wait until Listen reports Ready before cleaning failed audio. {activity} and the current result is unchanged."
                     );
                     return;
                 }
-                if self.recording.is_some() {
+                if self.is_capturing() {
                     self.snapshot.detail = "Still capturing the current playback locally; stop it and wait for the result before cleaning failed audio.".into();
                     return;
                 }
-                if self.completion.is_some() {
+                if self.is_processing() {
                     self.snapshot.detail = "Still processing the current playback locally; wait for the result before cleaning failed audio.".into();
                     return;
                 }
                 self.cleanup_failed_audio();
             }
-            _ if self.preparation.is_some() => {
+            _ if self.snapshot.preparation == Preparation::Pending => {
                 let activity = self.activity();
                 self.snapshot.detail = format!(
                     "The local recognition model is still being prepared; {activity}. The current result is unchanged."
                 );
             }
-            _ if self.completion.is_some() => {
+            _ if self.is_processing() => {
                 self.snapshot.detail = "Still processing the current playback locally; wait for the result before starting again.".into();
             }
             Control::Start => {
@@ -1433,99 +1192,37 @@ impl Application {
             self.snapshot.detail = "The audio retained from the failed capture is no longer on disk, so it was not retried. The current result is unchanged.".into();
             return;
         }
-        let RetainedCapture {
-            audio,
-            directory,
-            target,
-        } = retry;
-        let transcriber = self.transcriber.clone();
-        let current_result = self.runtime.join("current-result.txt");
-        let glossary = self.glossary.clone();
-        let readiness = self.readiness.clone();
-        let (tx, rx) = mpsc::channel();
-        self.completion = Some(rx);
-        self.snapshot.phase = Phase::Processing;
-        self.snapshot.delivery = None;
-        self.snapshot.retry_available = false;
-        self.snapshot.detail =
-            "Retrying recognition locally on the retained audio; no replay is needed and no messages are sent.".into();
-        thread::spawn(move || {
-            let started = Instant::now();
-            let recognized = readiness
-                .wait()
-                .and_then(|()| transcriber.check_ready())
-                .and_then(|()| transcriber.transcribe(&audio, &directory))
-                .map(|text| {
-                    // The retry must deliver the same corrected text as the original
-                    // path; it uses the glossary loaded when this capture started.
-                    glossary.correct(&text)
+        let id = self.next_id();
+        let request = SessionRequest {
+            id,
+            directory: retry.directory.clone(),
+            glossary: self.glossary.clone(),
+        };
+        match self.sessions.retry(request, retry.audio.clone()) {
+            Ok(handle) => {
+                self.bound_target = retry.target;
+                self.active = Some(ActiveSession {
+                    id,
+                    directory: retry.directory,
+                    handle,
+                    stopped: true,
+                    terminal: false,
+                    stop_requested: None,
+                    retry_audio: Some(retry.audio),
                 });
-            let elapsed = elapsed_ms(started);
-            let timing = Timing {
-                recognition_ms: Some(elapsed),
-                last_window_inference_ms: Some(elapsed),
-                recognition_windows: 1,
-                ..Timing::default()
-            };
-            let completion = match recognized {
-                // Still failing: the same audio stays retryable after another local
-                // repair. Nothing has been written to any target.
-                Err(error) => {
-                    let retry = RetainedCapture {
-                        audio,
-                        directory: directory.clone(),
-                        target,
-                    };
-                    Completion::Failed {
-                        error: format!("Local retry failed: {error}"),
-                        directory,
-                        retry: Some(retry),
-                        timing,
-                        retry_scope: None,
-                    }
-                }
-                Ok(text) if text.trim().is_empty() => Completion::Finished(Completed {
-                    text,
-                    description: audio.description,
-                    delivery: None,
-                    detail: String::new(),
-                    save_error: None,
-                    directory,
-                    timing,
-                    memory: None,
-                }),
-                Ok(text) => match fs::write(&current_result, &text) {
-                    Ok(()) => {
-                        let outcome = deliver(target, &text);
-                        Completion::Finished(Completed {
-                            text,
-                            description: audio.description,
-                            delivery: Some(outcome.delivery),
-                            detail: outcome.detail,
-                            save_error: None,
-                            directory,
-                            timing,
-                            memory: outcome.memory,
-                        })
-                    }
-                    Err(error) => {
-                        let retry = RetainedCapture {
-                            audio,
-                            directory: directory.clone(),
-                            target,
-                        };
-                        Completion::Failed {
-                            error: format!("Could not save the current result: {error}"),
-                            directory,
-                            retry: Some(retry),
-                            timing,
-                            retry_scope: None,
-                        }
-                    }
-                },
-            };
-            let _ = tx.send(completion);
-        });
+                self.snapshot.phase = Phase::Processing;
+                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+                self.snapshot.delivery = None;
+                self.snapshot.retry_available = false;
+                self.snapshot.detail = "Retrying recognition locally on the retained audio; no replay is needed and no messages are sent.".into();
+            }
+            Err(error) => {
+                let directory = retry.directory.clone();
+                self.retry = Some(retry);
+                self.snapshot.retry_available = true;
+                self.fail(Some(&directory), error);
+            }
+        }
     }
 
     /// Delete the audio kept from a failed recognition at the user's explicit
@@ -1554,105 +1251,6 @@ impl Application {
         }
     }
 
-    /// Report a failed first-use preparation. A capture that was already running is
-    /// stopped and its received audio is retained: a preparation failure is a real
-    /// failure, never a ready state and never a silently discarded capture.
-    fn fail_preparation(&mut self, error: String) {
-        // Wake every recognition thread before aborting: the abort path joins them.
-        self.readiness.fail(&error);
-        self.preparation = None;
-        self.preparation_started = None;
-        self.snapshot.preparation = Preparation::Failed;
-        if self.recording.is_some() {
-            self.abort_capture_for_failed_preparation(error);
-            return;
-        }
-        if self.snapshot.phase == Phase::Preparing {
-            self.snapshot.phase = Phase::Failure;
-            self.snapshot.detail = error;
-        } else if self.snapshot.phase == Phase::Processing && self.completion.is_some() {
-            self.snapshot.detail = format!(
-                "The local recognition model failed to prepare: {error}. The buffered audio is retained; nothing was delivered."
-            );
-        }
-    }
-
-    /// Stop a capture because the model it is waiting for cannot become ready. The
-    /// windows the worker has not decoded yet stay on disk, the recording is
-    /// finalized, and the existing retained-audio/retry/cleanup controls are
-    /// offered exactly as for a failed recognition.
-    fn abort_capture_for_failed_preparation(&mut self, error: String) {
-        let Some(recording) = self.recording.take() else {
-            return;
-        };
-        let directory = self.session.take();
-        let recognition = self.recognition.take();
-        let streaming = recognition.is_some();
-        let progress = self.progress.take();
-        if let Some(progress) = &progress {
-            progress.cancel();
-        }
-        let target = std::mem::replace(&mut self.bound_target, Ok(None));
-
-        // Finalize the recording first so its retained WAV is complete, then stop
-        // the worker; cancellation keeps the windows it has not decoded.
-        let captured = recording.finish();
-        let _ = recognition.map(|worker| worker.finish());
-        let recognized_segments = progress
-            .as_ref()
-            .map(|progress| progress.snapshot().recognized_segments)
-            .unwrap_or(0);
-
-        let (capture_error, kept) = match captured {
-            Ok(audio) => {
-                let kept = if audio.path.is_file() {
-                    Some(CapturedAudio {
-                        path: audio.path.clone(),
-                        description: audio.description.clone(),
-                    })
-                } else if streaming && recognized_segments == 0 {
-                    directory
-                        .as_deref()
-                        .and_then(|directory| streaming::retained_audio_path(directory).ok())
-                        .map(|path| CapturedAudio {
-                            path,
-                            description: audio.description.clone(),
-                        })
-                } else {
-                    None
-                };
-                (None, kept)
-            }
-            Err(capture_error) => (Some(capture_error), None),
-        };
-        let retryable = kept.is_some();
-        self.retry = match (kept, directory.clone()) {
-            (Some(audio), Some(directory)) => Some(RetainedCapture {
-                audio,
-                directory,
-                target,
-            }),
-            _ => None,
-        };
-        self.snapshot.retry_available = retryable;
-        let mut message = format!(
-            "The local recognition model failed to prepare: {error}. The capture in progress was stopped; nothing was transcribed or delivered."
-        );
-        if let Some(capture_error) = capture_error {
-            message.push_str(&format!(
-                " Finalizing the capture also failed: {capture_error}"
-            ));
-        }
-        self.fail(directory.as_deref(), message);
-        if retryable {
-            self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
-        } else if streaming && recognized_segments > 0 {
-            self.snapshot.detail.push_str(&format!(
-                "\nThis capture was partially recognized before the preparation failure ({recognized_segments} window(s) had been checkpointed). Those windows' audio was released after recognition, so automatic local retry is not offered here; the remaining audio paths are listed for manual recovery."
-            ));
-        }
-    }
-
     pub fn poll(&mut self) {
         if let Some(job) = &self.refine_job {
             match job.try_recv() {
@@ -1673,100 +1271,56 @@ impl Application {
                 }
             }
         }
-        if self.preparation.is_some() {
-            let received = self.preparation.as_ref().unwrap().try_recv();
-            match received {
-                Ok(Ok(note)) => {
-                    // Waking waiting recognition threads comes before any UI
-                    // bookkeeping so a stopped capture can decode immediately.
-                    self.readiness.succeed();
-                    self.snapshot.timing.preparation_ms =
-                        self.preparation_started.map(|started| elapsed_ms(started));
-                    self.preparation = None;
-                    self.preparation_started = None;
-                    self.snapshot.preparation = Preparation::Ready;
-                    // A capture started during preparation keeps its own phase and
-                    // detail; readiness is reported through `Snapshot::preparation`.
-                    if self.snapshot.phase == Phase::Preparing {
-                        self.snapshot.phase = Phase::Ready;
-                        self.snapshot.detail = ready_detail(Some(&note));
-                    } else if self.snapshot.phase == Phase::Capturing {
-                        // Drop the "still preparing" note without waiting for the
-                        // next progress update (non-streamed captures do not have one).
-                        self.snapshot.detail = self.with_glossary_note(format!(
-                            "{}{}",
-                            capture_scope(self.snapshot.endpoint.as_ref()),
-                            preparation_note(self.snapshot.preparation)
-                        ));
-                    } else if self.snapshot.phase == Phase::Processing
-                        && self.snapshot.detail == PROCESSING_WHILE_PREPARING_DETAIL
-                    {
-                        self.snapshot.detail = PROCESSING_READY_DETAIL.into();
-                    }
+        let readiness = self.sessions.preparation();
+        let preparation_changed = self.snapshot.preparation != readiness.state;
+        if self.control_error.is_none() {
+            self.snapshot.preparation = readiness.state;
+        }
+        self.snapshot.backend = readiness.backend;
+        self.snapshot.timing.preparation_ms = readiness.elapsed_ms;
+        if self.snapshot.phase == Phase::Preparing {
+            match readiness.state {
+                Preparation::Ready => {
+                    self.snapshot.phase = Phase::Ready;
+                    self.snapshot.detail = ready_detail(self.snapshot.backend.as_deref());
                 }
-                Ok(Err(error)) => {
-                    self.fail_preparation(error);
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Preparation is still pending. A capture may already be
-                    // running (and buffering), so keep polling progress, device
-                    // failures and completions below instead of returning early.
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.fail_preparation(
-                        "Local model preparation stopped unexpectedly, so the local model is not ready."
-                            .into(),
-                    );
-                    return;
-                }
+                Preparation::Failed => self.fail(
+                    None,
+                    readiness
+                        .error
+                        .unwrap_or_else(|| "Recognition preparation failed".into()),
+                ),
+                Preparation::Pending => {}
             }
         }
-        if let Some(note) = self.transcriber.backend_note() {
-            if self.backend.as_deref() != Some(note.as_str()) {
-                self.backend = Some(note.clone());
-                self.snapshot.backend = Some(note);
+        if let Some(active) = self.active.as_mut().filter(|session| !session.terminal) {
+            let event = active.handle.poll();
+            let status = active.handle.status();
+            // A retry processes the already captured audio; keep that capture's
+            // route/progress rather than reporting a new unidentified device.
+            if active.retry_audio.is_none() {
+                self.snapshot.progress = status.progress;
+                self.snapshot.endpoint = status.endpoint;
             }
-        }
-        if let Some(progress) = self.progress.as_ref().map(|p| p.snapshot()).or_else(|| {
-            self.recording
-                .as_ref()
-                .and_then(|recording| recording.progress())
-        }) {
-            self.snapshot.progress = progress;
-        }
-        if self.snapshot.phase == Phase::Capturing && self.recognition.is_some() {
-            let p = &self.snapshot.progress;
-            let detail = format!(
-                "{} {:.1} s received; {} recognition windows pending, {} completed; {} bytes audio on disk; {} samples audio in memory.{}",
-                capture_scope(self.snapshot.endpoint.as_ref()),
-                p.received_samples as f64 / streaming::SAMPLE_RATE as f64,
-                p.pending_segments,
-                p.recognized_segments,
-                p.spool_bytes,
-                p.buffered_samples,
-                if p.pending_segments > 1 {
-                    " Recognition backlog is growing; bounded spool pressure will interrupt capture with recoverable audio."
-                } else {
-                    ""
-                }
-            );
-            let mut detail = detail;
-            detail.push_str(preparation_note(self.snapshot.preparation));
-            self.snapshot.detail = self.with_glossary_note(detail);
-        }
-        if let Some(error) = self
-            .recording
-            .as_ref()
-            .and_then(|recording| recording.failure())
-            .or_else(|| {
-                self.recognition
-                    .as_ref()
-                    .and_then(|worker| worker.progress.failure())
-            })
-        {
-            self.dispatch(Control::Stop);
-            self.snapshot.detail = format!("{error}; finalizing partial audio for recovery.");
+            if status.state == SessionState::AwaitingFinal && !active.stopped {
+                active.stopped = true;
+                active.stop_requested = Some(Instant::now());
+                self.snapshot.phase = Phase::Processing;
+            }
+            if !active.stopped || preparation_changed {
+                self.snapshot.detail = match &self.glossary_note {
+                    Some(note) => format!("{}\n{note}", status.detail),
+                    None => status.detail,
+                };
+            }
+            // A stable sentence remains observable until the next session event;
+            // a status refresh must not turn it into a completed result.
+            if self.snapshot.recognition != Some(SessionState::Stable) || active.stopped {
+                self.snapshot.recognition = Some(status.state);
+            }
+            if let Some(event) = event {
+                self.apply_session_event(event);
+            }
         }
         let Some(rx) = &self.completion else {
             return;
@@ -1776,11 +1330,131 @@ impl Application {
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.completion = None;
+                self.snapshot.recognition = Some(SessionState::Failed);
                 self.fail(None, "Local processing worker stopped unexpectedly".into());
                 return;
             }
         };
         self.completion = None;
+        self.apply_completion(completion);
+    }
+
+    fn apply_session_event(&mut self, event: SessionEvent) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.id != event.id || active.terminal {
+            return;
+        }
+        match event.update {
+            SessionUpdate::Stable(_) if !active.stopped => {
+                self.snapshot.recognition = Some(SessionState::Stable);
+            }
+            SessionUpdate::Finished(result) if active.stopped => {
+                active.terminal = true;
+                self.snapshot.recognition = Some(SessionState::Complete);
+                self.finish_recognition(result);
+            }
+            SessionUpdate::Failed(failure) => {
+                active.terminal = true;
+                self.snapshot.recognition = Some(SessionState::Failed);
+                let directory = active.directory.clone();
+                let target = std::mem::replace(&mut self.bound_target, Ok(None));
+                let retry = failure.retry_audio.map(|audio| RetainedCapture {
+                    audio,
+                    directory: directory.clone(),
+                    target,
+                });
+                let mut timing = failure.timing;
+                timing.preparation_ms = self.snapshot.timing.preparation_ms;
+                timing.capture_start_ms = self.snapshot.timing.capture_start_ms;
+                self.apply_completion(Completion::Failed {
+                    error: failure.error,
+                    directory,
+                    retry,
+                    timing,
+                    retry_scope: failure.retry_scope,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_recognition(&mut self, result: SessionResult) {
+        let active = self.active.as_mut().unwrap();
+        let directory = active.directory.clone();
+        let retry_audio = active.retry_audio.take();
+        let stopped_at = match (active.stop_requested, result.stopped_at) {
+            (Some(control), Some(session)) => Some(control.min(session)),
+            (control, session) => control.or(session),
+        };
+        let target = std::mem::replace(&mut self.bound_target, Ok(None));
+        let current_result = self.runtime.join("current-result.txt");
+        let mut timing = result.timing;
+        timing.capture_start_ms = self.snapshot.timing.capture_start_ms;
+        timing.preparation_ms = self.snapshot.timing.preparation_ms;
+        let (tx, rx) = mpsc::channel();
+        self.completion = Some(rx);
+        thread::spawn(move || {
+            let text = result.text;
+            let completion = if text.trim().is_empty() {
+                timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
+                Completion::Finished(Completed {
+                    text,
+                    description: result.description,
+                    delivery: None,
+                    detail: String::new(),
+                    save_error: None,
+                    directory,
+                    timing,
+                    memory: None,
+                })
+            } else {
+                let save_started = Instant::now();
+                let save_error = fs::write(&current_result, &text)
+                    .err()
+                    .map(|error| error.to_string());
+                timing.save_ms = Some(elapsed_ms(save_started));
+                match (save_error, retry_audio) {
+                    (Some(error), Some(audio)) => Completion::Failed {
+                        error: format!("Could not save the current result: {error}"),
+                        retry: Some(RetainedCapture {
+                            audio,
+                            directory: directory.clone(),
+                            target,
+                        }),
+                        directory,
+                        timing,
+                        retry_scope: None,
+                    },
+                    (save_error, _) => {
+                        let delivery_started = Instant::now();
+                        let outcome = match &save_error {
+                            Some(error) => DeliveryOutcome::fallback(not_delivered(format!(
+                                "Could not save the current result: {error}"
+                            ))),
+                            None => deliver(target, &text),
+                        };
+                        timing.delivery_ms = Some(elapsed_ms(delivery_started));
+                        timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
+                        Completion::Finished(Completed {
+                            text,
+                            description: result.description,
+                            delivery: Some(outcome.delivery),
+                            detail: outcome.detail,
+                            save_error,
+                            directory,
+                            timing,
+                            memory: outcome.memory,
+                        })
+                    }
+                }
+            };
+            let _ = tx.send(completion);
+        });
+    }
+
+    fn apply_completion(&mut self, completion: Completion) {
         match completion {
             Completion::Finished(completed) if completed.text.trim().is_empty() => {
                 // A completed no-speech session is not a new transcript. In particular,
@@ -1928,6 +1602,7 @@ impl Application {
             }
         }
         self.snapshot.phase = Phase::Failure;
+        self.snapshot.recognition = Some(SessionState::Failed);
         // A failed operation leaves no complete result to refine, and no delivery
         // memory that a later refine could act on.
         self.delivery_memory = None;
