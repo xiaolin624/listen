@@ -324,6 +324,7 @@ impl Ui {
             let changed = self.last.as_ref().is_none_or(|last| {
                 last.phase != state.phase
                     || last.preparation != state.preparation
+                    || last.recognition != state.recognition
                     || last.detail != state.detail
                     || last.text != state.text
                     || last.retained_audio != state.retained_audio
@@ -363,7 +364,7 @@ impl Ui {
                 .map(|notice| notice.text().replace('\r', "").replace('\n', " "))
                 .unwrap_or_default();
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -441,7 +442,11 @@ impl Ui {
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 timing.recognition_windows,
-                std::process::id()
+                std::process::id(),
+                state
+                    .recognition
+                    .map(|state| state.name())
+                    .unwrap_or("none"),
             );
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
