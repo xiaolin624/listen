@@ -140,6 +140,24 @@ class EvaluationCommandTests(unittest.TestCase):
         self.assertTrue(case["writing_differences"]["case"])
         self.assertTrue(case["writing_differences"]["punctuation"])
 
+    def test_number_equivalence_cannot_hide_signed_chinese_or_arabic_numbers(self):
+        # A positive spelling approval cannot apply to a whole negative token.
+        # Worked examples: 三 -> -3 needs one substitution and one insertion;
+        # 三 -> -三 needs only the sign insertion, irrespective of writing style.
+        for spelling, expected in (
+                ("3", {"substitutions": 1, "deletions": 0, "insertions": 1}),
+                ("三", {"substitutions": 0, "deletions": 0, "insertions": 1})):
+            for minus in ("-", "−", "－", "﹣"):
+                for spacing in ("", " \t"):
+                    with self.subTest(spelling=spelling, minus=minus, spacing=spacing):
+                        report = self.score([
+                            {"id": "signed", "reference": "温度三度", "expressions": [],
+                             "number_equivalences": [{"canonical": "三度", "variants": ["3度"]}]},
+                        ], [{"id": "signed", "phase": "Result",
+                             "text": f"温度{minus}{spacing}{spelling}度"}])
+                        self.assertEqual(report["samples"][0]["edits"], expected)
+                        self.assertEqual(report["samples"][0]["number_format_differences"], [])
+
     @unittest.skipUnless(sys.platform == "win32", "Windows loopback recorder entry point")
     def test_twenty_sample_recording_plan_can_be_inspected_without_recording(self):
         output = self.root / "not-created"
