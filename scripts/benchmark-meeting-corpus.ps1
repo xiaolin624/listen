@@ -5,6 +5,7 @@ param(
     [string[]]$ListenArgs = $null,
     [string]$Output = '',
     [string]$ListenBinary = '',
+    [string]$Baseline = '',
     [int]$TimeoutSeconds = 180,
     [double]$SentenceDelaySeconds = 1,
     [switch]$ListOnly
@@ -166,6 +167,39 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Corpus 
 $manifest = Read-Utf8File $manifestPath | ConvertFrom-Json
 $corpusSamples = @($manifest.samples)
 if ($corpusSamples.Count -eq 0) { throw "Corpus manifest has no samples: $manifestPath" }
+$baselineReceipt = $null
+$baselineReceiptPath = ''
+$baselineArtifactsVerified = $false
+function Test-BaselineArtifacts($Receipt) {
+    foreach ($property in $Receipt.artifacts.PSObject.Properties) {
+        $artifact = $property.Value
+        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $artifact.path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $artifact.sha256) {
+            throw ("Baseline artifact changed: {0}. Rebuild into a new baseline directory; do not relabel this run." -f $property.Name)
+        }
+    }
+}
+if (-not $Baseline -and $manifest.baseline.file) { $Baseline = Join-Path $corpusDir $manifest.baseline.file }
+if ($Baseline) {
+    if ($PSBoundParameters.ContainsKey('ListenArgs') -or $ListenBinary) {
+        throw '-Baseline supplies the fixed binary and arguments; omit -ListenArgs and -ListenBinary.'
+    }
+    if ($PSBoundParameters.ContainsKey('Engine') -and $Engine -ne 'sensevoice') { throw 'The fixed baseline uses SenseVoice.' }
+    $baselineReceiptPath = [IO.Path]::GetFullPath($Baseline)
+    $baselineReceipt = Read-Utf8File $baselineReceiptPath | ConvertFrom-Json
+    if ($baselineReceipt.kind -ne 'local-baseline-build' -or $baselineReceipt.git_commit -ne '4b8a487e5e6cb5aaedf8bfe8084291cc24540545') {
+        throw 'A fixed current-local baseline build receipt is required; fixtures cannot run as quality evidence.'
+    }
+    Test-BaselineArtifacts $baselineReceipt
+    if ($manifest.baseline.sha256 -and
+        (Get-FileHash -LiteralPath $baselineReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.baseline.sha256) {
+        throw 'The baseline receipt differs from the frozen corpus.'
+    }
+    $baselineArtifactsVerified = $true
+    $ListenBinary = [string]$baselineReceipt.artifacts.listen_binary.path
+    $ListenArgs = @($baselineReceipt.listen_args)
+    $Engine = 'sensevoice'
+}
 $Runtime = [IO.Path]::GetFullPath($Runtime)
 $statusPath = Join-Path $Runtime 'status.txt'
 $resultPath = Join-Path $Runtime 'current-result.txt'
@@ -212,7 +246,7 @@ $launchedListen = $false
 $listenProcess = $null
 $listenPath = ''
 $binaryVerified = $false
-$launchMode = $PSBoundParameters.ContainsKey('ListenArgs')
+$launchMode = $PSBoundParameters.ContainsKey('ListenArgs') -or $null -ne $baselineReceipt
 
 if ($launchMode) {
     $launchBinary = Resolve-ListenBinary -ExplicitPath $ListenBinary
@@ -226,7 +260,7 @@ if ($launchMode) {
     foreach ($argument in $ListenArgs) { $quoted += (Quote-Argument $argument) }
     $quoted += @('--runtime', (Quote-Argument $Runtime))
     Write-Output ("Launching Listen: {0} {1}" -f $launchBinary, ($quoted -join ' '))
-    $listenProcess = Start-Process -FilePath $launchBinary -ArgumentList $quoted -PassThru
+    $listenProcess = Start-Process -FilePath $launchBinary -ArgumentList $quoted -WindowStyle Hidden -PassThru
     $launchedListen = $true
     $deadline = [DateTime]::UtcNow.AddSeconds(120)
     $listenStatus = ''
@@ -355,6 +389,8 @@ $index = 0
 try {
     foreach ($sample in $corpusSamples) {
         $index++
+        $captureInvoked = $false
+        $stopwatch = $null
         $audio = ''
         if ($sample.file) { $audio = Join-Path $corpusDir $sample.file }
         elseif ($sample.audio) { $audio = [IO.Path]::GetFullPath($sample.audio) }
@@ -373,6 +409,7 @@ try {
 
         $before = Read-Utf8File $resultPath
         Invoke-Control 'start'
+        $captureInvoked = $true
         $status = Wait-ForPhase '^phase=Capturing' 10 'the Capturing phase'
         if ($status -match '(?m)^phase=Failure') { throw ("Capture could not start: {0}" -f (Get-StatusField $status 'detail')) }
         Write-Host ("[{0}/{1}] {2}: playing {3} ({4} s) ..." -f $index, $corpusSamples.Count, $sample.id, $audio, (Format-Seconds $info.duration))
@@ -388,6 +425,12 @@ try {
         $detail = Get-StatusField $status 'detail'
         $backend = Get-StatusField $status 'backend'
         $endpointName = Get-StatusField $status 'endpoint_name'
+        $effectiveGlossary = Get-StatusField $status 'glossary'
+        if ($baselineReceipt -and ($backend -notmatch '^SenseVoice q8' -or
+            $effectiveGlossary -ine $baselineReceipt.artifacts.glossary.path)) {
+            $baselineArtifactsVerified = $false
+            throw 'The running backend or effective glossary does not match the fixed baseline.'
+        }
         $timingText = Get-StatusField $status 'timing_stop_to_result_ms'
         $timingMs = $null
         if ($timingText -match '^\d+$') { $timingMs = [long]$timingText }
@@ -424,6 +467,7 @@ try {
             stop_to_result_ms      = $timingMs
             wall_stop_to_result_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 1)
             backend                = $backend
+            glossary               = $effectiveGlossary
             endpoint_name          = $endpointName
             detail                 = $detail
         }
@@ -451,6 +495,35 @@ try {
     }
 }
 
+# A fatal capture/control/timeout error must not silently shrink the denominator.
+# Retain every identity, including the interrupted sample and untouched tail.
+foreach ($pendingSample in $corpusSamples) {
+    if (@($results | Where-Object { $_.id -eq $pendingSample.id }).Count -gt 0) { continue }
+    $pendingReference = Normalize-Text $pendingSample.reference
+    $pendingPhase = 'NotRun'
+    $pendingWall = $null
+    if ($sample -and $pendingSample.id -eq $sample.id -and $captureInvoked) {
+        $pendingPhase = 'Failure'
+        if ($fatal -match 'Timed out') { $pendingPhase = 'Timeout' }
+        if ($stopwatch) { $pendingWall = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 1) }
+        else { $pendingWall = 0 }
+    }
+    $results.Add([ordered]@{
+        id = $pendingSample.id; index = [array]::IndexOf($corpusSamples, $pendingSample) + 1
+        reference = $pendingSample.reference; sha256 = $pendingSample.sha256
+        phase = $pendingPhase; text = ''; error = $fatal
+        reference_chars = $pendingReference.Length; distance_chars = $pendingReference.Length
+        cer = 1.0; accuracy = 0.0; stop_to_result_ms = $null; wall_stop_to_result_ms = $pendingWall
+        backend = ''; endpoint_name = ''; glossary = ''; detail = $fatal
+    })
+}
+if ($baselineReceipt) {
+    try { Test-BaselineArtifacts $baselineReceipt } catch {
+        $baselineArtifactsVerified = $false
+        $fatal = ($fatal + ' ' + $_.Exception.Message).Trim()
+    }
+}
+
 # --- aggregate ---------------------------------------------------------------
 $scored = @($results | Where-Object { $_.reference_chars -gt 0 })
 $totalReferenceChars = 0
@@ -464,7 +537,7 @@ foreach ($entry in $scored) {
     $totalReferenceChars += $entry.reference_chars
     $totalDistance += $entry.distance_chars
     if ($null -ne $entry.stop_to_result_ms) { $latencies += [double]$entry.stop_to_result_ms }
-    $wallLatencies += [double]$entry.wall_stop_to_result_ms
+    if ($null -ne $entry.wall_stop_to_result_ms) { $wallLatencies += [double]$entry.wall_stop_to_result_ms }
     if ($entry.phase -eq 'Result') { $recognized++ }
     elseif ($entry.phase -eq 'NoSpeech') { $noSpeech++ }
     else { $failed++ }
@@ -535,12 +608,16 @@ $summary = [ordered]@{
 }
 $result = [ordered]@{
     corpus_manifest       = $manifestPath
+    corpus_manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    baseline_receipt_sha256 = $(if ($baselineReceiptPath) { (Get-FileHash -LiteralPath $baselineReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null })
+    baseline_artifacts_verified = $baselineArtifactsVerified
     corpus_dir            = $corpusDir
     engine                = $Engine
     engine_label_source   = $(if ($launchMode) { 'launch arguments' } else { 'operator (attached instance)' })
     listen_mode           = $(if ($launchMode) { 'launched' } else { 'attached' })
     listen_args           = $(if ($launchMode) { @($ListenArgs) } else { $null })
     listen_binary         = $listenPath
+    listen_binary_sha256  = (Get-FileHash -LiteralPath $listenPath -Algorithm SHA256).Hash.ToLowerInvariant()
     listen_binary_verified = $binaryVerified
     runtime               = $Runtime
     started_at            = $startedAt
@@ -554,6 +631,19 @@ $result = [ordered]@{
 if (-not (Test-Path -LiteralPath $outputDir -PathType Container)) { $null = New-Item -ItemType Directory -Force -Path $outputDir }
 $json = ConvertTo-Json -InputObject $result -Depth 12
 [IO.File]::WriteAllText($Output, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+
+if ($baselineReceipt) {
+    # #26 uses the stricter content-CER policy and expression review. The legacy
+    # #22 metrics above remain readable for old consumers but are not acceptance
+    # evidence, and must not overwrite the old two-engine comparison document.
+    $evaluationPath = Join-Path $outputDir ([IO.Path]::GetFileNameWithoutExtension($Output) + '-evaluation.json')
+    & python (Join-Path $PSScriptRoot 'evaluate-meeting-corpus.py') score --manifest $manifestPath --results $Output --output $evaluationPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not evaluate the fixed baseline; raw results were preserved.' }
+    Write-Output ("Baseline raw results: {0}" -f $Output)
+    Write-Output ("Authoritative content CER and pending expression reviews: {0}" -f $evaluationPath)
+    if ($fatal) { throw $fatal }
+    return
+}
 
 # --- console report ----------------------------------------------------------
 Write-Host ''

@@ -90,6 +90,8 @@ Rust | re
 
 ## 测试与范围
 
+云端规格 #26 的 20 段真实语料、本地固定基线与内容 CER 复跑步骤见 [#28 录制与评测说明](docs/issue-28-real-corpus-baseline.md)。目前工具就绪，真实 20 段录音、参考原文复核和本次基线实跑仍是未满足的验收前提；旧十句保存文字和合成回归语料不算本次成绩。
+
 ```powershell
 .\scripts\build-listen.ps1 -Task Test
 .\scripts\build-listen.ps1 -Task CheckFormat
