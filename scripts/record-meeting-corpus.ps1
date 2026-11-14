@@ -1,11 +1,12 @@
 param(
+    [Alias('Corpus')][string]$Definition = '',
     [string]$Output = '',
     [string]$Only = '',
     [double]$SentenceDelaySeconds = 2,
     [switch]$ListOnly,
     [string]$Recorder = ''
 )
-# Records the ten real Tencent-Meeting sentences used by issue #22. The audio is
+# Records the real Tencent-Meeting sentences in an explicit corpus (#22/#28).
 # captured from the default multimedia render endpoint by capture_only.exe and is
 # never recognized, transcribed or uploaded. The sentence text and all user-facing
 # recording instructions live in quality\meeting-corpus.json so this script stays
@@ -86,16 +87,22 @@ function Get-WavInfo([string]$Path) {
 }
 
 $corpusPath = Join-Path $projectRoot 'quality\meeting-corpus.json'
+if ($Definition) { $corpusPath = [IO.Path]::GetFullPath($Definition) }
 if (-not (Test-Path -LiteralPath $corpusPath -PathType Leaf)) { throw "Corpus file is missing: $corpusPath" }
 $corpus = [IO.File]::ReadAllText($corpusPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
 $samples = @($corpus.samples)
-if ($samples.Count -ne 10) { throw "quality\meeting-corpus.json must contain exactly 10 sentences; found $($samples.Count)." }
+$requiredCount = 10
+if ($corpus.required_sample_count) { $requiredCount = [int]$corpus.required_sample_count }
+if ($samples.Count -ne $requiredCount) { throw "Corpus must contain exactly $requiredCount sentences; found $($samples.Count)." }
+$targetSeconds = 12
+if ($corpus.target_seconds) { $targetSeconds = [int]$corpus.target_seconds }
 $indexById = @{}
 for ($i = 0; $i -lt $samples.Count; $i++) {
     $sample = $samples[$i]
     if (-not $sample.id -or -not $sample.spoken -or -not $sample.reference) {
         throw "Corpus sentence $($i + 1) is missing id, spoken or reference."
     }
+    if ($sample.id -notmatch '^[a-z0-9][a-z0-9-]{0,79}$') { throw "Unsafe corpus id: $($sample.id)" }
     if ($indexById.ContainsKey($sample.id)) { throw "Duplicate corpus id: $($sample.id)" }
     $indexById[$sample.id] = $i + 1
 }
@@ -105,7 +112,11 @@ if ($Only -and -not $indexById.ContainsKey($Only)) {
 if ($SentenceDelaySeconds -lt 0 -or $SentenceDelaySeconds -gt 30) {
     throw 'SentenceDelaySeconds must be between 0 and 30.'
 }
-if (-not $Output) { $Output = Join-Path $projectRoot '.artifacts\meeting-corpus' }
+if (-not $Output) {
+    $directory = 'meeting-corpus'
+    if ($corpus.kind -eq 'real-meeting-evaluation') { $directory = 'cloud-meeting-corpus' }
+    $Output = Join-Path (Join-Path $projectRoot '.artifacts') $directory
+}
 $Output = [IO.Path]::GetFullPath($Output)
 $manifestPath = Join-Path $Output 'manifest.json'
 
@@ -115,6 +126,10 @@ if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         $previous = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     } catch {
         throw "Existing manifest cannot be read: $manifestPath. Move it aside to start over. ($($_.Exception.Message))"
+    }
+    if ($corpus.kind -eq 'real-meeting-evaluation' -and
+        ($previous.kind -ne $corpus.kind -or $previous.corpus_sha256 -ne (Get-FileHash -LiteralPath $corpusPath -Algorithm SHA256).Hash.ToLowerInvariant())) {
+        throw 'The existing recording manifest uses a different definition; preserve it and choose a new -Output directory.'
     }
     foreach ($entry in @($previous.samples)) {
         if ($entry -and $entry.id) { $recorded[$entry.id] = $entry }
@@ -143,14 +158,15 @@ function New-Manifest($Corpus, $Recorded, [int]$Count, [string]$RecorderPath) {
         if ($Recorded.ContainsKey($sample.id)) { $entries.Add($Recorded[$sample.id]) }
     }
     return [ordered]@{
-        corpus          = 'quality/meeting-corpus.json'
+        corpus          = $corpusPath
+        corpus_sha256   = (Get-FileHash -LiteralPath $corpusPath -Algorithm SHA256).Hash.ToLowerInvariant()
         corpus_version  = $Corpus.version
         kind            = $Corpus.kind
         sample_rate     = $Corpus.sample_rate
         channels        = $Corpus.channels
         bits_per_sample = $Corpus.bits_per_sample
         recorder        = $RecorderPath
-        recording_chain = 'phone in Tencent Meeting -> PC in the same meeting -> default multimedia render endpoint (headphones) -> capture_only loopback; no recognition'
+        recording_chain = $(if ($Corpus.recording_chain) { $Corpus.recording_chain } else { 'phone in Tencent Meeting -> PC in the same meeting -> default multimedia render endpoint (headphones) -> capture_only loopback; no recognition' })
         sentence_count  = $Count
         generated_at    = (Get-Date).ToString('o')
         samples         = $entries.ToArray()
@@ -211,7 +227,7 @@ if ($ListOnly) {
 $RecorderPath = Resolve-Recorder -ExplicitPath $Recorder
 $null = New-Item -ItemType Directory -Force -Path $Output
 Write-Host ''
-Write-Host '=== Listen meeting-corpus recording (issue #22) ===' -ForegroundColor Cyan
+Write-Host '=== Listen meeting-corpus recording ===' -ForegroundColor Cyan
 Write-Host ("Recorder: {0}" -f $RecorderPath)
 Write-Host ("Output:   {0}" -f $Output)
 Write-Host ''
@@ -309,8 +325,8 @@ foreach ($sample in $selected) {
                     $problem = ("The take is not a 16 kHz mono 16-bit WAV ({0} Hz, {1} channel(s), {2} bit)." -f $info.sample_rate, $info.channels, $info.bits)
                 } elseif ($info.duration -lt 1.0) {
                     $problem = ("The take is only {0:N2} s long, which is too short; record the whole sentence again." -f $info.duration)
-                } elseif ($info.duration -gt 15.0) {
-                    Write-Warning ("The take is {0:N2} s long; the corpus targets under 12 s per sentence. You can still accept it." -f $info.duration)
+                } elseif ($info.duration -gt ($targetSeconds + 3)) {
+                    Write-Warning ("The take is {0:N2} s long; the corpus targets under {1} s per sentence. You can still accept it." -f $info.duration, $targetSeconds)
                 }
             }
             if (-not $problem -and (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
@@ -331,6 +347,11 @@ foreach ($sample in $selected) {
         if ($captureReport -and $captureReport.endpoint) {
             Write-Host ("Captured endpoint: {0} '{1}'" -f $captureReport.endpoint.role, $captureReport.endpoint.name) -ForegroundColor Green
         }
+        if ($corpus.requires_reference_review) {
+            Write-Host 'Replaying this take. Listen for missing words, repeats and changed meaning before accepting.'
+            $player = New-Object System.Media.SoundPlayer($wavPath)
+            try { $player.PlaySync() } finally { $player.Dispose() }
+        }
         $answer = Read-Host 'Press Enter to accept this take, type r to re-record, or q to stop the session'
         if ($answer -match '^\s*[Qq]\s*$') { $aborted = $true; break }
         if ($answer -match '^\s*[Rr]\s*$') { continue }
@@ -348,6 +369,9 @@ foreach ($sample in $selected) {
             spoken         = $sample.spoken
             reference      = $sample.reference
             focus          = $sample.focus
+            coverage       = @($sample.coverage)
+            expressions    = @($sample.expressions)
+            capture_source = $(if ($captureReport) { [string]$captureReport.source } else { '' })
             recorded_at    = (Get-Date).ToString('o')
             endpoint_name  = ''
             endpoint_id    = ''
@@ -359,7 +383,12 @@ foreach ($sample in $selected) {
         $recorded[$sample.id] = $entry
         $manifest = New-Manifest -Corpus $corpus -Recorded $recorded -Count $samples.Count -RecorderPath $RecorderPath
         Save-Manifest -Manifest $manifest -Path $manifestPath
-        Remove-Item -LiteralPath $runtimePath -Recurse -Force -ErrorAction SilentlyContinue
+        $captureRoot = [IO.Path]::GetFullPath((Join-Path $Output 'capture-runtime')) + [IO.Path]::DirectorySeparatorChar
+        $resolvedRuntime = [IO.Path]::GetFullPath($runtimePath)
+        if (-not $resolvedRuntime.StartsWith($captureRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing to clean a capture directory outside this evaluation corpus.'
+        }
+        Remove-Item -LiteralPath $resolvedRuntime -Recurse -Force -ErrorAction SilentlyContinue
         $accepted = $true
         Write-Output ("Accepted {0}; manifest updated: {1}" -f $sample.id, $manifestPath)
     }
