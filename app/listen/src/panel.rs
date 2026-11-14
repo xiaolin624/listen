@@ -75,7 +75,7 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
         Refine::Available => {
             Some("可以精修：只把下方的文字发送到 DeepSeek API，不发送音频。".into())
         }
-        Refine::Running => Some("正在精修：只发送文字，不发送音频；本地结果暂时保留。".into()),
+        Refine::Running => Some("正在精修：只发送文字，不发送音频；当前结果暂时保留。".into()),
         Refine::Applied => Some(match snapshot.delivery {
             Some(Delivery::Fallback) => {
                 "精修完成：没有目标输入框可替换，精修结果已保存为当前结果。".into()
@@ -85,7 +85,7 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
         Refine::NotApplied(reason) => Some(format!(
             "精修结果没有写回目标输入框：{reason}。精修文本在下方，你的编辑保持不变。"
         )),
-        Refine::Failed(reason) => Some(format!("精修失败：{reason}。本地结果保持不变，仍可复制。")),
+        Refine::Failed(reason) => Some(format!("精修失败：{reason}。当前结果保持不变，仍可复制。")),
         Refine::Unavailable(reason) if snapshot.phase == Phase::Result => {
             Some(format!("精修不可用：{reason}"))
         }
@@ -110,7 +110,13 @@ fn headline(snapshot: &Snapshot) -> &'static str {
             crate::capsule::CapsuleState::Preparing => "正在准备本地识别模型",
             crate::capsule::CapsuleState::Ready => "就绪",
             crate::capsule::CapsuleState::Capturing => "正在采集（实时进度）",
-            crate::capsule::CapsuleState::Processing => "正在本机识别",
+            crate::capsule::CapsuleState::Processing => {
+                if snapshot.cloud_trial() {
+                    "正在云端识别"
+                } else {
+                    "正在本机识别"
+                }
+            }
             crate::capsule::CapsuleState::Failure => "失败",
         },
     }
@@ -132,7 +138,13 @@ fn summary(snapshot: &Snapshot) -> &'static str {
         Phase::Failure => {
             "失败原因和保留的音频路径如下；没有自动重试，也没有向任何目标写入或发送。"
         }
+        Phase::Capturing if snapshot.cloud_trial() => {
+            "正在保存并逐步发送本次耳机音频；再按一次 Ctrl+Alt+R 停止，完整确认后交付。"
+        }
         Phase::Capturing => "正在持续采集并分段识别；再按一次 Ctrl+Alt+R 停止。",
+        Phase::Processing if snapshot.cloud_trial() => {
+            "正在等待云端整段完成确认；音频保留在本机，确认并保存完整文字后再安全回填。"
+        }
         Phase::Processing => {
             "正在本机识别，不发送任何消息；完成后结果会追加到目标或只显示在本面板。"
         }
@@ -147,6 +159,12 @@ fn summary(snapshot: &Snapshot) -> &'static str {
 /// capture moving.
 fn capture_progress(snapshot: &Snapshot) -> String {
     let seconds = snapshot.progress.received_samples as f64 / SAMPLE_RATE as f64;
+    if snapshot.cloud_trial() {
+        return format!(
+            "已接收 {seconds:.1} 秒连续音频；{} 字节已保存。稳定分句不等于完整结果。",
+            snapshot.progress.spool_bytes
+        );
+    }
     format!(
         "已接收 {seconds:.1} 秒音频；识别窗口已完成 {} 个，待处理 {} 个。",
         snapshot.progress.recognized_segments, snapshot.progress.pending_segments
@@ -162,6 +180,11 @@ pub fn status_text(snapshot: &Snapshot) -> String {
         headline(snapshot).to_string(),
         summary(snapshot).to_string(),
     ];
+    if snapshot.cloud_trial() {
+        if let Some(backend) = &snapshot.backend {
+            lines.push(backend.clone());
+        }
+    }
     if snapshot.phase == Phase::Capturing {
         lines.push(capture_progress(snapshot));
     }
@@ -184,7 +207,11 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     // result that was produced while the model was still loading) must not read as
     // "everything is ready for the next capture".
     if snapshot.preparation == Preparation::Failed && snapshot.phase != Phase::Failure {
-        lines.push("本地识别模型准备失败，新的采集无法进行。".into());
+        lines.push(if snapshot.cloud_trial() {
+            "云端试用准备未完成，新的云端请求未发送。".into()
+        } else {
+            "本地识别模型准备失败，新的采集无法进行。".into()
+        });
     }
     lines.join("\n")
 }

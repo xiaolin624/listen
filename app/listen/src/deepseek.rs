@@ -1,6 +1,6 @@
 //! The optional DeepSeek refine client (精修).
 //!
-//! This is the product's only outbound-network path, so the module is split in two:
+//! This optional text-only path is separate from explicit cloud audio recognition:
 //! pure request/response functions that unit tests pin down exactly, and one WinHTTP
 //! POST that carries nothing but the request body built by [`request_body`].
 //!
@@ -55,7 +55,7 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The one instruction sent with every transcript. It asks for the smallest change
 /// that fixes obvious recognition mistakes and forbids any rewrite of the content.
-pub const SYSTEM_PROMPT: &str = "You correct speech-to-text transcripts. The user message is one transcript produced by a local speech recognizer. Correct only obvious recognition mistakes: proper nouns, technical terms, homophones and punctuation. Keep the meaning, the wording, the speaker's language mixing (for example Chinese with English technical terms) and every number exactly as intended. Do not translate, summarize, expand, shorten or add commentary. Output only the corrected transcript text: no explanations, no quotes, no code fences. If nothing needs correcting, return the transcript unchanged.";
+pub const SYSTEM_PROMPT: &str = "You correct speech-to-text transcripts. The user message is one transcript produced by speech recognition. Correct only obvious recognition mistakes: proper nouns, technical terms, homophones and punctuation. Keep the meaning, the wording, the speaker's language mixing (for example Chinese with English technical terms) and every number exactly as intended. Do not translate, summarize, expand, shorten or add commentary. Output only the corrected transcript text: no explanations, no quotes, no code fences. If nothing needs correcting, return the transcript unchanged.";
 
 /// The client read from the local environment. Construction never touches the
 /// network; only an explicit [`RefineText::refine`] call does.
@@ -171,7 +171,7 @@ pub fn parse_response(status: u16, body: &str) -> AppResult<String> {
     let content = content.trim();
     if content.is_empty() {
         return Err(
-            "The DeepSeek API returned an empty correction; the local result is kept".into(),
+            "The DeepSeek API returned an empty correction; the current result is kept".into(),
         );
     }
     Ok(content.to_string())

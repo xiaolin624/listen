@@ -8,6 +8,7 @@ use std::{
 
 #[cfg(windows)]
 pub mod audio;
+pub mod cloud;
 #[cfg(windows)]
 pub mod deepseek;
 pub mod glossary;
@@ -40,6 +41,11 @@ pub trait PlaybackAudio: Send + Sync {
 
 pub trait Recording: Send {
     fn finish(self: Box<Self>) -> AppResult<CapturedAudio>;
+    /// Continuous, non-overlapping 16 kHz mono signed little-endian PCM. A cloud
+    /// adapter must refuse a device that only supplies local recognition windows.
+    fn take_pcm_stream(&mut self) -> Option<cloud::PcmStream> {
+        None
+    }
     fn take_segments(&mut self) -> Option<SegmentStream> {
         None
     }
@@ -127,8 +133,8 @@ pub trait Target: Send {
 
 /// The optional 精修 (refine) boundary: text in, corrected text out.
 ///
-/// This is the product's only outbound-network path, so the interface is
-/// deliberately the whole safety story: the implementation is handed one transcript
+/// This optional text-only path is separate from explicit cloud recognition.
+/// Its implementation is handed one transcript
 /// string and nothing else. It never sees the captured audio, a file path, the
 /// runtime directory or any other transcript. Implementations report availability
 /// without doing network work, so a missing API key disables the entry before the
@@ -215,7 +221,7 @@ pub enum Refine {
     Unavailable(String),
     /// A complete result exists and the port is able to run.
     Available,
-    /// A refine request is in flight. The local result is still the current result.
+    /// A refine request is in flight. The current result is still the current result.
     Running,
     /// The refined text replaced the current result and, when a target existed, the
     /// appended transcript that the target still held.
@@ -223,7 +229,7 @@ pub enum Refine {
     /// The refined text is valid but was deliberately not written to the target; it
     /// is exposed as `Snapshot::refined_text` and the user's target is untouched.
     NotApplied(String),
-    /// The refine request itself failed. The complete local result is unchanged.
+    /// The refine request itself failed. The complete result is unchanged.
     Failed(String),
 }
 
@@ -281,7 +287,7 @@ impl Notice {
                 "Could not copy the result: {reason}. The clipboard was not replaced; the complete result is still in the panel and can be selected and copied by hand."
             ),
             Notice::CaptureExcluded(reason) => format!(
-                "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and local recognition are unaffected."
+                "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
             ),
         }
     }
@@ -315,12 +321,21 @@ pub struct Snapshot {
     pub refine: Refine,
     /// The refined text when it must not be written to the target (the target was
     /// edited, or could not be confirmed unchanged). It is shown in the expanded
-    /// panel while `text` keeps the complete local result.
+    /// panel while `text` keeps the complete result.
     pub refined_text: Option<String>,
     /// A user-visible problem outside the capture flow (a failed clipboard copy, a
     /// capsule that cannot be hidden from screen capture). `None` when there is
     /// nothing to report.
     pub notice: Option<Notice>,
+}
+
+impl Snapshot {
+    /// Display metadata only; budget and delivery never depend on this label.
+    pub fn cloud_trial(&self) -> bool {
+        self.backend
+            .as_deref()
+            .is_some_and(|backend| backend.starts_with("Cloud trial:"))
+    }
 }
 
 /// States which render route the capture is bound to and which routes are outside
@@ -481,7 +496,7 @@ fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> DeliveryOu
 
 /// The result of one refine request. The delivery memory was moved to the worker so
 /// the target read, replace and read-back all happen off the UI thread; a target that
-/// must not be written leaves the local result untouched.
+/// must not be written leaves the current result untouched.
 enum RefineOutcome {
     Applied { refined: String, note: String },
     NotApplied { refined: String, reason: String },
@@ -495,7 +510,7 @@ enum RefineOutcome {
 /// * a target is written only when it still holds exactly the content delivery wrote
 ///   and the appended transcript is still the current result;
 /// * the write is confirmed by reading it back before success is claimed;
-/// * any failure keeps the complete local result and never re-appends or restores.
+/// * any failure keeps the complete result and never re-appends or restores.
 fn refine_delivery(
     refine: Arc<dyn RefineText>,
     text: String,
@@ -512,8 +527,9 @@ fn refine_delivery(
     };
     if refined.is_empty() {
         return RefineOutcome::Failed {
-            reason: "the refine service returned an empty correction, so the local result is kept"
-                .into(),
+            reason:
+                "the refine service returned an empty correction, so the current result is kept"
+                    .into(),
         };
     }
     let Some(mut memory) = memory else {
@@ -586,13 +602,13 @@ fn refine_delivery(
         Ok(_) => RefineOutcome::NotApplied {
             refined,
             reason:
-                "the original target did not confirm the complete refined text, so no complete write is claimed and the local result is kept"
+                "the original target did not confirm the complete refined text, so no complete write is claimed and the current result is kept"
                     .into(),
         },
         Err(error) => RefineOutcome::NotApplied {
             refined,
             reason: format!(
-                "the refined text could not be confirmed in the original target ({error}), so the local result is kept; the target is not written again"
+                "the refined text could not be confirmed in the original target ({error}), so the current result is kept; the target is not written again"
             ),
         },
     }
@@ -824,11 +840,11 @@ impl Application {
     /// Read the glossary again so an edit applies to this capture without a
     /// restart. A malformed file is reported and never loses the capture: the
     /// transcript is still delivered, only without correction.
-    fn reload_glossary(&mut self) {
+    fn reload_glossary(&mut self) -> AppResult<()> {
         let Some(path) = self.glossary_file().map(Path::to_path_buf) else {
             self.glossary = glossary::Glossary::default();
             self.glossary_note = None;
-            return;
+            return Ok(());
         };
         match glossary::Glossary::load(&path) {
             Ok(loaded) => {
@@ -840,8 +856,12 @@ impl Application {
                 self.glossary_note = Some(format!(
                     "Glossary correction is unavailable: {error}. The uncorrected transcript is still delivered."
                 ));
+                return Err(format!(
+                    "Cloud trial glossary could not be loaded: {error}. No cloud request was sent"
+                ));
             }
         }
+        Ok(())
     }
 
     fn with_glossary_note(&self, detail: String) -> String {
@@ -908,7 +928,7 @@ impl Application {
     }
 
     /// Record a finished refine. `Refine::Running` and `Phase::Result` are the only
-    /// states the worker can finish from; the local result is only replaced after a
+    /// states the worker can finish from; the current result is only replaced after a
     /// confirmed write or when there was no target at all.
     fn apply_refine_outcome(&mut self, outcome: RefineOutcome) {
         self.delivery_memory = None;
@@ -925,7 +945,7 @@ impl Application {
                 self.snapshot.refine = Refine::NotApplied(reason.clone());
                 let reason = reason.trim_end_matches('.').trim_end();
                 self.snapshot.detail = format!(
-                    "Refine was not written back: {reason}. The refined text is in the expanded panel and the complete local result is unchanged. Nothing is sent automatically."
+                    "Refine was not written back: {reason}. The refined text is in the expanded panel and the complete result is unchanged. Nothing is sent automatically."
                 );
             }
             RefineOutcome::Failed { reason } => {
@@ -933,7 +953,7 @@ impl Application {
                 self.snapshot.refine = Refine::Failed(reason.clone());
                 let reason = reason.trim_end_matches('.').trim_end();
                 self.snapshot.detail = format!(
-                    "Refine failed: {reason}. The complete local result is unchanged and remains available; nothing was appended again or sent."
+                    "Refine failed: {reason}. The complete result is unchanged and remains available; nothing was appended again or sent."
                 );
             }
         }
@@ -945,7 +965,7 @@ impl Application {
         if self.is_capturing() {
             "Playback is being captured and buffered"
         } else if self.is_processing() {
-            "The previous capture is still being processed locally"
+            "The previous capture is still being processed"
         } else {
             "Nothing is being captured"
         }
@@ -983,7 +1003,10 @@ impl Application {
                     if let Some(error) = &self.control_error {
                         return Err(format!("Global hotkey unavailable: {error}"));
                     }
-                    self.reload_glossary();
+                    let glossary_ready = self.reload_glossary();
+                    if self.sessions.requires_valid_glossary() {
+                        glossary_ready?;
+                    }
                     fs::create_dir_all(&self.runtime).map_err(|error| error.to_string())?;
                     let unique = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1050,11 +1073,7 @@ impl Application {
                 active.handle.stop();
                 self.snapshot.recognition = Some(SessionState::AwaitingFinal);
                 self.snapshot.phase = Phase::Processing;
-                self.snapshot.detail = if self.snapshot.preparation == Preparation::Pending {
-                    PROCESSING_WHILE_PREPARING_DETAIL.into()
-                } else {
-                    "Processing locally; no messages are sent.".into()
-                };
+                self.snapshot.detail = active.handle.status().detail;
             }
             Control::Refine => {
                 if self.refine_job.is_some() {
@@ -1071,10 +1090,10 @@ impl Application {
                 }
                 if self.is_processing() {
                     self.snapshot.refine = Refine::Unavailable(
-                        "The previous capture is still processing locally; wait for the complete result before refining."
+                        "The previous capture is still processing; wait for the complete result before refining."
                             .into(),
                     );
-                    self.snapshot.detail = "Refine is unavailable while the current playback is still being processed locally. The current result is unchanged.".into();
+                    self.snapshot.detail = "Refine is unavailable while the current playback is still being processed. The current result is unchanged.".into();
                     return;
                 }
                 // The entry is only enabled for a complete result that the port can
@@ -1110,7 +1129,7 @@ impl Application {
                 self.refine_job = Some(rx);
                 self.snapshot.refine = Refine::Running;
                 self.snapshot.refined_text = None;
-                self.snapshot.detail = "Refining the current result through the configured DeepSeek API; only the transcript text is sent, never the audio. The local result stays available meanwhile.".into();
+                self.snapshot.detail = "Refining the current result through the configured DeepSeek API; only the transcript text is sent, never the audio. The current result stays available meanwhile.".into();
                 thread::spawn(move || {
                     let _ = tx.send(refine_delivery(refine, text, memory, current_result));
                 });
@@ -1267,7 +1286,7 @@ impl Application {
                         "the refine worker stopped unexpectedly before reporting a correction"
                             .into(),
                     );
-                    self.snapshot.detail = "Refine failed: the worker stopped unexpectedly before reporting a correction. The complete local result is unchanged and remains available; nothing was appended again or sent.".into();
+                    self.snapshot.detail = "Refine failed: the worker stopped unexpectedly before reporting a correction. The complete result is unchanged and remains available; nothing was appended again or sent.".into();
                 }
             }
         }
@@ -1411,7 +1430,7 @@ impl Application {
                 })
             } else {
                 let save_started = Instant::now();
-                let save_error = fs::write(&current_result, &text)
+                let save_error = cloud::persist_result(&current_result, text.as_bytes())
                     .err()
                     .map(|error| error.to_string());
                 timing.save_ms = Some(elapsed_ms(save_started));
@@ -1592,7 +1611,9 @@ impl Application {
                         let path = entry.path();
                         if path.is_dir() {
                             pending.push(path);
-                        } else if path.extension().is_some_and(|extension| extension == "wav")
+                        } else if path
+                            .extension()
+                            .is_some_and(|extension| extension == "wav" || extension == "pcm")
                             && !self.snapshot.retained_audio.contains(&path)
                         {
                             self.snapshot.retained_audio.push(path);
