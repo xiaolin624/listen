@@ -512,12 +512,17 @@ impl MessageTransport for NoPolicy {
 }
 #[test]
 fn missing_credentials_and_unknown_cost_bounds_refuse_before_capture_or_network() {
-    for (credentials, expected) in [
+    for (credentials, expected, unknown_cost) in [
         (
             Arc::new(MissingKey) as Arc<dyn CredentialSource>,
             "No Alibaba cloud API key",
+            false,
         ),
-        (Arc::new(Key) as Arc<dyn CredentialSource>, "maximum cost"),
+        (
+            Arc::new(Key) as Arc<dyn CredentialSource>,
+            "maximum charge",
+            true,
+        ),
     ] {
         let runtime = Runtime::new();
         let playback = Arc::new(Playback::default());
@@ -537,7 +542,30 @@ fn missing_credentials_and_unknown_cost_bounds_refuse_before_capture_or_network(
         app.dispatch(Control::Start);
         let failure = app.snapshot();
         assert_eq!(failure.phase, Phase::Failure);
+        if unknown_cost {
+            let detail = failure.detail.to_ascii_lowercase();
+            for jargon in [
+                "token",
+                "protocol",
+                "websocket",
+                "message task",
+                "reservation",
+            ] {
+                assert!(!detail.contains(jargon), "{failure:?}");
+            }
+            assert!(detail.contains("no audio was sent"), "{failure:?}");
+            assert!(detail.contains("use local recognition"), "{failure:?}");
+            assert!(detail.contains("configuration guide"), "{failure:?}");
+        }
         assert!(failure.detail.contains(expected), "{failure:?}");
+        let backend = failure.backend.as_deref().unwrap();
+        for selected in [
+            "Alibaba Model Studio",
+            "qwen-audio-3.1-asr-flash-message",
+            "cn-beijing",
+        ] {
+            assert!(backend.contains(selected), "{failure:?}");
+        }
         assert!(playback.0.lock().unwrap().is_none());
         assert!(ledger.snapshot().unwrap().attempts.is_empty());
     }

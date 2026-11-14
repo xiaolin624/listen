@@ -163,7 +163,7 @@ impl fmt::Display for CloudError {
             Self::MissingKey => "No Alibaba cloud API key is configured. Use scripts/configure-cloud-trial.ps1 locally, or inject LISTEN_ALI_API_KEY for this process; no cloud request was sent",
             Self::Credential => "The local cloud credential could not be read or has an invalid format; configure it again locally",
             Self::Configuration => "Cloud trial requires a valid Alibaba workspace, cn-beijing region and qwen-audio-3.1-asr-flash-message model; check the local configuration",
-            Self::BudgetUnknown => "The maximum cost of this Message task cannot yet be verified (official input/output token bounds are missing). Cloud trial was not sent; a CNY 50 alert or an estimated token rate cannot replace a proven reservation",
+            Self::BudgetUnknown => "The maximum charge for this cloud trial cannot yet be confirmed. No audio was sent. Use local recognition for now; see the local cloud-trial configuration guide for the remaining requirements",
             Self::BudgetExhausted => "The shared CNY 50 trial budget has insufficient uncommitted funds; no new cloud task was sent",
             Self::Ledger => "The shared trial cost ledger cannot be read or safely persisted. No new paid request is allowed; preserve the ledger and check local storage",
             Self::LedgerBusy => "The shared trial cost ledger is in use by another process; no new cloud request was allowed",
