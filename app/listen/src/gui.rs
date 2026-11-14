@@ -1,5 +1,5 @@
 use crate::{
-    Config, WasapiPlayback,
+    Config,
     capsule::{CapsuleState, capsule_state, preparation_name},
     capsule_window::{self, Capsule},
     panel,
@@ -177,16 +177,12 @@ pub fn run(config: Config) -> Result<(), String> {
         // state is deliberately "not ready yet" rather than a false "ready".
         let capsule = capsule_window::create(&config.runtime, CapsuleState::Preparing)?;
 
-        let mut app = Application::new(
-            Arc::new(WasapiPlayback),
-            config.transcriber(),
-            config.runtime.clone(),
-            registration,
-        )
-        .with_targets(Arc::new(NativeTargets::new()))
-        // The only outbound path is opt-in: without DEEPSEEK_API_KEY this client
-        // reports itself unavailable and the refine entry stays disabled.
-        .with_refine(Arc::new(DeepSeek::from_environment()));
+        let mut app = config
+            .application(registration)?
+            .with_targets(Arc::new(NativeTargets::new()))
+            // Text refine is separately opt-in. Explicit cloud recognition never
+            // automatically invokes this connector or sends a second vendor request.
+            .with_refine(Arc::new(DeepSeek::from_environment()));
         capsule.set_state(capsule_state(&app.snapshot()));
         // The ADR promises the capsule is invisible to every screen share. If the
         // platform refuses, say so in the panel/status instead of leaving only
@@ -480,7 +476,11 @@ impl Ui {
                                 "Capturing the default multimedia playback endpoint. Ctrl+Alt+R stops."
                             }
                             Phase::Processing => {
-                                "Recognizing locally. Wait for the current result."
+                                if state.cloud_trial() {
+                                    "Waiting for complete cloud recognition; received audio is retained."
+                                } else {
+                                    "Recognizing locally. Wait for the current result."
+                                }
                             }
                             Phase::Preparing => {
                                 "Preparing the local model. Capture can still start now."
@@ -499,7 +499,7 @@ impl Ui {
                                 if state.retry_available {
                                     "Recognition failed. The captured audio is retained; retry it locally from the tray menu."
                                 } else {
-                                    "The operation failed. Retry or clean the retained audio from the tray menu."
+                                    "The operation failed. Open the panel for the reason and any retained audio paths."
                                 }
                             }
                             _ => "Ready. Ctrl+Alt+R starts playback capture.",

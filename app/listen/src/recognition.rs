@@ -96,6 +96,11 @@ pub struct SessionEvent {
 /// PCM directly to its engine here; it need not implement LocalTranscriber or use
 /// the local adapter's overlapping file windows.
 pub trait RecognitionSessions: Send {
+    /// Local recognition can warn and continue without correction. A cloud trial
+    /// must not silently upload after failing to load its declared term snapshot.
+    fn requires_valid_glossary(&self) -> bool {
+        false
+    }
     fn preparation(&mut self) -> RecognitionReadiness;
     fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>>;
     fn retry(

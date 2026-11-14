@@ -111,6 +111,11 @@ struct Token {
 }
 
 impl Glossary {
+    /// Canonical spellings in this immutable capture-start snapshot. Cloud
+    /// recognition receives these terms, never local aliases or previous text.
+    pub fn canonical_terms(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.canonical.as_str())
+    }
     /// Read the glossary from a human-editable file. A missing file is an empty
     /// glossary; an unreadable or malformed file is an explicit error.
     pub fn load(path: impl AsRef<Path>) -> AppResult<Self> {

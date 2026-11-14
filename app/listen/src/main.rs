@@ -7,8 +7,9 @@ mod panel;
 mod panel_window;
 
 use listen::{
-    LocalTranscriber,
-    audio::WasapiPlayback,
+    AppResult, Application, LocalTranscriber,
+    audio::{WasapiPcmPlayback, WasapiPlayback},
+    cloud::CloudSessions,
     sensevoice::SenseVoice,
     whisper::{Backend, Whisper},
 };
@@ -40,9 +41,26 @@ pub struct Config {
     sensevoice_tokens: PathBuf,
     sensevoice_vad: PathBuf,
     sensevoice_language: String,
+    cloud_trial: bool,
 }
 
 impl Config {
+    pub fn application(&self, registration: AppResult<()>) -> AppResult<Application> {
+        if self.cloud_trial {
+            Ok(Application::with_recognition_sessions(
+                Box::new(CloudSessions::from_local(Arc::new(WasapiPcmPlayback))?),
+                self.runtime.clone(),
+                registration,
+            ))
+        } else {
+            Ok(Application::new(
+                Arc::new(WasapiPlayback),
+                self.transcriber(),
+                self.runtime.clone(),
+                registration,
+            ))
+        }
+    }
     /// Builds the configured local engine. The default is the resident
     /// SenseVoice engine; whisper.cpp is only used when explicitly selected and
     /// is never a silent fallback inside the SenseVoice module.
@@ -77,9 +95,18 @@ enum LaunchAction {
 const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.
 Only that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.
 
-Recognition: SenseVoice q8 through sherpa-onnx, resident in this process on the CPU (AVX2 required). It is prepared on a background thread; capture can start immediately and is buffered until the model reports ready. Silence, music and notification windows are gated by Silero VAD and are never decoded into fabricated text. No cloud service is used and whisper is not a silent fallback.
+Default recognition: SenseVoice q8 through sherpa-onnx, resident in this process on the CPU (AVX2 required). It is prepared on a background thread; capture can start immediately and is buffered until the model reports ready. Silence, music and notification windows are gated by Silero VAD. Whisper is not a silent fallback.
+
+The explicit Alibaba cloud trial sends this capture's continuous audio and capture-start glossary to the Beijing Message model. It keeps the local daily default unchanged and never substitutes a local result for a failed cloud task. Production trials currently refuse to send because a defensible maximum Message token cost is not yet verified; a key or billing alert does not bypass this protection.
 
 Options:
+  --cloud-trial <ali>
+        explicitly select Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing.
+        Configure locally with scripts/configure-cloud-trial.ps1 (hidden key entry;
+        current-user Windows Credential Manager). LISTEN_ALI_API_KEY and
+        LISTEN_ALI_WORKSPACE_ID are optional process-local test injections.
+        All providers/retries must share the persisted CNY 50 first-trial ledger.
+        Cannot be combined with --engine; there is no automatic cloud/local fallback.
   --engine <sensevoice|whisper|whisper-cli.exe>
         sensevoice (default) or whisper select the engine; a path selects whisper.cpp and uses that executable.
   --sherpa-lib <directory>
@@ -107,7 +134,7 @@ Retry recognizes the same audio retained after a failed local recognition; clean
 show opens the expanded result panel, panel toggles it and copy copies the complete current result to the clipboard.
 refine asks the DeepSeek API to correct the complete current result. Only that transcript text is sent, never the audio.
 The refined text replaces the appended transcript only while the original target still holds exactly what Listen wrote; if the target was edited, the refined text stays in the panel and the edit is preserved. Without DEEPSEEK_API_KEY in the local environment the refine entry is unavailable, and local recognition is unaffected.
-Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail, and results are never sent automatically.";
+Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail. Text is never submitted as a message automatically.";
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
@@ -133,8 +160,10 @@ fn parse() -> Result<LaunchAction, String> {
         sensevoice_tokens: root.join(".tools/models/sense-voice/tokens.txt"),
         sensevoice_vad: root.join(".tools/models/sense-voice/silero_vad.onnx"),
         sensevoice_language: "auto".into(),
+        cloud_trial: false,
     };
     let mut glossary = None;
+    let mut explicit_engine = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--hidden" {
@@ -154,16 +183,25 @@ fn parse() -> Result<LaunchAction, String> {
                 }
                 return Ok(LaunchAction::Control(value));
             }
-            "--engine" => match value.as_str() {
-                "sensevoice" | "sense-voice" | "sense_voice" => {
-                    config.engine_kind = Engine::SenseVoice;
+            "--cloud-trial" => {
+                if value != "ali" {
+                    return Err("--cloud-trial must be ali".into());
                 }
-                "whisper" => config.engine_kind = Engine::Whisper,
-                _ => {
-                    config.engine = PathBuf::from(value);
-                    config.engine_kind = Engine::Whisper;
+                config.cloud_trial = true;
+            }
+            "--engine" => {
+                explicit_engine = true;
+                match value.as_str() {
+                    "sensevoice" | "sense-voice" | "sense_voice" => {
+                        config.engine_kind = Engine::SenseVoice;
+                    }
+                    "whisper" => config.engine_kind = Engine::Whisper,
+                    _ => {
+                        config.engine = PathBuf::from(value);
+                        config.engine_kind = Engine::Whisper;
+                    }
                 }
-            },
+            }
             "--sherpa-lib" => config.sherpa_lib = PathBuf::from(value),
             "--sensevoice-model" => config.sensevoice_model = PathBuf::from(value),
             "--sensevoice-tokens" => config.sensevoice_tokens = PathBuf::from(value),
@@ -191,6 +229,12 @@ fn parse() -> Result<LaunchAction, String> {
             }
             _ => return Err(format!("Unknown option: {arg}")),
         }
+    }
+    if config.cloud_trial && explicit_engine {
+        return Err(
+            "--cloud-trial cannot be combined with --engine; cloud trial has no local fallback"
+                .into(),
+        );
     }
     // Only an explicit --glossary is a process-wide override. Without one the
     // application resolves the runtime copy and the copy next to listen.exe.

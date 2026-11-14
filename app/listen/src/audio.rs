@@ -1,5 +1,6 @@
 //! WASAPI render-endpoint loopback, streamed to disk on a dedicated capture thread.
 //! No microphone/capture endpoint API is used.
+use crate::cloud::{PcmSpoolWriter, PcmStream};
 use crate::streaming::{
     CaptureProgress, Progress, SegmentConfig, SegmentStream, SegmentedAudioWriter,
 };
@@ -41,58 +42,81 @@ const ENDPOINT_ROLE: &str = "default multimedia render endpoint";
 const ROUTE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct WasapiPlayback;
+/// The explicit cloud trial uses continuous PCM, without local VAD, overlap,
+/// sentence filtering or recognition-driven deletion of earlier audio.
+pub struct WasapiPcmPlayback;
 struct WasapiRecording {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<AppResult<CapturedAudio>>>,
     segments: Option<SegmentStream>,
-    progress: Arc<Progress>,
+    pcm: Option<PcmStream>,
+    progress: Option<Arc<Progress>>,
     endpoint: CaptureEndpoint,
     last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaybackAudio for WasapiPlayback {
     fn start(&self, directory: &Path) -> AppResult<Box<dyn Recording>> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let signal = stop.clone();
+        start(directory, false)
+    }
+}
+impl PlaybackAudio for WasapiPcmPlayback {
+    fn start(&self, directory: &Path) -> AppResult<Box<dyn Recording>> {
+        start(directory, true)
+    }
+}
+fn start(directory: &Path, continuous: bool) -> AppResult<Box<dyn Recording>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    let (writer, segments, pcm, progress) = if continuous {
+        let (writer, stream) = PcmSpoolWriter::new(directory, 1024 * 1024 * 1024)?;
+        (CaptureWriter::Continuous(writer), None, Some(stream), None)
+    } else {
         let (writer, segments) = SegmentedAudioWriter::new(directory, SegmentConfig::default())?;
-        let progress = segments.progress.clone();
-        let last_error = Arc::new(Mutex::new(None));
-        let capture_error = last_error.clone();
-        let (tx, rx) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            let result = capture(writer, signal, &tx, capture_error.clone());
-            if let Err(error) = &result {
-                let _ = tx.try_send(Err(error.clone()));
-            }
-            result
-        });
-        match rx.recv().map_err(|_| {
-            "Playback capture thread stopped during device initialization".to_string()
-        })? {
-            Ok(endpoint) => Ok(Box::new(WasapiRecording {
-                stop,
-                worker: Some(worker),
-                segments: Some(segments),
-                progress,
-                endpoint,
-                last_error,
-            })),
-            Err(error) => {
-                let _ = worker.join();
-                Err(format!(
-                    "Cannot open the default multimedia render endpoint: {error}"
-                ))
-            }
+        let progress = Some(segments.progress.clone());
+        (CaptureWriter::Local(writer), Some(segments), None, progress)
+    };
+    let last_error = Arc::new(Mutex::new(None));
+    let capture_error = last_error.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let result = capture(writer, signal, &tx, capture_error.clone());
+        if let Err(error) = &result {
+            let _ = tx.try_send(Err(error.clone()));
+        }
+        result
+    });
+    match rx
+        .recv()
+        .map_err(|_| "Playback capture thread stopped during device initialization".to_string())?
+    {
+        Ok(endpoint) => Ok(Box::new(WasapiRecording {
+            stop,
+            worker: Some(worker),
+            segments,
+            pcm,
+            progress,
+            endpoint,
+            last_error,
+        })),
+        Err(error) => {
+            let _ = worker.join();
+            Err(format!(
+                "Cannot open the default multimedia render endpoint: {error}"
+            ))
         }
     }
 }
 
 impl Recording for WasapiRecording {
+    fn take_pcm_stream(&mut self) -> Option<PcmStream> {
+        self.pcm.take()
+    }
     fn take_segments(&mut self) -> Option<SegmentStream> {
         self.segments.take()
     }
     fn progress(&self) -> Option<CaptureProgress> {
-        Some(self.progress.snapshot())
+        self.progress.as_ref().map(|progress| progress.snapshot())
     }
     fn finish(mut self: Box<Self>) -> AppResult<CapturedAudio> {
         self.stop.store(true, Ordering::Release);
@@ -105,7 +129,7 @@ impl Recording for WasapiRecording {
         if let Some(error) = self.last_error.lock().ok().and_then(|error| error.clone()) {
             return Some(error);
         }
-        self.progress.failure().or_else(|| {
+        self.progress.as_ref().and_then(|progress| progress.failure()).or_else(|| {
             self.worker
                 .as_ref()
                 .filter(|worker| worker.is_finished())
@@ -227,8 +251,33 @@ fn route_changed_message(previous: &CaptureEndpoint, current: &CaptureEndpoint) 
     )
 }
 
+enum CaptureWriter {
+    Local(SegmentedAudioWriter),
+    Continuous(PcmSpoolWriter),
+}
+impl CaptureWriter {
+    fn push(&mut self, sample: i16) -> AppResult<()> {
+        match self {
+            Self::Local(writer) => writer.push(sample),
+            Self::Continuous(writer) => writer.push(sample),
+        }
+    }
+    fn flush(&mut self) -> AppResult<()> {
+        match self {
+            Self::Local(writer) => writer.flush(),
+            Self::Continuous(writer) => writer.flush(),
+        }
+    }
+    fn finish(self, description: String) -> AppResult<CapturedAudio> {
+        match self {
+            Self::Local(writer) => writer.finish(description),
+            Self::Continuous(writer) => writer.finish(description),
+        }
+    }
+}
+
 fn capture(
-    mut writer: SegmentedAudioWriter,
+    mut writer: CaptureWriter,
     stop: Arc<AtomicBool>,
     started: &mpsc::SyncSender<AppResult<CaptureEndpoint>>,
     last_error: Arc<Mutex<Option<String>>>,

@@ -5,6 +5,7 @@ param(
     # and uses that executable. Only the whisper paths are passed to listen.exe, so
     # the default launch exercises the same SenseVoice engine the product ships.
     [string]$Engine = 'sensevoice',
+    [ValidateSet('', 'ali')][string]$CloudTrial = '',
     [string]$Model = '',
     [string]$VadModel = '',
     [ValidateSet('host', 'cli')][string]$Backend = 'host',
@@ -61,6 +62,7 @@ if (-not $ToolsRoot) { $ToolsRoot = Join-Path $repositoryRoot '.tools' }
 if (-not $Runtime) { $Runtime = Join-Path $repositoryRoot '.artifacts\listen' }
 if (-not $Glossary) { $Glossary = Join-Path $projectRoot 'packaging\glossary.txt' }
 $engineKind = $Engine.Trim()
+if ($CloudTrial -and $engineKind -ine 'sensevoice') { throw '-CloudTrial ali cannot be combined with a different -Engine; cloud trial has no local fallback.' }
 $whisperPath = $false
 if ($engineKind -ieq 'whisper') {
     $whisperPath = $true
@@ -99,13 +101,14 @@ function ConvertTo-QuotedWindowsPath([string]$Path) {
     '"' + ([IO.Path]::GetFullPath($Path) -replace '(\\+)$', '$1$1') + '"'
 }
 $launchArguments = @('--runtime', (ConvertTo-QuotedWindowsPath $Runtime), '--glossary', (ConvertTo-QuotedWindowsPath $Glossary))
+if ($CloudTrial) { $launchArguments += @('--cloud-trial', 'ali') }
 if ($whisperPath) {
     $launchArguments += @('--engine', (ConvertTo-QuotedWindowsPath $whisperExecutable), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--backend', $Backend)
 }
 if ($Hidden) { $launchArguments += '--hidden' }
 $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -WindowStyle Hidden -PassThru
 Write-Output "Listen PID: $($process.Id)"
-Write-Output "Engine: $(if ($whisperPath) { $whisperExecutable } else { 'SenseVoice (default resident engine, sherpa-onnx)' })"
+Write-Output "Engine: $(if ($CloudTrial) { 'Alibaba cloud trial / qwen-audio-3.1-asr-flash-message / cn-beijing (explicit selection; budget protection applies)' } elseif ($whisperPath) { $whisperExecutable } else { 'SenseVoice (default resident engine, sherpa-onnx)' })"
 Write-Output "Current status: $(Join-Path $Runtime 'status.txt')"
 Write-Output "Glossary: $Glossary"
 Write-Output "Panel text: $(Join-Path $Runtime 'panel.txt')"
