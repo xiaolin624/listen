@@ -34,6 +34,30 @@ class EvaluationCommandTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
                               capture_output=True, encoding="utf-8")
 
+    def recording_command(self, *, corpus, output, list_only=True, recorder=None):
+        def literal(value):
+            return "'" + str(value).replace("'", "''") + "'"
+
+        arguments = f"-Corpus {literal(corpus)} -Output {literal(output)}"
+        if list_only:
+            arguments += " -ListOnly"
+        if recorder is not None:
+            arguments += f" -Recorder {literal(recorder)}"
+        # Simulate an interactive PowerShell caller whose location differs from
+        # the native cwd; invoke the public script without recording audio.
+        command = "\n".join([
+            f"Set-Location -LiteralPath {literal(REPOSITORY)}",
+            f"[Environment]::CurrentDirectory = {literal(self.root)}",
+            "try { & " + literal(REPOSITORY / "scripts/record-meeting-corpus.ps1")
+            + " " + arguments + " } catch {",
+            "[Console]::Error.WriteLine($_.Exception.Message); exit 1",
+            "}",
+        ])
+        return subprocess.run([
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", command,
+        ], capture_output=True, encoding="utf-8")
+
     def frozen_fixture(self):
         definition = REPOSITORY / "quality/cloud-meeting-corpus.json"
         samples = json.loads(definition.read_text(encoding="utf-8"))["samples"]
@@ -157,6 +181,39 @@ class EvaluationCommandTests(unittest.TestCase):
                              "text": f"温度{minus}{spacing}{spelling}度"}])
                         self.assertEqual(report["samples"][0]["edits"], expected)
                         self.assertEqual(report["samples"][0]["number_format_differences"], [])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows loopback recorder entry point")
+    def test_relative_recording_plan_uses_powershell_location(self):
+        output = self.root / "not-created"
+        process = self.recording_command(
+            corpus=".\\quality\\cloud-meeting-corpus.json", output=output)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn(f"Corpus: {REPOSITORY / 'quality/cloud-meeting-corpus.json'}",
+                      process.stdout)
+        self.assertIn("Recorded: 0 / 20", process.stdout)
+        self.assertFalse(output.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows loopback recorder entry point")
+    def test_relative_recording_output_uses_powershell_location_without_creating_it(self):
+        output = REPOSITORY / ".artifacts" / self.root.name / "not created"
+        process = self.recording_command(
+            corpus=REPOSITORY / "quality/cloud-meeting-corpus.json",
+            output=f".\\.artifacts\\{self.root.name}\\not created")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn(f"Output: {output}", process.stdout)
+        self.assertFalse(output.parent.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows loopback recorder entry point")
+    def test_relative_missing_recorder_uses_powershell_location_before_output_creation(self):
+        output = self.root / "not-created"
+        recorder = REPOSITORY / ".artifacts" / self.root.name / "missing recorder.exe"
+        process = self.recording_command(
+            corpus=REPOSITORY / "quality/cloud-meeting-corpus.json", output=output,
+            list_only=False,
+            recorder=f".\\.artifacts\\{self.root.name}\\missing recorder.exe")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(f"Recorder not found: {recorder}.", process.stderr)
+        self.assertFalse(output.exists())
 
     @unittest.skipUnless(sys.platform == "win32", "Windows loopback recorder entry point")
     def test_twenty_sample_recording_plan_can_be_inspected_without_recording(self):

@@ -87,7 +87,7 @@ function Get-WavInfo([string]$Path) {
 }
 
 $corpusPath = Join-Path $projectRoot 'quality\meeting-corpus.json'
-if ($Definition) { $corpusPath = [IO.Path]::GetFullPath($Definition) }
+if ($Definition) { $corpusPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Definition) }
 if (-not (Test-Path -LiteralPath $corpusPath -PathType Leaf)) { throw "Corpus file is missing: $corpusPath" }
 $corpus = [IO.File]::ReadAllText($corpusPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
 $samples = @($corpus.samples)
@@ -117,7 +117,7 @@ if (-not $Output) {
     if ($corpus.kind -eq 'real-meeting-evaluation') { $directory = 'cloud-meeting-corpus' }
     $Output = Join-Path (Join-Path $projectRoot '.artifacts') $directory
 }
-$Output = [IO.Path]::GetFullPath($Output)
+$Output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 $manifestPath = Join-Path $Output 'manifest.json'
 
 $recorded = @{}
@@ -178,7 +178,7 @@ function Save-Manifest($Manifest, [string]$Path) {
 }
 function Resolve-Recorder([string]$ExplicitPath) {
     if ($ExplicitPath) {
-        $resolved = [IO.Path]::GetFullPath($ExplicitPath)
+        $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExplicitPath)
         if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
             throw "Recorder not found: $resolved. Run .\scripts\build-recorder.ps1 first."
         }
