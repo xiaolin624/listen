@@ -1,11 +1,14 @@
 //! Offline workflows through the application and the real cloud-session adapter.
 //! The only substitutes are the playback device, credential store and remote socket.
+#[cfg(windows)]
+use listen::cloud::{FreeOnlyStatusSource, NativeMessageTransport};
 use listen::{
     AppResult, Application, CapturedAudio, Control, Delivery, Phase, PlaybackAudio, Recording,
     Target, TargetSelection,
     cloud::{
-        AliSettings, CloudError, CloudSessions, CredentialSource, MessageSocket, MessageTransport,
-        PcmSpoolWriter, PcmStream, Secret, TrialLedger, VerifiedBounds,
+        AliSettings, CloudError, CloudSessions, CredentialSource, FreeOnlyPolicy, MessageSocket,
+        MessageTransport, PcmSpoolWriter, PcmStream, Secret, TrialClock, TrialCostPolicy,
+        TrialLedger, VerifiedBounds,
     },
 };
 use serde_json::{Value, json};
@@ -264,6 +267,352 @@ fn cloud_capture_streams_before_stop_and_waits_for_whole_task_confirmation_befor
         result.text
     );
     assert_eq!(ledger.snapshot().unwrap().committed_nanoyuan, 517_500);
+}
+
+struct FreeOnlyRemote(Remote);
+impl MessageTransport for FreeOnlyRemote {
+    fn cost_policy(
+        &self,
+        settings: &AliSettings,
+        _: &Secret,
+    ) -> Result<TrialCostPolicy, CloudError> {
+        Ok(TrialCostPolicy::FreeOnly(FreeOnlyPolicy {
+            model: settings.model.clone(),
+            region: settings.region.clone(),
+            evidence: "controlled offline fixture: free-only protection is active; no paid network"
+                .into(),
+            verified_on: "2026-11-15".into(),
+        }))
+    }
+    fn connect(
+        &self,
+        settings: &AliSettings,
+        key: &Secret,
+    ) -> Result<Box<dyn MessageSocket>, CloudError> {
+        self.0.connect(settings, key)
+    }
+}
+
+#[test]
+fn a_verified_free_only_session_delivers_without_token_bounds_or_final_usage() {
+    let runtime = Runtime::new();
+    let playback = Arc::new(Playback::default());
+    let editor = Arc::new(Editor(Mutex::new("draft".into())));
+    let (input, incoming) = mpsc::channel();
+    let (output, outgoing) = mpsc::channel();
+    let sessions = CloudSessions::new(
+        Arc::new(Device(playback.clone())),
+        Arc::new(FreeOnlyRemote(Remote {
+            inbound: Mutex::new(Some(incoming)),
+            outbound: output,
+        })),
+        Arc::new(Key),
+        AliSettings::beijing("offline-workspace".into()),
+        TrialLedger::new(runtime.0.join("shared-ledger")),
+    );
+    let mut app =
+        Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()))
+            .with_targets(Arc::new(Selection(editor.clone())));
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    playback.speak();
+    let run = receive_text(&outgoing, "run-task");
+    let task = run["header"]["task_id"].as_str().unwrap();
+    input
+        .send(Ok(event(task, "task-started", json!({}))))
+        .unwrap();
+    input
+        .send(Ok(event(
+            task,
+            "result-generated",
+            json!({"output":{"sentence":{
+                "sentence_id":1,"text":"嗯，还不能保证。","sentence_end":true
+            }}}),
+        )))
+        .unwrap();
+    app.dispatch(Control::Stop);
+    receive_text(&outgoing, "finish-task");
+    input
+        .send(Ok(event(task, "task-finished", json!({}))))
+        .unwrap();
+    let result = wait(&mut app, Phase::Result);
+    assert_eq!(result.text, "嗯，还不能保证。");
+    assert_eq!(result.delivery, Some(Delivery::Appended));
+    assert_eq!(*editor.0.lock().unwrap(), "draft\n嗯，还不能保证。");
+}
+
+struct GatedCostCheck {
+    remote: FreeOnlyRemote,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+impl MessageTransport for GatedCostCheck {
+    fn requires_live_cost_check(&self) -> bool {
+        true
+    }
+    fn cost_policy(
+        &self,
+        settings: &AliSettings,
+        key: &Secret,
+    ) -> Result<TrialCostPolicy, CloudError> {
+        self.entered.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| CloudError::Timeout)?;
+        self.remote.cost_policy(settings, key)
+    }
+    fn connect(
+        &self,
+        settings: &AliSettings,
+        key: &Secret,
+    ) -> Result<Box<dyn MessageSocket>, CloudError> {
+        self.remote.connect(settings, key)
+    }
+}
+
+#[test]
+fn a_live_cost_check_keeps_the_beginning_and_does_not_block_start_stop_or_poll() {
+    let runtime = Runtime::new();
+    let playback = Arc::new(Playback::default());
+    let (input, incoming) = mpsc::channel();
+    let (output, outgoing) = mpsc::channel();
+    let (entered, checking) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let sessions = CloudSessions::new(
+        Arc::new(Device(playback.clone())),
+        Arc::new(GatedCostCheck {
+            remote: FreeOnlyRemote(Remote {
+                inbound: Mutex::new(Some(incoming)),
+                outbound: output,
+            }),
+            entered,
+            release: Mutex::new(gate),
+        }),
+        Arc::new(Key),
+        AliSettings::beijing("offline-workspace".into()),
+        TrialLedger::new(runtime.0.join("shared-ledger")),
+    );
+    let mut app =
+        Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()));
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    checking.recv_timeout(Duration::from_secs(5)).unwrap();
+    playback.speak();
+    app.dispatch(Control::Stop);
+    app.poll();
+    assert_eq!(app.snapshot().phase, Phase::Processing);
+    assert!(outgoing.try_recv().is_err());
+    release.send(()).unwrap();
+    let run = receive_text(&outgoing, "run-task");
+    let task = run["header"]["task_id"].as_str().unwrap();
+    input
+        .send(Ok(event(task, "task-started", json!({}))))
+        .unwrap();
+    let mut uploaded = Vec::new();
+    while uploaded.len() < 3200 {
+        if let Outbound::Audio(bytes) = outgoing.recv_timeout(Duration::from_secs(5)).unwrap() {
+            uploaded.extend(bytes);
+        }
+    }
+    assert_eq!(uploaded, vec![7, 0].repeat(1600));
+    receive_text(&outgoing, "finish-task");
+    input
+        .send(Ok(event(task, "task-finished", json!({}))))
+        .unwrap();
+    wait(&mut app, Phase::NoSpeech);
+}
+
+struct AdvancedClock(Mutex<Instant>);
+impl TrialClock for AdvancedClock {
+    fn now(&self) -> Instant {
+        *self.0.lock().unwrap()
+    }
+}
+
+#[test]
+fn the_free_only_time_allowance_closes_an_unfinished_session_and_retains_audio() {
+    let runtime = Runtime::new();
+    let playback = Arc::new(Playback::default());
+    let editor = Arc::new(Editor(Mutex::new("protected draft".into())));
+    let (input, incoming) = mpsc::channel();
+    let (output, outgoing) = mpsc::channel();
+    let clock = Arc::new(AdvancedClock(Mutex::new(Instant::now())));
+    let sessions = CloudSessions::new(
+        Arc::new(Device(playback.clone())),
+        Arc::new(FreeOnlyRemote(Remote {
+            inbound: Mutex::new(Some(incoming)),
+            outbound: output,
+        })),
+        Arc::new(Key),
+        AliSettings::beijing("offline-workspace".into()),
+        TrialLedger::new(runtime.0.join("shared-ledger")),
+    )
+    .with_clock(clock.clone());
+    let mut app =
+        Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()))
+            .with_targets(Arc::new(Selection(editor.clone())));
+    app.dispatch(Control::Start);
+    playback.speak();
+    let run = receive_text(&outgoing, "run-task");
+    let task = run["header"]["task_id"].as_str().unwrap();
+    input
+        .send(Ok(event(task, "task-started", json!({}))))
+        .unwrap();
+    input
+        .send(Ok(event(
+            task,
+            "result-generated",
+            json!({"output":{"sentence":{
+                "sentence_id":1,"text":"不能交付片段。","sentence_end":true
+            }}}),
+        )))
+        .unwrap();
+    *clock.0.lock().unwrap() += Duration::from_secs(33_615);
+    let failure = wait(&mut app, Phase::Failure);
+    assert!(failure.detail.contains("time allowance"), "{failure:?}");
+    assert!(failure.text.is_empty());
+    assert_eq!(*editor.0.lock().unwrap(), "protected draft");
+    assert!(!failure.retained_audio.is_empty());
+    assert!(failure.retained_audio.iter().all(|path| path.is_file()));
+}
+
+#[cfg(windows)]
+struct ConsoleStatus {
+    workspaces: Value,
+    quota: Value,
+}
+#[cfg(windows)]
+impl FreeOnlyStatusSource for ConsoleStatus {
+    fn checked_at(&self) -> Result<SystemTime, CloudError> {
+        Ok(UNIX_EPOCH + Duration::from_secs(1_794_672_000)) // 2026-11-15 00:00 Beijing
+    }
+    fn workspaces(&self) -> Result<Vec<u8>, CloudError> {
+        Ok(serde_json::to_vec(&self.workspaces).unwrap())
+    }
+    fn quota(&self) -> Result<Vec<u8>, CloudError> {
+        Ok(serde_json::to_vec(&self.quota).unwrap())
+    }
+}
+#[cfg(windows)]
+struct NativePolicyRemote {
+    native: NativeMessageTransport,
+    remote: Remote,
+}
+#[cfg(windows)]
+impl MessageTransport for NativePolicyRemote {
+    fn requires_live_cost_check(&self) -> bool {
+        self.native.requires_live_cost_check()
+    }
+    fn cost_policy(
+        &self,
+        settings: &AliSettings,
+        key: &Secret,
+    ) -> Result<TrialCostPolicy, CloudError> {
+        self.native.cost_policy(settings, key)
+    }
+    fn connect(
+        &self,
+        settings: &AliSettings,
+        key: &Secret,
+    ) -> Result<Box<dyn MessageSocket>, CloudError> {
+        self.remote.connect(settings, key)
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn live_model_protection_and_the_matching_unique_default_workspace_are_required_before_upload() {
+    let valid_workspaces = json!([{"workspaceId":"offline-workspace","default":true}]);
+    let valid_quota = json!({
+        "model":"qwen-audio-3.1-asr-flash-message","type":"Audio", "remaining":1000000,
+        "total":1000000,"expires":"9999-12-31","autoStop":true
+    });
+    let mut cases = vec![(valid_workspaces.clone(), valid_quota.clone(), true)];
+    for (field, value) in [
+        ("autoStop", json!(false)),
+        ("autoStop", Value::Null),
+        ("model", json!("qwen-audio-3.1-asr-flash")),
+        ("remaining", json!(0)),
+        ("remaining", json!("1000000")),
+        ("expires", json!("2020-01-01")),
+        ("expires", json!("2099-02-30")),
+        ("expires", json!("2026-11-16")),
+    ] {
+        let mut quota = valid_quota.clone();
+        quota[field] = value;
+        cases.push((valid_workspaces.clone(), quota, false));
+    }
+    let mut two_days_remaining = valid_quota.clone();
+    two_days_remaining["expires"] = json!("2026-11-17");
+    cases.push((valid_workspaces.clone(), two_days_remaining, true));
+    for workspaces in [
+        json!([{"workspaceId":"another-workspace","default":true}]),
+        json!([{"workspaceId":"offline-workspace","default":false}]),
+        json!([
+            {"workspaceId":"offline-workspace","default":true},
+            {"workspaceId":"another-workspace","default":true}
+        ]),
+        json!([
+            {"workspaceId":"offline-workspace","default":true},
+            {"workspaceId":"offline-workspace","default":false}
+        ]),
+        json!({"workspaceId":"offline-workspace","default":true}),
+    ] {
+        cases.push((workspaces, valid_quota.clone(), false));
+    }
+    for (workspaces, quota, allowed) in cases {
+        let runtime = Runtime::new();
+        let playback = Arc::new(Playback::default());
+        let (input, incoming) = mpsc::channel();
+        let (output, outgoing) = mpsc::channel();
+        let sessions = CloudSessions::new(
+            Arc::new(Device(playback)),
+            Arc::new(NativePolicyRemote {
+                native: NativeMessageTransport::with_status_source(Arc::new(ConsoleStatus {
+                    workspaces,
+                    quota,
+                })),
+                remote: Remote {
+                    inbound: Mutex::new(Some(incoming)),
+                    outbound: output,
+                },
+            }),
+            Arc::new(Key),
+            AliSettings::beijing("offline-workspace".into()),
+            TrialLedger::new(runtime.0.join("shared-ledger")),
+        );
+        let mut app = Application::with_recognition_sessions(
+            Box::new(sessions),
+            runtime.0.join("app"),
+            Ok(()),
+        );
+        app.dispatch(Control::Start);
+        assert_eq!(app.snapshot().phase, Phase::Capturing);
+        if allowed {
+            let run = receive_text(&outgoing, "run-task");
+            let task = run["header"]["task_id"].as_str().unwrap();
+            input
+                .send(Ok(event(task, "task-started", json!({}))))
+                .unwrap();
+            app.dispatch(Control::Stop);
+            receive_text(&outgoing, "finish-task");
+            input
+                .send(Ok(event(task, "task-finished", json!({}))))
+                .unwrap();
+            wait(&mut app, Phase::NoSpeech);
+        } else {
+            let failure = wait(&mut app, Phase::Failure);
+            assert!(
+                failure.detail.contains("free-only protection"),
+                "{failure:?}"
+            );
+            assert!(outgoing.try_recv().is_err());
+            assert!(!failure.retained_audio.is_empty());
+            assert!(failure.retained_audio.iter().all(|path| path.is_file()));
+        }
+    }
 }
 
 struct Scenario {
@@ -572,7 +921,7 @@ fn missing_credentials_and_unknown_cost_bounds_refuse_before_capture_or_network(
     #[cfg(windows)]
     {
         assert!(
-            listen::cloud::NativeMessageTransport
+            listen::cloud::NativeMessageTransport::default()
                 .verified_bounds(&AliSettings::beijing("offline-workspace".into()))
                 .is_none(),
             "configuring a real key cannot unlock the unproved production policy"
@@ -712,6 +1061,89 @@ fn account_errors_are_actionable_and_remote_credentials_or_audio_echoes_are_neve
 }
 
 struct ReserveOnly;
+
+#[test]
+fn a_persisted_attempt_must_keep_exactly_one_consistent_cost_policy() {
+    // Independent version-1 legacy fixture: no free_only field existed then.
+    let legacy = json!({
+        "task_id":"previous-attempt","segment_id":"old-capture","provider":"alibaba-model-studio",
+        "model":"qwen-audio-3.1-asr-flash-message","region":"cn-beijing",
+        "reserved_nanoyuan":6000,"estimated_nanoyuan":null,"billed_nanoyuan":null,
+        "usage":{"input_tokens":null,"output_tokens":null,"total_tokens":null,"duration":null},
+        "reported_final_usage":null,"final_usage":false,"unknown_reason":"Unresolved prior attempt",
+        "bounds":{"max_input_tokens":1,"max_output_tokens":0,"max_pcm_bytes":32000,
+            "evidence":"Previously verified fixture","verified_on":"2026-11-14"},
+        "price_source":"previous policy","price_verified_on":"2026-11-14"
+    });
+    let protection = json!({"model":"qwen-audio-3.1-asr-flash-message","region":"cn-beijing",
+        "evidence":"Previously checked fixture","verified_on":"2026-11-15"});
+    let mut free_only = legacy.clone();
+    free_only.as_object_mut().unwrap().remove("bounds");
+    free_only["free_only"] = protection.clone();
+    free_only["reserved_nanoyuan"] = json!(0);
+    free_only["estimated_nanoyuan"] = json!(0);
+    let mut missing = free_only.clone();
+    missing.as_object_mut().unwrap().remove("free_only");
+    let mut both = legacy.clone();
+    both["free_only"] = protection;
+    let mut cases = vec![
+        (legacy.clone(), true),
+        (free_only.clone(), true),
+        (missing, false),
+        (both, false),
+    ];
+    for (fixture, field, value) in [
+        (&legacy, "reserved_nanoyuan", json!(0)),
+        (&legacy, "reserved_nanoyuan", json!(5999)),
+        (&free_only, "reserved_nanoyuan", json!(1)),
+        (&free_only, "estimated_nanoyuan", json!(1)),
+        (&free_only, "billed_nanoyuan", json!(1)),
+    ] {
+        let mut invalid = fixture.clone();
+        invalid[field] = value;
+        cases.push((invalid, false));
+    }
+    for (field, value) in [
+        ("model", json!("another-model")),
+        ("region", json!("another-region")),
+        ("evidence", json!("")),
+    ] {
+        let mut invalid = free_only.clone();
+        invalid["free_only"][field] = value;
+        cases.push((invalid, false));
+    }
+    for (attempt, allowed) in cases {
+        let mut scenario = Scenario::new();
+        fs::create_dir_all(scenario.runtime.0.join("shared-ledger")).unwrap();
+        fs::write(
+            scenario.runtime.0.join("shared-ledger/ledger.json"),
+            serde_json::to_vec(&json!({
+                "version":1,"cap_nanoyuan":50000000000u64,"frozen":false,"attempts":[attempt]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        scenario.app.dispatch(Control::Start);
+        if allowed {
+            let run = receive_text(&scenario.outgoing, "run-task");
+            let task = run["header"]["task_id"].as_str().unwrap();
+            scenario.send(task, "task-started", json!({}));
+            scenario.stop();
+            scenario.send(task, "task-finished", json!({}));
+            wait(&mut scenario.app, Phase::NoSpeech);
+        } else {
+            let failure = scenario.app.snapshot();
+            assert_eq!(failure.phase, Phase::Failure);
+            assert!(
+                failure.detail.contains("shared trial cost ledger"),
+                "{failure:?}"
+            );
+            assert!(scenario.outgoing.try_recv().is_err());
+        }
+        assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    }
+}
+
 impl MessageTransport for ReserveOnly {
     fn verified_bounds(&self, _: &AliSettings) -> Option<VerifiedBounds> {
         Some(VerifiedBounds {

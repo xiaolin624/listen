@@ -6,6 +6,8 @@ use capture::CaptureControl;
 #[cfg(windows)]
 mod credentials;
 #[cfg(windows)]
+mod free_only;
+#[cfg(windows)]
 mod transport;
 use crate::{
     AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, elapsed_ms,
@@ -18,6 +20,8 @@ pub(crate) use budget::atomic_write as persist_result;
 pub use budget::{Attempt, LedgerSnapshot, TrialLedger, Usage};
 #[cfg(windows)]
 pub use credentials::{CREDENTIAL_TARGET, LocalCredentials, local_settings};
+#[cfg(windows)]
+pub use free_only::FreeOnlyStatusSource;
 pub use pcm::{PcmSpoolWriter, PcmStream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,11 +123,69 @@ pub struct VerifiedBounds {
     pub evidence: String,
     pub verified_on: String,
 }
+/// Supplied only by an adapter which has checked active, model-scoped free-only
+/// protection for the credential used by this task. Never loaded from trial JSON.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreeOnlyPolicy {
+    pub model: String,
+    pub region: String,
+    pub evidence: String,
+    pub verified_on: String,
+}
+#[derive(Clone, Debug)]
+pub enum TrialCostPolicy {
+    TokenBounds(VerifiedBounds),
+    FreeOnly(FreeOnlyPolicy),
+}
+impl TrialCostPolicy {
+    fn max_pcm_bytes(&self) -> u64 {
+        match self {
+            Self::TokenBounds(bounds) => bounds.max_pcm_bytes,
+            // This is the existing local retention allowance, not a Token or
+            // billing bound. The free-only guarantee supplies the cash limit.
+            Self::FreeOnly(_) => 1024 * 1024 * 1024,
+        }
+    }
+    fn max_duration(&self) -> Option<Duration> {
+        match self {
+            Self::TokenBounds(_) => None,
+            // 1 GiB / (16 kHz * 16-bit mono) plus bounded finalization. This
+            // operational deadline also covers idle or slow upload sessions.
+            Self::FreeOnly(_) => Some(Duration::from_secs(1024 * 1024 * 1024 / 32_000 + 60)),
+        }
+    }
+}
+/// Monotonic time is an external dependency; controlled application workflows
+/// can advance it without waiting through a real multi-hour capture.
+pub trait TrialClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+struct SystemClock;
+impl TrialClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
 /// Only a maintained, independently verified contract may supply bounds. This is
 /// not loaded from user JSON/environment. Native Message currently returns None.
 pub trait MessageTransport: Send + Sync {
+    /// Allows local PCM retention while the worker checks the live policy. It
+    /// never authorizes connect; `cost_policy` must still succeed before that.
+    fn requires_live_cost_check(&self) -> bool {
+        false
+    }
     fn verified_bounds(&self, _settings: &AliSettings) -> Option<VerifiedBounds> {
         None
+    }
+    fn cost_policy(
+        &self,
+        settings: &AliSettings,
+        _key: &Secret,
+    ) -> Result<TrialCostPolicy, CloudError> {
+        self.verified_bounds(settings)
+            .map(TrialCostPolicy::TokenBounds)
+            .ok_or(CloudError::BudgetUnknown)
     }
     fn connect(
         &self,
@@ -134,7 +196,7 @@ pub trait MessageTransport: Send + Sync {
 pub trait MessageSocket: Send {
     fn send_text(&mut self, text: &str) -> Result<(), CloudError>;
     fn send_audio(&mut self, pcm: &[u8]) -> Result<(), CloudError>;
-    /// Non-blocking; implementations own one bounded receive channel.
+    /// Non-blocking; implementations own bounded receive storage.
     fn poll(&mut self) -> Result<Option<String>, CloudError>;
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +205,7 @@ pub enum CloudError {
     Credential,
     Configuration,
     BudgetUnknown,
+    ProtectionUnavailable,
     BudgetExhausted,
     Ledger,
     LedgerBusy,
@@ -164,12 +227,13 @@ impl fmt::Display for CloudError {
             Self::Credential => "The local cloud credential could not be read or has an invalid format; configure it again locally",
             Self::Configuration => "Cloud trial requires a valid Alibaba workspace, cn-beijing region and qwen-audio-3.1-asr-flash-message model; check the local configuration",
             Self::BudgetUnknown => "The maximum charge for this cloud trial cannot yet be confirmed. No audio was sent. Use local recognition for now; see the local cloud-trial configuration guide for the remaining requirements",
+            Self::ProtectionUnavailable => "The Alibaba trial's free-only protection could not be verified for the selected default workspace and model. No audio was sent. Check the existing CLI login, quota protection and expiry locally; received audio is retained",
             Self::BudgetExhausted => "The shared CNY 50 trial budget has insufficient uncommitted funds; no new cloud task was sent",
             Self::Ledger => "The shared trial cost ledger cannot be read or safely persisted. No new paid request is allowed; preserve the ledger and check local storage",
             Self::LedgerBusy => "The shared trial cost ledger is in use by another process; no new cloud request was allowed",
             Self::UsageMismatch => "Provider usage exceeded or contradicted the verified reservation. New paid trials are blocked pending billing review",
             Self::Network => "The Alibaba cloud connection failed or closed without whole-task confirmation; received audio is retained and no local fallback was substituted",
-            Self::Timeout => "The Alibaba cloud task did not acknowledge start or final completion within the bounded wait; received audio is retained",
+            Self::Timeout => "The Alibaba cloud connection or task did not respond within the bounded wait; received audio is retained and unconfirmed text was not delivered",
             Self::Protocol => "The Alibaba response did not satisfy the whole-task protocol; received audio is retained and unconfirmed text was not delivered",
             Self::Unauthorized => "Alibaba rejected authentication or workspace access (401/403). Check the Beijing API key, account and workspace permissions locally",
             Self::ModelUnavailable => "The selected Alibaba ASR model is unavailable or not enabled for this account/workspace; no alternate model was selected",
@@ -188,13 +252,14 @@ pub struct CloudSessions {
     key: Result<Arc<Secret>, CloudError>,
     settings: AliSettings,
     ledger: TrialLedger,
+    clock: Arc<dyn TrialClock>,
 }
 impl CloudSessions {
     #[cfg(windows)]
     pub fn from_local(audio: Arc<dyn PlaybackAudio>) -> AppResult<Self> {
         Ok(Self::new(
             audio,
-            Arc::new(NativeMessageTransport),
+            Arc::new(NativeMessageTransport::default()),
             Arc::new(LocalCredentials),
             local_settings().map_err(|e| e.to_string())?,
             TrialLedger::shared_local().map_err(|e| e.to_string())?,
@@ -213,14 +278,21 @@ impl CloudSessions {
             key: credentials.load().map(Arc::new),
             settings,
             ledger,
+            clock: Arc::new(SystemClock),
         }
     }
-    fn available(&self) -> Result<VerifiedBounds, CloudError> {
+    pub fn with_clock(mut self, clock: Arc<dyn TrialClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+    fn available(&self) -> Result<Option<TrialCostPolicy>, CloudError> {
         self.settings.validate()?;
-        self.key.as_ref().map_err(Clone::clone)?;
-        self.transport
-            .verified_bounds(&self.settings)
-            .ok_or(CloudError::BudgetUnknown)
+        let key = self.key.as_ref().map_err(Clone::clone)?;
+        if self.transport.requires_live_cost_check() {
+            Ok(None)
+        } else {
+            self.transport.cost_policy(&self.settings, key).map(Some)
+        }
     }
 }
 impl RecognitionSessions for CloudSessions {
@@ -241,7 +313,7 @@ impl RecognitionSessions for CloudSessions {
         }
     }
     fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        let bounds = self.available().map_err(|e| e.to_string())?;
+        let policy = self.available().map_err(|e| e.to_string())?;
         let mut vocabulary = serde_json::Map::new();
         for term in request.glossary.canonical_terms() {
             if vocabulary.len() >= 2000
@@ -257,10 +329,13 @@ impl RecognitionSessions for CloudSessions {
             .directory
             .file_name()
             .and_then(|v| v.to_str())
-            .ok_or("Invalid capture directory")?;
-        self.ledger
-            .reserve(&task, segment, &self.settings, bounds.clone())
-            .map_err(|e| e.to_string())?;
+            .ok_or("Invalid capture directory")?
+            .to_owned();
+        if let Some(policy) = &policy {
+            self.ledger
+                .reserve(&task, &segment, &self.settings, policy.clone())
+                .map_err(|e| e.to_string())?;
+        }
         fs::create_dir(&request.directory).map_err(|e| e.to_string())?;
         let mut recording = self.audio.start(&request.directory)?;
         let stream = recording.take_pcm_stream().ok_or("Cloud trial requires continuous retained PCM; local overlapping windows are not a cloud stream")?;
@@ -274,10 +349,11 @@ impl RecognitionSessions for CloudSessions {
         let settings = self.settings.clone();
         let key = self.key.as_ref().map_err(|e| e.to_string())?.clone();
         let ledger = self.ledger.clone();
+        let clock = self.clock.clone();
         let id = request.id;
         let (tx, result) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let update = match run(capture_worker, stream, stable_signal, transport, &settings, &key, &task, bounds.max_pcm_bytes, &ledger, vocabulary) {
+            let update = match run(capture_worker, stream, stable_signal, transport, &settings, &key, &task, &segment, policy, &ledger, clock, vocabulary) {
                 Ok(result) => SessionUpdate::Finished(result),
                 Err(error) => SessionUpdate::Failed(SessionFailure { error, retry_audio: None, retry_scope: Some("Received continuous PCM is retained. Automatic network/restart recovery belongs to the later recovery task; no local result was substituted.".into()), timing: Timing::default() }),
             };
@@ -375,16 +451,43 @@ fn run(
     settings: &AliSettings,
     key: &Secret,
     task: &str,
-    max_pcm_bytes: u64,
+    segment: &str,
+    policy: Option<TrialCostPolicy>,
     ledger: &TrialLedger,
+    clock: Arc<dyn TrialClock>,
     vocabulary: serde_json::Map<String, Value>,
 ) -> AppResult<SessionResult> {
     let started_at = Instant::now();
     let mut description = String::new();
     let result = (|| -> AppResult<SessionResult> {
+        let policy = match policy {
+            Some(policy) => policy,
+            None => {
+                let policy = transport
+                    .cost_policy(settings, key)
+                    .map_err(|e| e.to_string())?;
+                ledger
+                    .reserve(task, segment, settings, policy.clone())
+                    .map_err(|e| e.to_string())?;
+                policy
+            }
+        };
+        let max_pcm_bytes = policy.max_pcm_bytes();
+        let session_started = clock.now();
+        let within_time = || {
+            if policy.max_duration().is_some_and(|limit| {
+                clock.now().saturating_duration_since(session_started) >= limit
+            }) {
+                Err("Cloud trial time allowance reached. Received audio is retained; unconfirmed text was not delivered".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let connecting_at = Instant::now();
         let mut socket = transport
             .connect(settings, key)
             .map_err(|e| e.to_string())?;
+        within_time()?;
         socket.send_text(&json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":settings.model,"parameters":{"format":"pcm","sample_rate":16000,"disfluency_removal_enabled":false,"intermediate_result_enabled":false,"keep_dialect":true,"heartbeat":true,"vocabulary":vocabulary},"input":{}}}).to_string()).map_err(|e| e.to_string())?;
         let mut ready = false;
         let mut finish_sent = None;
@@ -392,6 +495,7 @@ fn run(
         let mut sentences = BTreeMap::<u64, String>::new();
         let mut pending = BTreeSet::new();
         loop {
+            within_time()?;
             if capture.failure().is_some() {
                 capture.stop();
             }
@@ -491,15 +595,17 @@ fn run(
                     if sent.saturating_add(pcm.len() as u64) > max_pcm_bytes {
                         return Err("Verified upload allowance reached; no unreserved PCM was sent, received audio is retained".into());
                     }
+                    within_time()?;
                     socket.send_audio(&pcm).map_err(|e| e.to_string())?;
                     sent += pcm.len() as u64;
                 }
                 if stream.drained() && captured.is_some() && finish_sent.is_none() {
+                    within_time()?;
                     socket.send_text(&json!({"header":{"action":"finish-task","task_id":task,"streaming":"duplex"},"payload":{"input":{}}}).to_string()).map_err(|e| e.to_string())?;
                     finish_sent = Some(Instant::now());
                 }
             }
-            if (!ready && started_at.elapsed() > Duration::from_secs(15))
+            if (!ready && connecting_at.elapsed() > Duration::from_secs(15))
                 || (finish_sent.is_none()
                     && capture
                         .stopped_at()
