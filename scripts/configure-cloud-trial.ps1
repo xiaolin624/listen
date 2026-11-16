@@ -136,7 +136,7 @@ if ($ShowStatus) {
             Write-Output ('Shared two-provider trial commitment: CNY {0:F9} / 50; frozen={1}' -f ($committed / 1000000000), $ledger.frozen)
         } catch { throw 'The shared ledger is unreadable or invalid; preserve it. The application will refuse new paid tasks.' }
     } else { Write-Output 'Shared two-provider trial ledger: no task reserved yet (cap CNY 50).' }
-    Write-Output 'Production requests remain blocked: Message has no verified per-task input/output token upper bounds. No key or console budget setting bypasses this protection.'
+    Write-Output 'On each explicit trial start, Listen checks the existing CLI default workspace and exact-model free-only protection before any model task. Unknown protection refuses upload and retains received audio; configuration alone does not grant admission.'
     return
 }
 
@@ -156,4 +156,4 @@ try {
     else { [IO.File]::Move($temporary, $configuration) }
 } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
 Write-Output 'Alibaba trial configured in Windows Credential Manager for the current user. Restart Listen to use it.'
-Write-Output 'Production calls remain blocked until a defensible Message cost bound is verified; the default local engine is unchanged.'
+Write-Output 'Each explicit trial requires live default-workspace, exact-model quota and free-only checks; the default local engine is unchanged.'

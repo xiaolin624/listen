@@ -1,6 +1,6 @@
 //! One ledger for the entire two-provider trial, independently of runtime paths.
-//! No free quota assumption, billing alarm or audio/token heuristic grants credit.
-use super::{AliSettings, CloudError, VerifiedBounds};
+//! Only verified Token bounds or checked free-only protection admit a task.
+use super::{AliSettings, CloudError, FreeOnlyPolicy, TrialCostPolicy, VerifiedBounds};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -39,7 +39,10 @@ pub struct Attempt {
     pub reported_final_usage: Option<Usage>,
     pub final_usage: bool,
     pub unknown_reason: Option<String>,
-    pub bounds: VerifiedBounds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<VerifiedBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_only: Option<FreeOnlyPolicy>,
     pub price_source: String,
     pub price_verified_on: String,
 }
@@ -120,6 +123,7 @@ impl TrialLedger {
                 if data.version != 1
                     || data.cap_nanoyuan != TRIAL_CAP_NANOYUAN
                     || data.attempts.len() > 10_000
+                    || data.attempts.iter().any(|attempt| !valid_policy(attempt))
                 {
                     return Err(CloudError::Ledger);
                 }
@@ -148,17 +152,37 @@ impl TrialLedger {
         task_id: &str,
         segment_id: &str,
         settings: &AliSettings,
-        bounds: VerifiedBounds,
+        policy: TrialCostPolicy,
     ) -> Result<(), CloudError> {
-        let amount = price(bounds.max_input_tokens, bounds.max_output_tokens)?;
-        if amount == 0
-            || bounds.max_pcm_bytes == 0
-            || bounds.max_pcm_bytes % 2 != 0
-            || bounds.evidence.trim().is_empty()
-            || bounds.verified_on.trim().is_empty()
-        {
-            return Err(CloudError::BudgetUnknown);
-        }
+        let (amount, bounds, free_only, price_source, price_verified_on) = match policy {
+            TrialCostPolicy::TokenBounds(bounds) => {
+                let amount = price(bounds.max_input_tokens, bounds.max_output_tokens)?;
+                if amount == 0
+                    || bounds.max_pcm_bytes == 0
+                    || bounds.max_pcm_bytes % 2 != 0
+                    || bounds.evidence.trim().is_empty()
+                    || bounds.verified_on.trim().is_empty()
+                {
+                    return Err(CloudError::BudgetUnknown);
+                }
+                (amount, Some(bounds), None,
+                 "https://help.aliyun.com/zh/model-studio/model-pricing (input CNY 6 / million tokens; output CNY 4.5 / million tokens)".to_owned(),
+                 "2026-11-14".to_owned())
+            }
+            TrialCostPolicy::FreeOnly(protection) => {
+                if protection.model != settings.model
+                    || protection.region != settings.region
+                    || protection.evidence.trim().is_empty()
+                    || protection.verified_on.trim().is_empty()
+                {
+                    return Err(CloudError::BudgetUnknown);
+                }
+                let verified_on = protection.verified_on.clone();
+                (0, None, Some(protection),
+                 "https://help.aliyun.com/zh/model-studio/new-free-quota/ (active model-scoped free-only protection)".to_owned(),
+                 verified_on)
+            }
+        };
         let _lock = self.lock()?;
         let mut data = self.read()?;
         if data.frozen {
@@ -174,11 +198,29 @@ impl TrialLedger {
         if data.attempts.iter().any(|a| a.task_id == task_id) {
             return Err(CloudError::Ledger);
         }
+        let estimated_nanoyuan = free_only.as_ref().map(|_| 0);
+        let unknown_reason = if free_only.is_some() {
+            "Provider usage and the actual billed charge have not been verified; active free-only protection limits additional cash charges to zero"
+        } else {
+            "Final cumulative provider usage has not been confirmed; the full reservation remains committed"
+        };
         data.attempts.push(Attempt {
-            task_id: task_id.into(), segment_id: segment_id.into(), provider: "alibaba-model-studio".into(), model: settings.model.clone(), region: settings.region.clone(),
-            reserved_nanoyuan: amount, estimated_nanoyuan: None, billed_nanoyuan: None, usage: Usage::default(), reported_final_usage: None, final_usage: false,
-            unknown_reason: Some("Final cumulative provider usage has not been confirmed; the full reservation remains committed".into()), bounds,
-            price_source: "https://help.aliyun.com/zh/model-studio/model-pricing (input CNY 6 / million tokens; output CNY 4.5 / million tokens)".into(), price_verified_on: "2026-11-14".into(),
+            task_id: task_id.into(),
+            segment_id: segment_id.into(),
+            provider: "alibaba-model-studio".into(),
+            model: settings.model.clone(),
+            region: settings.region.clone(),
+            reserved_nanoyuan: amount,
+            estimated_nanoyuan,
+            billed_nanoyuan: None,
+            usage: Usage::default(),
+            reported_final_usage: None,
+            final_usage: false,
+            unknown_reason: Some(unknown_reason.into()),
+            bounds,
+            free_only,
+            price_source,
+            price_verified_on,
         });
         self.write(&data)
     }
@@ -200,14 +242,20 @@ impl TrialLedger {
             .input_tokens
             .zip(usage.output_tokens)
             .zip(usage.total_tokens);
-        let mismatch = usage
-            .input_tokens
-            .is_some_and(|v| v > attempt.bounds.max_input_tokens)
-            || usage
-                .output_tokens
-                .is_some_and(|v| v > attempt.bounds.max_output_tokens)
-            || complete
-                .is_some_and(|((input, output), total)| input.checked_add(output) != Some(total))
+        let within_bounds = |input, output| {
+            attempt.bounds.as_ref().is_none_or(|bounds| {
+                input <= bounds.max_input_tokens && output <= bounds.max_output_tokens
+            })
+        };
+        let mismatch = attempt.bounds.as_ref().is_some_and(|bounds| {
+            usage
+                .input_tokens
+                .is_some_and(|v| v > bounds.max_input_tokens)
+                || usage
+                    .output_tokens
+                    .is_some_and(|v| v > bounds.max_output_tokens)
+        }) || complete
+            .is_some_and(|((input, output), total)| input.checked_add(output) != Some(total))
             || (final_usage
                 && complete.is_some_and(|((input, output), total)| {
                     previous.input_tokens.is_some_and(|v| input < v)
@@ -227,15 +275,20 @@ impl TrialLedger {
                 (usage.input_tokens, usage.output_tokens, usage.total_tokens)
             {
                 if input.checked_add(output) == Some(total)
-                    && input <= attempt.bounds.max_input_tokens
-                    && output <= attempt.bounds.max_output_tokens
+                    && within_bounds(input, output)
                     && previous.input_tokens.is_none_or(|v| input >= v)
                     && previous.output_tokens.is_none_or(|v| output >= v)
                     && previous.total_tokens.is_none_or(|v| total >= v)
                 {
-                    attempt.estimated_nanoyuan = Some(price(input, output)?);
+                    attempt.estimated_nanoyuan = Some(if attempt.free_only.is_some() {
+                        0
+                    } else {
+                        price(input, output)?
+                    });
                     attempt.final_usage = true;
-                    attempt.unknown_reason = None;
+                    attempt.unknown_reason = attempt.free_only.as_ref().map(|_| {
+                        "Actual billed charge has not been verified; active free-only protection limits additional cash charges to zero".into()
+                    });
                 }
             }
         }
@@ -251,6 +304,29 @@ impl TrialLedger {
         } else {
             Ok(())
         }
+    }
+}
+fn valid_policy(attempt: &Attempt) -> bool {
+    match (&attempt.bounds, &attempt.free_only) {
+        // Version 1 TokenBounds records predate the optional free_only field.
+        (Some(bounds), None) => {
+            bounds.max_pcm_bytes > 0
+                && bounds.max_pcm_bytes % 2 == 0
+                && !bounds.evidence.trim().is_empty()
+                && !bounds.verified_on.trim().is_empty()
+                && price(bounds.max_input_tokens, bounds.max_output_tokens)
+                    .is_ok_and(|amount| amount > 0 && amount == attempt.reserved_nanoyuan)
+        }
+        (None, Some(protection)) => {
+            protection.model == attempt.model
+                && protection.region == attempt.region
+                && !protection.evidence.trim().is_empty()
+                && !protection.verified_on.trim().is_empty()
+                && attempt.reserved_nanoyuan == 0
+                && attempt.estimated_nanoyuan.is_none_or(|amount| amount == 0)
+                && attempt.billed_nanoyuan.is_none_or(|amount| amount == 0)
+        }
+        _ => false,
     }
 }
 fn maximum(a: Option<u64>, b: Option<u64>) -> Option<u64> {
