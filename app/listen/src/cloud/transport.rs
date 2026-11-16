@@ -70,14 +70,12 @@ impl MessageTransport for NativeMessageTransport {
 pub(super) struct Limits {
     pub handshake: Duration,
     pub send: Duration,
-    pub receive: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             handshake: Duration::from_secs(15),
             send: Duration::from_secs(5),
-            receive: Duration::from_secs(15),
         }
     }
 }
@@ -179,7 +177,7 @@ pub(super) fn connect(
         socket,
         _connection: connection,
         _session: session,
-        receiving: None,
+        receiving: false,
         message: Utf8Message::default(),
         limits,
     })
@@ -355,7 +353,7 @@ pub(super) struct Socket {
     socket: AsyncHandle,
     _connection: Handle,
     _session: Handle,
-    receiving: Option<Instant>,
+    receiving: bool,
     message: Utf8Message,
     limits: Limits,
 }
@@ -417,15 +415,15 @@ impl Socket {
         if context.failed.load(Ordering::Acquire) {
             return Err(CloudError::Network);
         }
-        if let Some(started) = self.receiving {
+        if self.receiving {
             if !context.read.load(Ordering::Acquire) {
-                return if started.elapsed() >= self.limits.receive {
-                    Err(CloudError::Timeout)
-                } else {
-                    Ok(None)
-                };
+                // With intermediate results disabled, a healthy long sentence
+                // may have no application frames while audio keeps uploading.
+                // The application bounds start/final confirmation and the
+                // whole task; polling pending I/O itself never waits.
+                return Ok(None);
             }
-            self.receiving = None;
+            self.receiving = false;
             let bytes = context.read_bytes.load(Ordering::Relaxed) as usize;
             let kind = WINHTTP_WEB_SOCKET_BUFFER_TYPE(context.read_kind.load(Ordering::Relaxed));
             let buffers = context.buffers.lock().map_err(|_| CloudError::Network)?;
@@ -454,7 +452,7 @@ impl Socket {
             )
         };
         context.read.store(false, Ordering::Release);
-        self.receiving = Some(Instant::now());
+        self.receiving = true;
         if unsafe { WinHttpWebSocketReceive(handle, pointer.cast(), 16 * 1024, count, kind) } != 0 {
             return Err(CloudError::Network);
         }

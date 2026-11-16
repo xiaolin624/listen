@@ -156,27 +156,13 @@ impl TrialLedger {
     ) -> Result<(), CloudError> {
         let (amount, bounds, free_only, price_source, price_verified_on) = match policy {
             TrialCostPolicy::TokenBounds(bounds) => {
-                let amount = price(bounds.max_input_tokens, bounds.max_output_tokens)?;
-                if amount == 0
-                    || bounds.max_pcm_bytes == 0
-                    || bounds.max_pcm_bytes % 2 != 0
-                    || bounds.evidence.trim().is_empty()
-                    || bounds.verified_on.trim().is_empty()
-                {
-                    return Err(CloudError::BudgetUnknown);
-                }
+                let amount = token_reservation(&bounds)?;
                 (amount, Some(bounds), None,
                  "https://help.aliyun.com/zh/model-studio/model-pricing (input CNY 6 / million tokens; output CNY 4.5 / million tokens)".to_owned(),
                  "2026-11-14".to_owned())
             }
             TrialCostPolicy::FreeOnly(protection) => {
-                if protection.model != settings.model
-                    || protection.region != settings.region
-                    || protection.evidence.trim().is_empty()
-                    || protection.verified_on.trim().is_empty()
-                {
-                    return Err(CloudError::BudgetUnknown);
-                }
+                validate_free_only(&protection, &settings.model, &settings.region)?;
                 let verified_on = protection.verified_on.clone();
                 (0, None, Some(protection),
                  "https://help.aliyun.com/zh/model-studio/new-free-quota/ (active model-scoped free-only protection)".to_owned(),
@@ -306,22 +292,40 @@ impl TrialLedger {
         }
     }
 }
+fn token_reservation(bounds: &VerifiedBounds) -> Result<u64, CloudError> {
+    let amount = price(bounds.max_input_tokens, bounds.max_output_tokens)?;
+    if amount == 0
+        || bounds.max_pcm_bytes == 0
+        || bounds.max_pcm_bytes % 2 != 0
+        || bounds.evidence.trim().is_empty()
+        || bounds.verified_on.trim().is_empty()
+    {
+        return Err(CloudError::BudgetUnknown);
+    }
+    Ok(amount)
+}
+fn validate_free_only(
+    protection: &FreeOnlyPolicy,
+    model: &str,
+    region: &str,
+) -> Result<(), CloudError> {
+    if protection.model != model
+        || protection.region != region
+        || protection.evidence.trim().is_empty()
+        || protection.verified_on.trim().is_empty()
+    {
+        return Err(CloudError::BudgetUnknown);
+    }
+    Ok(())
+}
 fn valid_policy(attempt: &Attempt) -> bool {
     match (&attempt.bounds, &attempt.free_only) {
         // Version 1 TokenBounds records predate the optional free_only field.
         (Some(bounds), None) => {
-            bounds.max_pcm_bytes > 0
-                && bounds.max_pcm_bytes % 2 == 0
-                && !bounds.evidence.trim().is_empty()
-                && !bounds.verified_on.trim().is_empty()
-                && price(bounds.max_input_tokens, bounds.max_output_tokens)
-                    .is_ok_and(|amount| amount > 0 && amount == attempt.reserved_nanoyuan)
+            token_reservation(bounds).is_ok_and(|amount| amount == attempt.reserved_nanoyuan)
         }
         (None, Some(protection)) => {
-            protection.model == attempt.model
-                && protection.region == attempt.region
-                && !protection.evidence.trim().is_empty()
-                && !protection.verified_on.trim().is_empty()
+            validate_free_only(protection, &attempt.model, &attempt.region).is_ok()
                 && attempt.reserved_nanoyuan == 0
                 && attempt.estimated_nanoyuan.is_none_or(|amount| amount == 0)
                 && attempt.billed_nanoyuan.is_none_or(|amount| amount == 0)
