@@ -108,6 +108,7 @@ mod tests {
             refine: listen::Refine::Unavailable("not connected in this test".into()),
             refined_text: None,
             notice: None,
+            usage: None,
         }
     }
 

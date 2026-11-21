@@ -18,6 +18,8 @@ pub mod recognition;
 #[cfg(windows)]
 pub mod sensevoice;
 pub mod streaming;
+pub mod usage;
+pub use usage::UsageSummary;
 #[cfg(windows)]
 pub mod target;
 #[cfg(windows)]
@@ -276,6 +278,10 @@ pub enum Notice {
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed, so the resident
     /// status capsule is visible to screen sharing and recordings.
     CaptureExcluded(String),
+    /// This month's own cloud-recognition cost reached the CNY 100 reminder line.
+    /// It is a reminder only: nothing was stopped, cancelled, purchased or raised,
+    /// and the capture flow is unaffected.
+    UsageReminder,
 }
 
 impl Notice {
@@ -289,6 +295,7 @@ impl Notice {
             Notice::CaptureExcluded(reason) => format!(
                 "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
             ),
+            Notice::UsageReminder => "本月云端识别费用估计已达每月 100 元提醒线。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
         }
     }
 }
@@ -327,6 +334,11 @@ pub struct Snapshot {
     /// capsule that cannot be hidden from screen capture). `None` when there is
     /// nothing to report.
     pub notice: Option<Notice>,
+    /// Cumulative usage and cost of this tool's own cloud recognition requests,
+    /// read from the durable trial ledger. Confirmed, conservatively estimated and
+    /// unknown parts stay separate. `None` when the recognition adapter keeps no
+    /// such ledger (the local engine).
+    pub usage: Option<UsageSummary>,
 }
 
 impl Snapshot {
@@ -721,6 +733,10 @@ pub struct Application {
     refine_port: Option<Arc<dyn RefineText>>,
     refine_job: Option<mpsc::Receiver<RefineOutcome>>,
     delivery_memory: Option<DeliveryMemory>,
+    /// Whether this process already raised [`Notice::UsageReminder`] for the
+    /// current month, so one reached line is announced once instead of on every
+    /// ledger refresh. Reset when the month figure falls back under the line.
+    usage_reminder_announced: bool,
 }
 
 impl Application {
@@ -767,7 +783,7 @@ impl Application {
         };
         let glossary_paths =
             glossary::default_paths(&runtime, std::env::current_exe().ok().as_deref());
-        Self {
+        let mut application = Self {
             snapshot: Snapshot {
                 phase,
                 preparation,
@@ -787,6 +803,7 @@ impl Application {
                 refine: Refine::Unavailable(NO_REFINE_PORT.into()),
                 refined_text: None,
                 notice: None,
+                usage: None,
             },
             sessions,
             runtime,
@@ -803,7 +820,13 @@ impl Application {
             refine_port: None,
             refine_job: None,
             delivery_memory: None,
-        }
+            usage_reminder_announced: false,
+        };
+        // The durable ledger already exists before the first capture, so the cost
+        // this tool has accumulated is readable immediately and after a restart.
+        // This is also the one safe place to raise an already-reached reminder.
+        application.refresh_usage();
+        application
     }
 
     fn is_capturing(&self) -> bool {
@@ -823,6 +846,49 @@ impl Application {
     fn next_id(&mut self) -> SessionId {
         self.next_session_id += 1;
         SessionId(self.next_session_id)
+    }
+
+    /// Re-read the durable cost summary. It is deliberately **not** called while a
+    /// cloud session is active: the ledger's exclusive lock is also the paid-request
+    /// admission lock, so a UI read that wins the race would make the worker's next
+    /// reservation fail and block an otherwise healthy capture. The safe points are
+    /// construction, a start that failed before any worker existed, and a completed
+    /// or failed session (its worker has already returned). A locked or unreadable
+    /// ledger reports "unknown", never zero.
+    fn refresh_usage(&mut self) {
+        let usage = self.sessions.usage();
+        self.apply_usage(usage);
+    }
+
+    /// Publish one cost summary and the one reminder it may raise. The reminder is
+    /// reported beside the capture flow; it never refuses, stops or cancels one.
+    fn apply_usage(&mut self, usage: Option<UsageSummary>) {
+        let Some(usage) = usage else {
+            // The local engine has no cloud ledger; that is not "zero spent".
+            self.snapshot.usage = None;
+            return;
+        };
+        // A lock held by the worker is not evidence that the cost became unknown:
+        // keep the last readable figures instead of claiming an unknown total.
+        if usage.unreadable
+            && self
+                .snapshot
+                .usage
+                .as_ref()
+                .is_some_and(|known| !known.unreadable)
+        {
+            return;
+        }
+        let reached = usage.reminder_reached();
+        self.snapshot.usage = Some(usage);
+        if !reached {
+            // A new month (or a re-read below the line) may announce again exactly
+            // once; the reminder is never turned into a budget decision.
+            self.usage_reminder_announced = false;
+        } else if !self.usage_reminder_announced && self.snapshot.notice.is_none() {
+            self.usage_reminder_announced = true;
+            self.snapshot.notice = Some(Notice::UsageReminder);
+        }
     }
 
     /// Use a specific 术语表 file for this application. The default is the first
@@ -1078,6 +1144,10 @@ impl Application {
                         self.active = None;
                         self.snapshot.recognition = Some(SessionState::Failed);
                         self.fail(started_directory.as_deref(), error);
+                        // A start may have reserved a request before it failed. No
+                        // worker exists in this branch, so reading the ledger here
+                        // cannot steal the exclusive lock a paid request needs.
+                        self.refresh_usage();
                     }
                 }
             }
@@ -1259,6 +1329,9 @@ impl Application {
                 self.retry = Some(retry);
                 self.snapshot.retry_available = true;
                 self.fail(Some(&directory), error);
+                // A retry reserves its paid request before it spawns a worker; when
+                // it fails first, that reservation must still become visible.
+                self.refresh_usage();
             }
         }
     }
@@ -1601,6 +1674,10 @@ impl Application {
                 }
             }
         }
+        // The final usage of this request was observed by the recognition adapter
+        // before it reported the result, so this is the moment the summary becomes
+        // exact (or stays conservatively reserved when the provider sent none).
+        self.refresh_usage();
     }
 
     /// Append one machine-readable latency record. The session directory is
