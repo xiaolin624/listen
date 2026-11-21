@@ -12,7 +12,7 @@ mod transport;
 use crate::{
     AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, UsageSummary, elapsed_ms,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
+        RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
     },
 };
@@ -468,6 +468,46 @@ impl RecognitionSessions for CloudSessions {
             progress,
             description: self.settings.description(),
         }))
+    }
+    /// What the shared trial ledger recorded for exactly this segment, including
+    /// every automatic rebuild and an explicit retry. The segment identity is the
+    /// capture directory name, so another segment's cost can never be mixed in.
+    ///
+    /// This reads the ledger, so the application must call it only when no
+    /// recognition session is in flight (#37): the ledger's exclusive lock is also
+    /// the paid-request admission lock, and a UI read must never make a worker's
+    /// reservation fail. A locked or unreadable ledger reports `None`, never zero.
+    fn segment_usage(&self, directory: &std::path::Path) -> Option<SegmentUsage> {
+        let segment = segment_name(directory).ok()?;
+        let snapshot = self.ledger.snapshot().ok()?;
+        let attempts: Vec<&Attempt> = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.segment_id == segment)
+            .collect();
+        let first = attempts.first()?;
+        let mut estimated = Some(0u64);
+        let mut unknown = false;
+        for attempt in &attempts {
+            match attempt.estimated_nanoyuan.or(attempt.billed_nanoyuan) {
+                Some(value) => {
+                    estimated = estimated.map(|total| total.saturating_add(value));
+                }
+                None => {
+                    // An unfinished request is not a zero-cost request.
+                    unknown = true;
+                    estimated = None;
+                }
+            }
+        }
+        Some(SegmentUsage {
+            provider: first.provider.clone(),
+            model: first.model.clone(),
+            region: first.region.clone(),
+            requests: attempts.len().min(u32::MAX as usize) as u32,
+            estimated_nanoyuan: estimated,
+            unknown,
+        })
     }
     /// Reprocess the exact retained recording on the explicit user request. This
     /// is a new, separately reserved remote task tied to the same segment; it never

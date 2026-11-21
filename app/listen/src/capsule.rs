@@ -109,6 +109,7 @@ mod tests {
             refined_text: None,
             notice: None,
             usage: None,
+            segments: Vec::new(),
         }
     }
 
@@ -196,5 +197,58 @@ mod tests {
         assert_eq!(preparation_name(Preparation::Pending), "Pending");
         assert_eq!(preparation_name(Preparation::Ready), "Ready");
         assert_eq!(preparation_name(Preparation::Failed), "Failed");
+    }
+
+    #[test]
+    fn several_segments_change_nothing_about_the_capsules_colour_only_vocabulary() {
+        // The capsule never shows waiting counts, segment numbers or text: every
+        // multi-segment fact belongs to the panel. Its whole vocabulary is these five
+        // colour/shape states, and each name is a word without any number.
+        let states = [
+            CapsuleState::Preparing,
+            CapsuleState::Ready,
+            CapsuleState::Capturing,
+            CapsuleState::Processing,
+            CapsuleState::Failure,
+        ];
+        for state in states {
+            assert!(
+                !state
+                    .name()
+                    .chars()
+                    .any(|character| character.is_ascii_digit()),
+                "the capsule state must stay number-free: {}",
+                state.name()
+            );
+        }
+
+        // A snapshot with an older waiting segment and a waiting result maps exactly
+        // like the same phase without them.
+        let mut idle = snapshot(Phase::Ready, Preparation::Ready);
+        idle.segments = vec![
+            listen::SegmentSummary {
+                sequence: 1,
+                state: listen::SegmentState::Result,
+                detail: "pending".into(),
+                text: "一段完整结果".into(),
+                delivery: Some(listen::Delivery::Fallback),
+                usage: None,
+            },
+            listen::SegmentSummary {
+                sequence: 2,
+                state: listen::SegmentState::WaitingForNetwork,
+                detail: "waiting".into(),
+                text: String::new(),
+                delivery: None,
+                usage: None,
+            },
+        ];
+        assert_eq!(capsule_state(&idle), CapsuleState::Ready);
+        idle.phase = Phase::Capturing;
+        assert_eq!(capsule_state(&idle), CapsuleState::Capturing);
+        idle.phase = Phase::Processing;
+        assert_eq!(capsule_state(&idle), CapsuleState::Processing);
+        idle.phase = Phase::Failure;
+        assert_eq!(capsule_state(&idle), CapsuleState::Failure);
     }
 }

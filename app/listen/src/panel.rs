@@ -9,7 +9,8 @@
 //! existing [`Snapshot`], so it stays consistent with the capsule and the files.
 
 use listen::{
-    Delivery, Phase, Preparation, Refine, Snapshot, UsageSummary, streaming::SAMPLE_RATE,
+    Delivery, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot, UsageSummary,
+    streaming::SAMPLE_RATE,
 };
 
 /// The panel's button availability. `refine` is only enabled when the application
@@ -173,6 +174,73 @@ fn capture_progress(snapshot: &Snapshot) -> String {
     )
 }
 
+/// The panel's label for one segment's state. It is a user-facing fact, never a
+/// number the capsule shows.
+fn segment_label(segment: &SegmentSummary) -> &'static str {
+    match segment.state {
+        SegmentState::Capturing => "正在采集",
+        SegmentState::WaitingForNetwork => "等待联网，已收到的声音保存在这台电脑上",
+        SegmentState::Processing => "处理中，等待完整结果",
+        SegmentState::Result => match segment.delivery {
+            Some(Delivery::Appended) => "已完成，结果已追加到目标输入框",
+            Some(Delivery::Fallback) => "已完成，结果只在面板中，尚未写入任何输入框",
+            None => "已完成",
+        },
+        SegmentState::NoSpeech => "没有检测到语音",
+        SegmentState::Failed => "失败，录音仍保留在本机",
+    }
+}
+
+/// One complete result that is still waiting to be taken, oldest first. The current
+/// result is shown by [`result_text`] itself, so only the other pending results are
+/// listed here; a later segment never replaces an earlier entry.
+pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
+    snapshot
+        .segments
+        .iter()
+        .filter(|segment| {
+            !segment.text.is_empty()
+                && segment.state == SegmentState::Result
+                && segment.delivery == Some(Delivery::Fallback)
+                && snapshot.text != segment.text
+        })
+        .collect()
+}
+
+/// The multi-segment block for the panel's status area: how many older segments
+/// still wait, how many complete results are waiting to be taken, and each
+/// segment's own state in capture order. A single delivered capture reads exactly
+/// as before, so the ordinary flow is unchanged.
+pub fn segments_note(snapshot: &Snapshot) -> Option<String> {
+    if snapshot.segments.is_empty() {
+        return None;
+    }
+    let pending = pending_results(snapshot).len();
+    if snapshot.segments.len() == 1 && pending == 0 {
+        return None;
+    }
+    // The newest segment is the one the headline already describes; the count is
+    // the older backlog that must not be lost behind it.
+    let latest = snapshot.segments.last().map(|segment| segment.sequence);
+    let waiting = snapshot
+        .segments
+        .iter()
+        .filter(|segment| segment.state.in_flight() && Some(segment.sequence) != latest)
+        .count();
+    let mut lines = vec![format!(
+        "多段记录（按采集先后）：等待 {waiting} 段，待取结果 {pending} 段。"
+    )];
+    for segment in &snapshot.segments {
+        let mut line = format!("第 {} 段：{}", segment.sequence, segment_label(segment));
+        let detail = segment.detail.trim().replace(['\r', '\n'], " ");
+        if !detail.is_empty() && snapshot.segments.len() > 1 {
+            line.push_str(&format!("（{detail}）"));
+        }
+        lines.push(line);
+    }
+    Some(lines.join("\n"))
+}
+
 /// One amount in CNY. Amounts are exact integer 纳元 in the ledger and become
 /// readable here only; this rounding is for display and is never used as a cost.
 fn cny(nanoyuan: u64) -> String {
@@ -277,6 +345,11 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     if !detail.is_empty() {
         lines.push(detail.to_string());
     }
+    // The multi-segment block comes after the current operation's detail: it never
+    // hides what is happening now, and each older segment keeps its own state.
+    if let Some(note) = segments_note(snapshot) {
+        lines.push(note);
+    }
     // A condition outside the capture flow (a failed copy, a capsule the platform
     // refused to hide from screen capture) is shown after the phase detail so the
     // user reads what happened and what it means without opening a log file.
@@ -303,20 +376,28 @@ pub fn status_text(snapshot: &Snapshot) -> String {
 
 /// The complete current 转写文本, or a placeholder when there is none yet. When a
 /// refine produced text that must not be written to the target, it follows the local
-/// result with an explicit label: the panel never edits either string, and the copy
-/// button copies exactly the local result.
+/// result with an explicit label. Older complete results that still wait to be taken
+/// follow in capture order, each in full and with its own label, so a later segment
+/// can never replace an earlier pending result. The copy button copies exactly the
+/// current result; every pending result is selectable and copyable by hand here.
 pub fn result_text(snapshot: &Snapshot) -> String {
-    let current = if snapshot.text.is_empty() {
+    let mut shown = if snapshot.text.is_empty() {
         "（还没有可复制的转写文本）".to_string()
     } else {
         snapshot.text.clone()
     };
-    match &snapshot.refined_text {
-        Some(refined) => {
-            format!("{current}\n\n【精修结果，未写回目标输入框；可手动复制】\n{refined}")
-        }
-        None => current,
+    if let Some(refined) = &snapshot.refined_text {
+        shown.push_str(&format!(
+            "\n\n【精修结果，未写回目标输入框；可手动复制】\n{refined}"
+        ));
     }
+    for segment in pending_results(snapshot) {
+        shown.push_str(&format!(
+            "\n\n【第 {} 段 · 待取结果；可手动复制】\n{}",
+            segment.sequence, segment.text
+        ));
+    }
+    shown
 }
 
 /// The panel's full text in reading order: status first, then the complete result
@@ -432,6 +513,7 @@ mod tests {
             refined_text: None,
             notice: None,
             usage: None,
+            segments: Vec::new(),
         }
     }
 
@@ -942,6 +1024,111 @@ mod tests {
         // And a capsule at the very right edge of the second monitor.
         let (x, _) = position(Rect::new(3600, 40, 3875, 73), second, 640, 480, 8);
         assert_eq!(x, second.right - 640);
+    }
+
+    fn segment(
+        sequence: u64,
+        state: SegmentState,
+        text: &str,
+        delivery: Option<Delivery>,
+    ) -> SegmentSummary {
+        SegmentSummary {
+            sequence,
+            state,
+            detail: String::new(),
+            text: text.into(),
+            delivery,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn a_multi_segment_panel_counts_waiting_segments_and_keeps_every_pending_result_in_full() {
+        let mut state = snapshot(Phase::Capturing, Preparation::Ready);
+        state.detail = "Capturing the default multimedia endpoint.".into();
+        let long = "第一段很长很长的完整结果。".repeat(400);
+        state.segments = vec![
+            segment(1, SegmentState::Result, &long, Some(Delivery::Fallback)),
+            segment(2, SegmentState::Processing, "", None),
+            segment(3, SegmentState::Capturing, "", None),
+        ];
+        let status = status_text(&state);
+        assert!(status.contains("多段记录"), "{status}");
+        assert!(
+            status.contains("等待 1 段，待取结果 1 段"),
+            "the panel distinguishes the older waiting segment from the pending result: {status}"
+        );
+        let first = status.find("第 1 段").expect("first segment line");
+        let second = status.find("第 2 段").expect("second segment line");
+        let third = status.find("第 3 段").expect("third segment line");
+        assert!(first < second && second < third, "{status}");
+
+        let shown = result_text(&state);
+        assert!(
+            shown.contains(&long),
+            "a pending result must be shown complete, not truncated"
+        );
+        assert!(
+            shown.contains("【第 1 段 · 待取结果；可手动复制】"),
+            "{shown}"
+        );
+        assert!(!shown.contains("【第 2 段"), "{shown}");
+    }
+
+    #[test]
+    fn pending_results_stay_in_capture_order_and_never_replace_the_current_result() {
+        let mut state = result("第三段当前结果", Delivery::Appended);
+        state.segments = vec![
+            segment(
+                1,
+                SegmentState::Result,
+                "第一段待取结果",
+                Some(Delivery::Fallback),
+            ),
+            segment(
+                2,
+                SegmentState::Result,
+                "第二段待取结果",
+                Some(Delivery::Fallback),
+            ),
+            segment(
+                3,
+                SegmentState::Result,
+                "第三段当前结果",
+                Some(Delivery::Appended),
+            ),
+        ];
+        let shown = result_text(&state);
+        assert!(shown.starts_with("第三段当前结果"), "{shown}");
+        let first = shown.find("第一段待取结果").expect("first pending");
+        let second = shown.find("第二段待取结果").expect("second pending");
+        assert!(first < second, "older pending results come first: {shown}");
+        assert_eq!(state.text, "第三段当前结果");
+
+        let pending = pending_results(&state);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|segment| segment.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let status = status_text(&state);
+        assert!(status.contains("待取结果 2 段"), "{status}");
+    }
+
+    #[test]
+    fn a_single_delivered_capture_reads_exactly_as_before() {
+        let mut state = result("单段完整结果", Delivery::Appended);
+        state.segments = vec![segment(
+            1,
+            SegmentState::Result,
+            "单段完整结果",
+            Some(Delivery::Appended),
+        )];
+        assert_eq!(segments_note(&state), None);
+        assert!(!status_text(&state).contains("多段记录"));
+        assert_eq!(result_text(&state), "单段完整结果");
     }
 
     #[test]

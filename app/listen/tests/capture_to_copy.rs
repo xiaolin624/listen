@@ -97,6 +97,26 @@ fn await_phase(app: &mut Application, phase: Phase) -> listen::Snapshot {
     }
 }
 
+fn await_state(
+    app: &mut Application,
+    what: &str,
+    condition: impl Fn(&listen::Snapshot) -> bool,
+) -> listen::Snapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.poll();
+        let state = app.snapshot();
+        if condition(&state) {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "flow did not reach {what}: {state:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn hotkey_start_stop_delivers_complete_copyable_current_result_and_removes_temporary_audio() {
     let runtime = Runtime::new();
@@ -647,7 +667,9 @@ fn busy_operations_explain_the_current_work_and_do_not_replace_or_duplicate_the_
     assert!(app.snapshot().detail.contains("Already capturing"));
     app.dispatch(Control::Stop);
     assert_eq!(app.snapshot().phase, Phase::Processing);
-    app.dispatch(Control::Toggle);
+    // Processing still refuses a retry; the old control explains itself instead of
+    // silently doing nothing.
+    app.dispatch(Control::Retry);
     assert!(app.snapshot().detail.contains("Still processing"));
     app.dispatch(Control::Stop);
     let result = await_phase(&mut app, Phase::Result);
@@ -996,7 +1018,9 @@ fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_
     app.dispatch(Control::Start);
     app.dispatch(Control::Stop);
     app.dispatch(Control::Stop);
-    app.dispatch(Control::Toggle);
+    // A repeated control while the capture is still being finalized explains itself;
+    // it must not start another capture or retry the append.
+    app.dispatch(Control::Retry);
     let result = await_phase(&mut app, Phase::Result);
     app.dispatch(Control::Stop);
     app.poll();
@@ -1259,32 +1283,56 @@ fn concurrent_target_edit_during_output_is_reported_unconfirmed_and_never_revert
 }
 
 #[test]
-fn repeated_stop_held_hotkey_and_processing_controls_deliver_each_result_once() {
+fn repeated_hotkey_events_form_independent_segments_and_deliver_each_result_once() {
     let runtime = Runtime::new();
     let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
     let model = Arc::new(NumberedModel(AtomicUsize::new(0)));
     let mut app = Application::new(Arc::new(Playback), model, runtime.0.clone(), Ok(()))
         .with_targets(Arc::new(Desktop(editors.clone())));
 
-    // A held or auto-repeating hotkey turns into several events: only the first can
-    // stop the capture; the rest arrive during local processing.
-    app.dispatch(Control::Toggle);
+    // A held or auto-repeating hotkey produces independent start/stop segments. Each
+    // stop ends the current one and the next event starts the following one; a
+    // previous segment that is still being processed must not refuse the next.
+    app.dispatch(Control::Toggle); // start segment 1
     assert_eq!(app.snapshot().phase, Phase::Capturing);
     for _ in 0..4 {
-        app.dispatch(Control::Toggle);
+        app.dispatch(Control::Toggle); // stop 1, start 2, stop 2, start 3
     }
-    assert_eq!(app.snapshot().phase, Phase::Processing);
-    assert!(app.snapshot().detail.contains("Still processing"));
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
     app.dispatch(Control::Start);
-    app.dispatch(Control::Stop);
+    assert!(app.snapshot().detail.contains("Already capturing"));
+    app.dispatch(Control::Stop); // stop segment 3
     assert_eq!(app.snapshot().phase, Phase::Processing);
 
-    let first = await_phase(&mut app, Phase::Result);
-    let once = editors.lock().unwrap().drafts[0].clone();
-    assert_eq!(once, format!("原有草稿\n{}", first.text));
-    assert_eq!(once.matches("Rust 和 WASAPI").count(), 1);
-    assert_eq!(editors.lock().unwrap().replace_calls, 1);
-    assert_eq!(first.delivery, Some(Delivery::Appended));
+    let settled = await_state(&mut app, "three complete segments", |state| {
+        state.segments.len() == 3
+            && state
+                .segments
+                .iter()
+                .all(|segment| !segment.text.is_empty())
+    });
+    assert_eq!(settled.phase, Phase::Result, "{settled:?}");
+    let newest = settled.segments[2].text.clone();
+    assert_eq!(
+        settled.text, newest,
+        "the newest segment is the current result: {settled:?}"
+    );
+    let delivered_draft = {
+        let desktop = editors.lock().unwrap();
+        assert_eq!(
+            desktop.replace_calls, 3,
+            "each independent segment is appended exactly once"
+        );
+        for segment in &settled.segments {
+            assert_eq!(
+                desktop.drafts[0].matches(&segment.text).count(),
+                1,
+                "each independent result appears exactly once in {:?}",
+                desktop.drafts[0]
+            );
+        }
+        desktop.drafts[0].clone()
+    };
 
     // Lost key-up / repeated stop after the result must not append or re-enter.
     for _ in 0..3 {
@@ -1293,9 +1341,9 @@ fn repeated_stop_held_hotkey_and_processing_controls_deliver_each_result_once() 
     app.poll();
     assert!(app.snapshot().detail.contains("Not capturing"));
     assert_eq!(app.snapshot().phase, Phase::Result);
-    assert_eq!(app.snapshot().text, first.text);
-    assert_eq!(editors.lock().unwrap().drafts[0], once);
-    assert_eq!(editors.lock().unwrap().replace_calls, 1);
+    assert_eq!(app.snapshot().text, newest);
+    assert_eq!(editors.lock().unwrap().drafts[0], delivered_draft);
+    assert_eq!(editors.lock().unwrap().replace_calls, 3);
 
     // A later capture binds the focus at its own start; it never reuses or mixes
     // the previous target, result, or append.
@@ -1303,11 +1351,11 @@ fn repeated_stop_held_hotkey_and_processing_controls_deliver_each_result_once() 
     app.dispatch(Control::Toggle);
     app.dispatch(Control::Toggle);
     let second = await_phase(&mut app, Phase::Result);
-    assert_ne!(second.text, first.text);
+    assert_ne!(second.text, newest);
     let desktop = editors.lock().unwrap();
-    assert_eq!(desktop.drafts[0], once);
+    assert_eq!(desktop.drafts[0], delivered_draft);
     assert_eq!(desktop.drafts[1], format!("另一个输入框\n{}", second.text));
-    assert_eq!(desktop.replace_calls, 2);
+    assert_eq!(desktop.replace_calls, 4);
     assert_eq!(
         fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
         second.text

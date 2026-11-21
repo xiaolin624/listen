@@ -1,7 +1,8 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +16,7 @@ pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
 pub mod recognition;
+pub(crate) mod segments;
 #[cfg(windows)]
 pub mod sensevoice;
 pub mod streaming;
@@ -29,9 +31,10 @@ pub mod whisper_host;
 #[cfg(windows)]
 pub mod whisper_timing;
 use recognition::{
-    LocalSessions, RecognitionSession, RecognitionSessions, SessionEvent, SessionId,
-    SessionRequest, SessionResult, SessionState, SessionUpdate,
+    LocalSessions, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
+    SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
 };
+use segments::SegmentStore;
 use streaming::{CaptureProgress, SegmentStream};
 
 pub type AppResult<T> = Result<T, String>;
@@ -306,6 +309,67 @@ fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
 }
 
+/// One start/stop segment's user-visible state (#33). It is deliberately a
+/// different vocabulary from [`Phase`]: the phase describes the one operation the
+/// capsule shows, while every segment keeps its own place in the panel until the
+/// user takes its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentState {
+    /// Playback is being captured for this segment.
+    Capturing,
+    /// A transient cloud failure interrupted this segment; it is recovering.
+    WaitingForNetwork,
+    /// The segment was stopped and its whole result is still being confirmed.
+    Processing,
+    /// A complete result exists for this segment.
+    Result,
+    /// The segment completed without any speech.
+    NoSpeech,
+    /// The segment ended without a complete result.
+    Failed,
+}
+
+impl SegmentState {
+    /// The stable spelling used by `segments.json` and the status file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Capturing => "capturing",
+            Self::WaitingForNetwork => "waiting_for_network",
+            Self::Processing => "processing",
+            Self::Result => "result",
+            Self::NoSpeech => "no_speech",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether this segment still occupies capture or recognition work.
+    pub fn in_flight(self) -> bool {
+        matches!(
+            self,
+            Self::Capturing | Self::WaitingForNetwork | Self::Processing
+        )
+    }
+}
+
+/// One capture's independent record as the panel sees it: capture order, state,
+/// complete text, delivery and what the engine metered. A later segment never
+/// replaces an earlier entry; [`Snapshot::text`] is only the newest complete
+/// result, so an older pending result stays readable in its own entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentSummary {
+    /// 1-based capture order. Stable for the life of the segment.
+    pub sequence: u64,
+    pub state: SegmentState,
+    /// The segment's own status line; never contains a credential.
+    pub detail: String,
+    /// The complete text, empty until the segment has one.
+    pub text: String,
+    pub delivery: Option<Delivery>,
+    /// What the recognition engine recorded for this segment's paid requests.
+    /// `None` means the engine cannot meter it; it is never reported as zero.
+    pub usage: Option<SegmentUsage>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -339,6 +403,10 @@ pub struct Snapshot {
     /// unknown parts stay separate. `None` when the recognition adapter keeps no
     /// such ledger (the local engine).
     pub usage: Option<UsageSummary>,
+    /// Every segment of this run in capture order. An older waiting segment keeps
+    /// its own entry and its own complete text; `text` above is only the newest
+    /// complete result.
+    pub segments: Vec<SegmentSummary>,
 }
 
 impl Snapshot {
@@ -394,43 +462,59 @@ fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
-struct Completed {
-    text: String,
-    description: String,
-    delivery: Option<Delivery>,
-    detail: String,
-    save_error: Option<String>,
-    directory: PathBuf,
-    timing: Timing,
-    /// What a successful append left behind, so the same appended transcript can be
-    /// replaced later without guessing. Only a fully confirmed append sets it.
-    memory: Option<DeliveryMemory>,
-}
-
 /// Audio from a failed recognition attempt, kept on disk so the user can retry
-/// without replaying the speech. The target is the one bound at capture start;
+/// without replaying the speech. The target and glossary stay on the segment:
 /// retrying never selects the focus that happens to be active later.
 struct RetainedCapture {
     audio: CapturedAudio,
-    directory: PathBuf,
-    target: AppResult<Option<Box<dyn Target>>>,
-    /// The 术语表 snapshot fixed when this capture started, so a retry sends the
-    /// same terms even if the file has been edited since.
-    glossary: glossary::Glossary,
 }
 
-enum Completion {
-    Finished(Completed),
-    Failed {
-        error: String,
-        directory: PathBuf,
-        retry: Option<RetainedCapture>,
-        timing: Timing,
-        /// Why an automatic local retry cannot cover this failure even though some
-        /// audio remains on disk. Shown to the user instead of silently omitting
-        /// the retry action.
-        retry_scope: Option<String>,
-    },
+/// One segment's saved result whose target delivery finished off the UI thread.
+/// It carries its own capture order, so an older segment's completion can never be
+/// mistaken for the newest result.
+struct Delivered {
+    sequence: u64,
+    text: String,
+    description: String,
+    outcome: DeliveryOutcome,
+    timing: Timing,
+    directory: PathBuf,
+    stopped_at: Option<Instant>,
+}
+
+/// One start/stop segment. It owns its capture directory, its bound target and its
+/// own complete result; another segment never reads or writes them.
+struct SegmentSession {
+    id: SessionId,
+    /// 1-based capture order; the newest segment is the one the capsule and phase
+    /// describe.
+    sequence: u64,
+    directory: PathBuf,
+    /// `None` once the session reported a terminal event; the handle is dropped so
+    /// no further event from it can reach the application.
+    handle: Option<Box<dyn RecognitionSession>>,
+    stopped: bool,
+    terminal: bool,
+    /// A saved result's target delivery is still running.
+    finalizing: bool,
+    stop_requested: Option<Instant>,
+    retry_audio: Option<CapturedAudio>,
+    glossary: glossary::Glossary,
+    /// The target bound at this segment's start; used exactly once.
+    target: AppResult<Option<Box<dyn Target>>>,
+    retained: Option<RetainedCapture>,
+    /// Audio paths kept on disk from a failed attempt, shown to the user.
+    retained_paths: Vec<PathBuf>,
+    state: SegmentState,
+    session_state: SessionState,
+    detail: String,
+    endpoint: Option<CaptureEndpoint>,
+    progress: CaptureProgress,
+    capture_start_ms: Option<u64>,
+    text: Option<String>,
+    delivery: Option<Delivery>,
+    usage: Option<SegmentUsage>,
+    timing: Timing,
 }
 
 /// What a successful append left behind. The bound target is kept alive so a later
@@ -465,6 +549,13 @@ impl DeliveryOutcome {
     }
 }
 
+/// Only one delivery may write to a target at a time. Segments finish at their own
+/// pace, but one editor's read/modify/write pair must never interleave with another
+/// segment's, or a confirmed append would be misread as a user edit. The lock is
+/// taken on a delivery worker's thread, never on the application thread, so a slow
+/// editor can never block a new capture.
+static TARGET_WRITER: Mutex<()> = Mutex::new(());
+
 fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> DeliveryOutcome {
     let mut target = match target {
         Ok(Some(target)) => target,
@@ -475,6 +566,9 @@ fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> DeliveryOu
         }
         Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
     };
+    let _writer = TARGET_WRITER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let latest = match target.content() {
         Ok(latest) => latest,
         Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
@@ -572,6 +666,9 @@ fn refine_delivery(
                     .into(),
         };
     }
+    let _writer = TARGET_WRITER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let observed = match memory.target.content() {
         Ok(observed) => observed,
         Err(error) => {
@@ -703,40 +800,47 @@ fn failed_write(
     }
 }
 
-/// The application boundary used by both global hotkey and complete-flow tests.
-struct ActiveSession {
-    id: SessionId,
-    directory: PathBuf,
-    handle: Box<dyn RecognitionSession>,
-    stopped: bool,
-    terminal: bool,
-    stop_requested: Option<Instant>,
-    retry_audio: Option<CapturedAudio>,
-    /// The fixed 术语表 snapshot this capture was started with.
-    glossary: glossary::Glossary,
-}
-
 pub struct Application {
     snapshot: Snapshot,
     sessions: Box<dyn RecognitionSessions>,
     runtime: PathBuf,
-    active: Option<ActiveSession>,
+    /// Every segment of this run in capture order. The last one is the newest and
+    /// drives `Phase`, the capsule and `Snapshot::text`; older segments keep their
+    /// own state and complete text until the user takes them.
+    segments: Vec<SegmentSession>,
+    /// The durable per-segment record (#33). Only the application thread writes it,
+    /// so no two workers can corrupt the index.
+    store: SegmentStore,
+    record_problem: Option<String>,
     next_session_id: u64,
-    completion: Option<mpsc::Receiver<Completion>>,
-    retry: Option<RetainedCapture>,
+    /// The highest capture order whose complete text is the current result. An older
+    /// segment that completes later must never overwrite it.
+    current_sequence: u64,
+    completion_tx: mpsc::Sender<Delivered>,
+    completion_rx: mpsc::Receiver<Delivered>,
+    /// Deliveries that already finished but are not applied yet, keyed by capture
+    /// order so old segments are applied in capture order.
+    deliveries: BTreeMap<u64, Delivered>,
     control_error: Option<String>,
     targets: Option<Arc<dyn TargetSelection>>,
-    bound_target: AppResult<Option<Box<dyn Target>>>,
     glossary_paths: Vec<PathBuf>,
     glossary: glossary::Glossary,
     glossary_note: Option<String>,
     refine_port: Option<Arc<dyn RefineText>>,
     refine_job: Option<mpsc::Receiver<RefineOutcome>>,
     delivery_memory: Option<DeliveryMemory>,
+    segments_dirty: bool,
     /// Whether this process already raised [`Notice::UsageReminder`] for the
     /// current month, so one reached line is announced once instead of on every
     /// ledger refresh. Reset when the month figure falls back under the line.
     usage_reminder_announced: bool,
+    /// The cumulative cost summary must be re-read, but only once no recognition
+    /// session is in flight: the ledger's exclusive lock is also the paid-request
+    /// admission lock (#37), and an app-side read must never make a worker's
+    /// reservation fail.
+    usage_pending: bool,
+    /// Segments whose own cost still needs a safe-point ledger read.
+    segment_usage_pending: BTreeSet<u64>,
 }
 
 impl Application {
@@ -773,7 +877,7 @@ impl Application {
         } else {
             readiness.state
         };
-        let (phase, detail) = match initial_error {
+        let (phase, mut detail) = match initial_error {
             Some(error) => (Phase::Failure, error),
             None if preparation == Preparation::Pending => (
                 Phase::Preparing,
@@ -783,6 +887,11 @@ impl Application {
         };
         let glossary_paths =
             glossary::default_paths(&runtime, std::env::current_exe().ok().as_deref());
+        let store = SegmentStore::open(&runtime);
+        if let Some(problem) = store.problem() {
+            detail.push_str(&format!("\n{problem}"));
+        }
+        let (completion_tx, completion_rx) = mpsc::channel();
         let mut application = Self {
             snapshot: Snapshot {
                 phase,
@@ -804,23 +913,30 @@ impl Application {
                 refined_text: None,
                 notice: None,
                 usage: None,
+                segments: Vec::new(),
             },
             sessions,
             runtime,
-            active: None,
+            segments: Vec::new(),
+            store,
+            record_problem: None,
             next_session_id: 0,
-            completion: None,
-            retry: None,
+            current_sequence: 0,
+            completion_tx,
+            completion_rx,
+            deliveries: BTreeMap::new(),
             control_error,
             targets: None,
-            bound_target: Ok(None),
             glossary_paths,
             glossary: glossary::Glossary::default(),
             glossary_note: None,
             refine_port: None,
             refine_job: None,
             delivery_memory: None,
+            segments_dirty: false,
             usage_reminder_announced: false,
+            usage_pending: false,
+            segment_usage_pending: BTreeSet::new(),
         };
         // The durable ledger already exists before the first capture, so the cost
         // this tool has accumulated is readable immediately and after a restart.
@@ -829,18 +945,43 @@ impl Application {
         application
     }
 
-    fn is_capturing(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|session| !session.stopped && !session.terminal)
+    /// The segment whose capture is still running. The playback device admits one
+    /// at a time; an older segment that is only waiting or processing is not it.
+    fn capturing_index(&self) -> Option<usize> {
+        self.segments
+            .iter()
+            .position(|segment| segment.handle.is_some() && !segment.stopped && !segment.terminal)
     }
 
+    fn is_capturing(&self) -> bool {
+        self.capturing_index().is_some()
+    }
+
+    /// Any segment still waiting for its complete result or for a target delivery.
     fn is_processing(&self) -> bool {
-        self.completion.is_some()
-            || self
-                .active
-                .as_ref()
-                .is_some_and(|session| session.stopped && !session.terminal)
+        self.segments.iter().any(|segment| {
+            segment.finalizing || (segment.handle.is_some() && segment.stopped && !segment.terminal)
+        })
+    }
+
+    fn any_retained(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.retained.is_some())
+    }
+
+    /// The newest failed segment that still owns recoverable audio. Retry and
+    /// CleanupAudio act on it; an older failure keeps its own audio and record.
+    fn newest_retained(&self) -> Option<usize> {
+        self.segments
+            .iter()
+            .rposition(|segment| segment.retained.is_some())
+    }
+
+    fn current_segment_index(&self) -> Option<usize> {
+        self.segments
+            .iter()
+            .position(|segment| segment.sequence == self.current_sequence)
     }
 
     fn next_id(&mut self) -> SessionId {
@@ -888,6 +1029,69 @@ impl Application {
         } else if !self.usage_reminder_announced && self.snapshot.notice.is_none() {
             self.usage_reminder_announced = true;
             self.snapshot.notice = Some(Notice::UsageReminder);
+        }
+    }
+
+    /// Whether any recognition session is still alive. While one is, the ledger
+    /// must not be read at all: its exclusive lock is the paid-request admission
+    /// lock, so a UI read that wins the race would make the worker's next
+    /// reservation fail and block a healthy capture (#37).
+    fn recognition_in_flight(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.handle.is_some() && !segment.terminal)
+    }
+
+    /// Ask for the cumulative cost summary once no recognition session is active.
+    fn mark_usage_pending(&mut self) {
+        self.usage_pending = true;
+    }
+
+    /// Ask for one segment's own cost once no recognition session is active.
+    fn mark_segment_usage_pending(&mut self, sequence: u64) {
+        self.segment_usage_pending.insert(sequence);
+    }
+
+    /// Read the deferred cost summaries, if it is safe now. Both reads are skipped
+    /// while a recognition session is alive; the pending flags stay set until then.
+    fn flush_deferred_usage(&mut self) {
+        if self.recognition_in_flight() {
+            return;
+        }
+        if self.usage_pending {
+            self.usage_pending = false;
+            self.refresh_usage();
+        }
+        if self.segment_usage_pending.is_empty() {
+            return;
+        }
+        let pending: Vec<u64> = self.segment_usage_pending.iter().copied().collect();
+        self.segment_usage_pending.clear();
+        for sequence in pending {
+            let Some(index) = self
+                .segments
+                .iter()
+                .position(|segment| segment.sequence == sequence)
+            else {
+                continue;
+            };
+            let directory = self.segments[index].directory.clone();
+            let Some(usage) = self.sessions.segment_usage(&directory) else {
+                // No metered request for this segment, or the ledger is unreadable
+                // from another process. It is never reported as zero.
+                continue;
+            };
+            self.segments[index].usage = Some(usage.clone());
+            if let Some(record) = self.store.record_mut(sequence) {
+                record.usage = Some(usage);
+                record.updated_utc = segments::now_utc();
+                if self.store.problem().is_none() {
+                    if let Err(error) = self.store.persist() {
+                        self.note_record_problem(error);
+                    }
+                }
+            }
+            self.segments_dirty = true;
         }
     }
 
@@ -1006,18 +1210,19 @@ impl Application {
         }
     }
 
-    /// Record a finished refine. `Refine::Running` and `Phase::Result` are the only
-    /// states the worker can finish from; the current result is only replaced after a
-    /// confirmed write or when there was no target at all.
+    /// Record a finished refine. The current result is only replaced after a
+    /// confirmed write or when there was no target at all; the segment that owns the
+    /// current result keeps the refined text, so the panel and the record agree.
     fn apply_refine_outcome(&mut self, outcome: RefineOutcome) {
         self.delivery_memory = None;
         match outcome {
             RefineOutcome::Applied { refined, note } => {
-                self.snapshot.text = refined;
+                self.snapshot.text = refined.clone();
                 self.snapshot.refined_text = None;
                 self.snapshot.refine = Refine::Applied;
                 self.snapshot.detail =
                     format!("Refine applied. {note} Nothing is sent automatically.");
+                self.keep_refined_text(refined);
             }
             RefineOutcome::NotApplied { refined, reason } => {
                 self.snapshot.refined_text = Some(refined);
@@ -1034,6 +1239,27 @@ impl Application {
                 self.snapshot.detail = format!(
                     "Refine failed: {reason}. The complete result is unchanged and remains available; nothing was appended again or sent."
                 );
+            }
+        }
+        self.segments_dirty = true;
+        self.refresh_segments();
+    }
+
+    /// The refined text becomes the current segment's own complete text, and its
+    /// durable copy follows when it exists. The target was already verified above.
+    fn keep_refined_text(&mut self, refined: String) {
+        let Some(index) = self.current_segment_index() else {
+            return;
+        };
+        self.segments[index].text = Some(refined.clone());
+        let sequence = self.segments[index].sequence;
+        if let Err(error) = self.store.write_text(sequence, &refined) {
+            self.note_record_problem(error);
+        } else if let Some(record) = self.store.record_mut(sequence) {
+            record.text_chars = refined.chars().count();
+            record.updated_utc = segments::now_utc();
+            if let Err(error) = self.store.persist() {
+                self.note_record_problem(error);
             }
         }
     }
@@ -1064,102 +1290,11 @@ impl Application {
             return;
         }
         match control {
-            Control::Start if !self.is_capturing() && !self.is_processing() => {
-                let start_requested = Instant::now();
-                if self.retry.is_some() {
-                    self.snapshot.detail = "A failed capture's audio is retained for retry. Retry recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
-                    return;
-                }
-                // Bind once before any UI feedback. Recognition receives neither
-                // the target draft nor an editor identity.
-                self.bound_target = self
-                    .targets
-                    .as_ref()
-                    .map_or(Ok(None), |targets| targets.focused_target());
-                self.snapshot.endpoint = None;
-                let mut started_directory = None;
-                let result = (|| {
-                    if let Some(error) = &self.control_error {
-                        return Err(format!("Global hotkey unavailable: {error}"));
-                    }
-                    let glossary_ready = self.reload_glossary();
-                    if self.sessions.requires_valid_glossary() {
-                        glossary_ready?;
-                    }
-                    fs::create_dir_all(&self.runtime).map_err(|error| error.to_string())?;
-                    let unique = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_err(|error| error.to_string())?
-                        .as_nanos();
-                    let directory = self
-                        .runtime
-                        .join(format!("session-{}-{unique}", std::process::id()));
-                    started_directory = Some(directory.clone());
-                    let id = self.next_id();
-                    let glossary = self.glossary.clone();
-                    let handle = self.sessions.start(SessionRequest {
-                        id,
-                        directory: directory.clone(),
-                        glossary: glossary.clone(),
-                    })?;
-                    let status = handle.status();
-                    self.snapshot.endpoint = status.endpoint;
-                    self.snapshot.recognition = Some(status.state);
-                    self.snapshot.progress = status.progress;
-                    self.snapshot.detail = self.with_glossary_note(status.detail);
-                    self.active = Some(ActiveSession {
-                        id,
-                        directory,
-                        handle,
-                        stopped: false,
-                        terminal: false,
-                        stop_requested: None,
-                        retry_audio: None,
-                        glossary,
-                    });
-                    Ok::<_, String>(())
-                })();
-                match result {
-                    Ok(()) => {
-                        self.snapshot.phase = Phase::Capturing;
-                        self.snapshot.delivery = None;
-                        self.snapshot.retained_audio.clear();
-                        self.snapshot.retry_available = false;
-                        self.delivery_memory = None;
-                        self.snapshot.refined_text = None;
-                        self.snapshot.refine = Refine::Unavailable(
-                            "Playback is being captured; stop and wait for the complete result before refining.".into(),
-                        );
-                        if matches!(self.snapshot.notice, Some(Notice::CopyFailed(_))) {
-                            self.snapshot.notice = None;
-                        }
-                        self.snapshot.timing = Timing {
-                            preparation_ms: self.snapshot.timing.preparation_ms,
-                            capture_start_ms: Some(elapsed_ms(start_requested)),
-                            ..Timing::default()
-                        };
-                    }
-                    Err(error) => {
-                        self.bound_target = Ok(None);
-                        self.active = None;
-                        self.snapshot.recognition = Some(SessionState::Failed);
-                        self.fail(started_directory.as_deref(), error);
-                        // A start may have reserved a request before it failed. No
-                        // worker exists in this branch, so reading the ledger here
-                        // cannot steal the exclusive lock a paid request needs.
-                        self.refresh_usage();
-                    }
-                }
-            }
-            Control::Stop if self.is_capturing() => {
-                let active = self.active.as_mut().unwrap();
-                active.stop_requested = Some(Instant::now());
-                active.stopped = true;
-                active.handle.stop();
-                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
-                self.snapshot.phase = Phase::Processing;
-                self.snapshot.detail = active.handle.status().detail;
-            }
+            // A new capture is refused only while another capture runs. An older
+            // segment that waits for the network or is still being processed must
+            // never block the next sentence.
+            Control::Start if !self.is_capturing() => self.start_capture(),
+            Control::Stop if self.is_capturing() => self.stop_capture(),
             Control::Refine => {
                 if self.refine_job.is_some() {
                     self.snapshot.detail = "Refine is already running; the current result is unchanged. Wait for the refined text before asking again.".into();
@@ -1255,6 +1390,13 @@ impl Application {
                 }
                 self.cleanup_failed_audio();
             }
+            // A Start while a capture is live is about the live capture, whatever
+            // older segments are doing; it must say so instead of reporting them.
+            Control::Start => {
+                self.snapshot.detail =
+                    "Already capturing playback audio. Stop to transcribe the current recording."
+                        .into();
+            }
             _ if self.snapshot.preparation == Preparation::Pending => {
                 let activity = self.activity();
                 self.snapshot.detail = format!(
@@ -1262,12 +1404,7 @@ impl Application {
                 );
             }
             _ if self.is_processing() => {
-                self.snapshot.detail = "Still processing the current playback locally; wait for the result before starting again.".into();
-            }
-            Control::Start => {
-                self.snapshot.detail =
-                    "Already capturing playback audio. Stop to transcribe the current recording."
-                        .into();
+                self.snapshot.detail = "Still processing the current playback; wait for the result before starting again.".into();
             }
             _ => {
                 if !self.snapshot.detail.starts_with("Not capturing;") {
@@ -1278,88 +1415,252 @@ impl Application {
                 }
             }
         }
+        self.segments_dirty = true;
+        self.refresh_segments();
     }
 
-    /// Reprocess the exact audio kept from a failed attempt. This never starts
-    /// capture, never re-selects a target and never asks for the speech to be
+    /// Bind the target once and create one independent segment. Older segments keep
+    /// their own target, audio and result; only the playback device is exclusive.
+    fn start_capture(&mut self) {
+        let start_requested = Instant::now();
+        if self.any_retained() {
+            self.snapshot.detail = "A failed capture's audio is retained for retry. Retry recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
+            return;
+        }
+        // Bind once before any UI feedback. Recognition receives neither the target
+        // draft nor an editor identity.
+        let bound_target = self
+            .targets
+            .as_ref()
+            .map_or(Ok(None), |targets| targets.focused_target());
+        self.snapshot.endpoint = None;
+        let mut started_directory = None;
+        let result = (|| {
+            if let Some(error) = &self.control_error {
+                return Err(format!("Global hotkey unavailable: {error}"));
+            }
+            let glossary_ready = self.reload_glossary();
+            if self.sessions.requires_valid_glossary() {
+                glossary_ready?;
+            }
+            fs::create_dir_all(&self.runtime).map_err(|error| error.to_string())?;
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos();
+            let directory = self
+                .runtime
+                .join(format!("session-{}-{unique}", std::process::id()));
+            started_directory = Some(directory.clone());
+            let id = self.next_id();
+            let glossary = self.glossary.clone();
+            let handle = self.sessions.start(SessionRequest {
+                id,
+                directory: directory.clone(),
+                glossary: glossary.clone(),
+            })?;
+            let status = handle.status();
+            Ok::<_, String>((id, directory, handle, status, glossary))
+        })();
+        match result {
+            Ok((id, directory, handle, status, glossary)) => {
+                let (sequence, record_error) = self.store.begin(&directory, &status.detail);
+                let capture_start_ms = Some(elapsed_ms(start_requested));
+                let segment = SegmentSession {
+                    id,
+                    sequence,
+                    directory,
+                    handle: Some(handle),
+                    stopped: false,
+                    terminal: false,
+                    finalizing: false,
+                    stop_requested: None,
+                    retry_audio: None,
+                    glossary,
+                    target: bound_target,
+                    retained: None,
+                    retained_paths: Vec::new(),
+                    state: SegmentState::Capturing,
+                    session_state: status.state,
+                    detail: status.detail.clone(),
+                    endpoint: status.endpoint.clone(),
+                    progress: status.progress.clone(),
+                    capture_start_ms,
+                    text: None,
+                    delivery: None,
+                    usage: None,
+                    timing: Timing::default(),
+                };
+                self.snapshot.endpoint = segment.endpoint.clone();
+                self.snapshot.recognition = Some(status.state);
+                self.snapshot.progress = segment.progress.clone();
+                self.snapshot.detail = self.with_glossary_note(status.detail);
+                self.segments.push(segment);
+                self.snapshot.phase = Phase::Capturing;
+                self.snapshot.delivery = None;
+                self.snapshot.retained_audio.clear();
+                self.snapshot.retry_available = false;
+                self.delivery_memory = None;
+                self.snapshot.refined_text = None;
+                self.snapshot.refine = Refine::Unavailable(
+                    "Playback is being captured; stop and wait for the complete result before refining.".into(),
+                );
+                if matches!(self.snapshot.notice, Some(Notice::CopyFailed(_))) {
+                    self.snapshot.notice = None;
+                }
+                self.snapshot.timing = Timing {
+                    preparation_ms: self.snapshot.timing.preparation_ms,
+                    capture_start_ms,
+                    ..Timing::default()
+                };
+                if let Some(error) = record_error {
+                    self.note_record_problem(error);
+                }
+            }
+            Err(error) => {
+                self.snapshot.recognition = Some(SessionState::Failed);
+                self.snapshot.phase = Phase::Failure;
+                self.snapshot.detail = error;
+                // A start may have reserved a request before it failed. No worker
+                // exists in this branch, so the ledger can be read at the next poll.
+                self.mark_usage_pending();
+            }
+        }
+    }
+
+    /// Stop only the live capture. Every older segment keeps waiting or finalizing
+    /// on its own.
+    fn stop_capture(&mut self) {
+        let Some(index) = self.capturing_index() else {
+            return;
+        };
+        let stop_requested = Instant::now();
+        let detail = {
+            let segment = &mut self.segments[index];
+            segment.stop_requested = Some(stop_requested);
+            segment.stopped = true;
+            segment.state = SegmentState::Processing;
+            if let Some(handle) = segment.handle.as_mut() {
+                handle.stop();
+            }
+            segment
+                .handle
+                .as_ref()
+                .map(|handle| handle.status().detail)
+                .unwrap_or_else(|| segment.detail.clone())
+        };
+        if index + 1 == self.segments.len() {
+            self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+            self.snapshot.phase = Phase::Processing;
+            self.snapshot.detail = detail;
+        }
+        self.persist_segment(index);
+        // A retry may have reserved its paid request before it spawned a worker; the
+        // summary becomes visible once no recognition session is active.
+        self.mark_usage_pending();
+    }
+
+    /// Reprocess the exact audio kept from the newest failed segment. This never
+    /// starts capture, never re-selects a target and never asks for the speech to be
     /// replayed: the configured recognizer processes the same recording again.
     fn retry_retained_recognition(&mut self) {
-        let Some(retry) = self.retry.take() else {
+        let Some(index) = self.newest_retained() else {
             self.snapshot.retry_available = false;
             self.snapshot.detail = "No retained audio is available for a retry, so nothing was recognized and no result was delivered. The current result is unchanged.".into();
             return;
         };
-        if !retry.audio.path.is_file() {
-            self.snapshot.retry_available = false;
-            self.snapshot.retained_audio.clear();
-            let _ = fs::remove_dir_all(&retry.directory);
+        let Some(retained) = self.segments[index].retained.as_ref() else {
+            return;
+        };
+        let audio = retained.audio.clone();
+        if !audio.path.is_file() {
+            self.segments[index].retained = None;
+            self.segments[index].retained_paths.clear();
+            let _ = fs::remove_dir_all(&self.segments[index].directory);
+            self.persist_segment(index);
+            self.refresh_recovery_snapshot();
             self.snapshot.detail = "The audio retained from the failed capture is no longer on disk, so it was not retried. The current result is unchanged.".into();
             return;
         }
         let id = self.next_id();
-        let glossary = retry.glossary.clone();
+        let glossary = self.segments[index].glossary.clone();
         let request = SessionRequest {
             id,
-            directory: retry.directory.clone(),
-            glossary: glossary.clone(),
+            directory: self.segments[index].directory.clone(),
+            glossary,
         };
-        match self.sessions.retry(request, retry.audio.clone()) {
+        match self.sessions.retry(request, audio.clone()) {
             Ok(handle) => {
-                self.bound_target = retry.target;
-                self.active = Some(ActiveSession {
-                    id,
-                    directory: retry.directory,
-                    handle,
-                    stopped: true,
-                    terminal: false,
-                    stop_requested: None,
-                    retry_audio: Some(retry.audio),
-                    glossary: retry.glossary,
-                });
-                self.snapshot.phase = Phase::Processing;
-                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
-                self.snapshot.delivery = None;
-                self.snapshot.retry_available = false;
-                self.snapshot.detail =
+                let segment = &mut self.segments[index];
+                segment.id = id;
+                segment.handle = Some(handle);
+                segment.stopped = true;
+                segment.terminal = false;
+                segment.finalizing = false;
+                segment.retry_audio = Some(audio);
+                segment.retained = None;
+                segment.retained_paths.clear();
+                segment.state = SegmentState::Processing;
+                segment.session_state = SessionState::AwaitingFinal;
+                segment.detail =
                     "Retrying recognition on the retained audio; the speech is not replayed."
                         .into();
+                self.persist_segment(index);
+                self.refresh_recovery_snapshot();
+                if index + 1 == self.segments.len() {
+                    self.snapshot.phase = Phase::Processing;
+                    self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+                    self.snapshot.delivery = None;
+                    self.snapshot.retry_available = false;
+                    self.snapshot.detail =
+                        "Retrying recognition on the retained audio; the speech is not replayed."
+                            .into();
+                }
             }
             Err(error) => {
-                let directory = retry.directory.clone();
-                self.retry = Some(retry);
-                self.snapshot.retry_available = true;
-                self.fail(Some(&directory), error);
+                self.fail_segment(index, error, Timing::default());
                 // A retry reserves its paid request before it spawns a worker; when
                 // it fails first, that reservation must still become visible.
-                self.refresh_usage();
+                self.mark_usage_pending();
             }
         }
     }
 
-    /// Delete the audio kept from a failed recognition at the user's explicit
-    /// request. A later retry must not act as if a capture were still available.
+    /// Delete the newest failed segment's retained audio at the user's explicit
+    /// request. Every other segment's recordings and results stay untouched.
     fn cleanup_failed_audio(&mut self) {
-        let Some(retry) = self.retry.take() else {
+        let Some(index) = self.newest_retained() else {
             self.snapshot.retry_available = false;
             self.snapshot.detail =
                 "There is no failed capture audio to clean. The current result is unchanged."
                     .into();
             return;
         };
-        match fs::remove_dir_all(&retry.directory) {
+        match fs::remove_dir_all(&self.segments[index].directory) {
             Ok(()) => {
-                self.snapshot.retained_audio.clear();
-                self.snapshot.retry_available = false;
-                self.snapshot.detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+                self.segments[index].retained = None;
+                self.segments[index].retained_paths.clear();
+                self.segments[index].detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+                self.remove_segment_record(index);
+                self.refresh_recovery_snapshot();
+                if index + 1 == self.segments.len() {
+                    self.snapshot.retained_audio.clear();
+                    self.snapshot.retry_available = false;
+                    self.snapshot.detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+                }
             }
             Err(error) => {
-                self.retry = Some(retry);
-                self.snapshot.retry_available = true;
-                self.snapshot.detail = format!(
+                self.segments[index].detail = format!(
                     "The temporarily retained audio could not be deleted ({error}), so it is still available for a retry."
                 );
+                self.refresh_recovery_snapshot();
+                if index + 1 == self.segments.len() {
+                    self.snapshot.retry_available = true;
+                    self.snapshot.detail = self.segments[index].detail.clone();
+                }
             }
         }
+        self.persist_segment(index);
     }
 
     pub fn poll(&mut self) {
@@ -1404,286 +1705,584 @@ impl Application {
                 Preparation::Pending => {}
             }
         }
-        if let Some(active) = self.active.as_mut().filter(|session| !session.terminal) {
-            let event = active.handle.poll();
-            let status = active.handle.status();
-            // A retry processes the already captured audio; keep that capture's
-            // route/progress rather than reporting a new unidentified device.
-            if active.retry_audio.is_none() {
-                self.snapshot.progress = status.progress;
-                self.snapshot.endpoint = status.endpoint;
+        // Refresh every live segment in capture order, but apply at most one session
+        // event per poll: the oldest waiting segment cannot be reordered behind a
+        // newer one inside one poll, and the poll stays bounded. Only the segments up
+        // to the first event are polled, so no session's event is consumed and
+        // dropped when two of them finish between polls.
+        for index in 0..self.segments.len() {
+            if self.segments[index].handle.is_none() || self.segments[index].terminal {
+                continue;
             }
-            if status.state == SessionState::AwaitingFinal && !active.stopped {
-                active.stopped = true;
-                active.stop_requested = Some(Instant::now());
-                self.snapshot.phase = Phase::Processing;
+            let status = self.segments[index]
+                .handle
+                .as_mut()
+                .expect("checked above")
+                .status();
+            self.note_segment_status(index, status, preparation_changed);
+        }
+        let mut event: Option<(usize, SessionEvent)> = None;
+        for index in 0..self.segments.len() {
+            if self.segments[index].handle.is_none() || self.segments[index].terminal {
+                continue;
             }
-            // A transition into waiting-for-network must be visible even after stop,
-            // when the detail is otherwise held stable. A normal local stop keeps the
-            // last capture detail, which carries the backlog/interruption note.
-            let state_changed = self.snapshot.recognition != Some(status.state);
-            let waiting_now = status.state == SessionState::WaitingForNetwork;
-            if !active.stopped || preparation_changed || (waiting_now && state_changed) {
-                self.snapshot.detail = match &self.glossary_note {
-                    Some(note) => format!("{}\n{note}", status.detail),
-                    None => status.detail,
-                };
-            }
-            // A stable sentence stays observable until the next session event; a
-            // status refresh must not turn it into a completed result. A waiting or
-            // failed state still supersedes it.
-            let keep_stable = self.snapshot.recognition == Some(SessionState::Stable)
-                && !active.stopped
-                && status.state == SessionState::Capturing;
-            if !keep_stable {
-                self.snapshot.recognition = Some(status.state);
-            }
-            if let Some(event) = event {
-                self.apply_session_event(event);
+            let session_event = self.segments[index]
+                .handle
+                .as_mut()
+                .expect("checked above")
+                .poll();
+            if let Some(session_event) = session_event {
+                event = Some((index, session_event));
+                break;
             }
         }
-        let Some(rx) = &self.completion else {
-            return;
-        };
-        let completion = match rx.try_recv() {
-            Ok(completion) => completion,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.completion = None;
-                self.snapshot.recognition = Some(SessionState::Failed);
-                self.fail(None, "Local processing worker stopped unexpectedly".into());
-                return;
+        if let Some((index, event)) = event {
+            self.apply_session_event(index, event);
+        }
+        // Apply finished deliveries oldest capture order first, at most one per
+        // poll, so a burst of completions cannot reorder the panel.
+        loop {
+            match self.completion_rx.try_recv() {
+                Ok(delivered) => {
+                    self.deliveries
+                        .entry(delivered.sequence)
+                        .or_insert(delivered);
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
-        };
-        self.completion = None;
-        self.apply_completion(completion);
+        }
+        if let Some((_, delivered)) = self.deliveries.pop_first() {
+            self.apply_delivery(delivered);
+        }
+        // Cost summaries and per-segment cost are read only once no recognition
+        // session is alive, so the ledger's admission lock is never contended.
+        self.flush_deferred_usage();
+        self.refresh_segments();
     }
 
-    fn apply_session_event(&mut self, event: SessionEvent) {
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        if active.id != event.id || active.terminal {
+    /// Keep one segment's own status up to date, and copy it into the phase/capsule
+    /// snapshot only while that segment is the newest one.
+    fn note_segment_status(
+        &mut self,
+        index: usize,
+        status: recognition::SessionStatus,
+        preparation_changed: bool,
+    ) {
+        let primary = index + 1 == self.segments.len();
+        let previous_state = self.segments[index].state;
+        {
+            let segment = &mut self.segments[index];
+            segment.session_state = status.state;
+            segment.detail = status.detail.clone();
+            // A retry processes the already captured audio; keep that capture's
+            // route/progress rather than reporting a new unidentified device.
+            if segment.retry_audio.is_none() {
+                segment.progress = status.progress.clone();
+                segment.endpoint = status.endpoint.clone();
+            }
+            if !matches!(
+                segment.state,
+                SegmentState::Result | SegmentState::NoSpeech | SegmentState::Failed
+            ) {
+                segment.state = match status.state {
+                    SessionState::WaitingForNetwork => SegmentState::WaitingForNetwork,
+                    SessionState::Capturing | SessionState::Stable => SegmentState::Capturing,
+                    // A session reports `Complete`/`Failed` only once its terminal
+                    // event is queued; the segment becomes a result (or a failure)
+                    // when that event is applied, not before.
+                    SessionState::Preparing
+                    | SessionState::AwaitingFinal
+                    | SessionState::Complete
+                    | SessionState::Failed => SegmentState::Processing,
+                };
+            }
+            if status.state == SessionState::AwaitingFinal && !segment.stopped {
+                segment.stopped = true;
+                segment.stop_requested = Some(Instant::now());
+                segment.state = SegmentState::Processing;
+                if primary {
+                    self.snapshot.phase = Phase::Processing;
+                }
+            }
+        }
+        let changed = self.segments[index].state != previous_state;
+        if changed {
+            self.segments_dirty = true;
+            self.persist_segment(index);
+        }
+        if !primary {
             return;
         }
+        if self.segments[index].retry_audio.is_none() {
+            self.snapshot.progress = self.segments[index].progress.clone();
+            self.snapshot.endpoint = self.segments[index].endpoint.clone();
+        }
+        // A transition into waiting-for-network must be visible even after stop,
+        // when the detail is otherwise held stable. A normal stop keeps the last
+        // capture detail, which carries the backlog/interruption note.
+        let state_changed = self.snapshot.recognition != Some(status.state);
+        let waiting_now = status.state == SessionState::WaitingForNetwork;
+        if !self.segments[index].stopped || preparation_changed || (waiting_now && state_changed) {
+            self.snapshot.detail = match &self.glossary_note {
+                Some(note) => format!("{}\n{note}", status.detail),
+                None => status.detail,
+            };
+        }
+        // A stable sentence stays observable until the next session event; a status
+        // refresh must not turn it into a completed result. A waiting or failed
+        // state still supersedes it.
+        let keep_stable = self.snapshot.recognition == Some(SessionState::Stable)
+            && !self.segments[index].stopped
+            && status.state == SessionState::Capturing;
+        if !keep_stable {
+            self.snapshot.recognition = Some(status.state);
+        }
+    }
+
+    fn apply_session_event(&mut self, index: usize, event: SessionEvent) {
+        let Some(segment) = self.segments.get(index) else {
+            return;
+        };
+        if segment.terminal || segment.id != event.id {
+            return;
+        }
+        let primary = index + 1 == self.segments.len();
         match event.update {
-            SessionUpdate::Stable(_) if !active.stopped => {
-                self.snapshot.recognition = Some(SessionState::Stable);
+            SessionUpdate::Stable(_) if !segment.stopped => {
+                if primary {
+                    self.snapshot.recognition = Some(SessionState::Stable);
+                }
             }
-            SessionUpdate::Finished(result) if active.stopped => {
-                active.terminal = true;
-                self.snapshot.recognition = Some(SessionState::Complete);
-                self.finish_recognition(result);
+            SessionUpdate::Finished(result) if segment.stopped => {
+                self.segments[index].terminal = true;
+                if primary {
+                    self.snapshot.recognition = Some(SessionState::Complete);
+                }
+                self.finish_recognition(index, result);
             }
             SessionUpdate::Failed(failure) => {
-                active.terminal = true;
-                self.snapshot.recognition = Some(SessionState::Failed);
-                let directory = active.directory.clone();
-                let glossary = active.glossary.clone();
-                let target = std::mem::replace(&mut self.bound_target, Ok(None));
-                let retry = failure.retry_audio.map(|audio| RetainedCapture {
-                    audio,
-                    directory: directory.clone(),
-                    target,
-                    glossary,
-                });
-                let mut timing = failure.timing;
+                let SessionFailure {
+                    error,
+                    retry_audio,
+                    retry_scope,
+                    mut timing,
+                } = failure;
                 timing.preparation_ms = self.snapshot.timing.preparation_ms;
-                timing.capture_start_ms = self.snapshot.timing.capture_start_ms;
-                self.apply_completion(Completion::Failed {
-                    error: failure.error,
-                    directory,
-                    retry,
-                    timing,
-                    retry_scope: failure.retry_scope,
-                });
+                timing.capture_start_ms = self.segments[index].capture_start_ms;
+                self.segments[index].terminal = true;
+                if let Some(audio) = retry_audio {
+                    self.segments[index].retained = Some(RetainedCapture { audio });
+                }
+                self.segments[index].timing = timing.clone();
+                if primary {
+                    self.snapshot.recognition = Some(SessionState::Failed);
+                }
+                self.fail_segment(index, error, timing);
+                // The retry/recovery advice is appended after the failure detail so
+                // the reason itself is never hidden by it.
+                let note = if self.any_retained() {
+                    Some("The audio from this capture is retained. Retry processes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.".to_string())
+                } else {
+                    retry_scope
+                };
+                if let Some(note) = note {
+                    self.segments[index].detail.push('\n');
+                    self.segments[index].detail.push_str(&note);
+                    if primary {
+                        self.snapshot.detail.push('\n');
+                        self.snapshot.detail.push_str(&note);
+                    }
+                    self.persist_segment(index);
+                }
             }
             _ => {}
         }
     }
 
-    fn finish_recognition(&mut self, result: SessionResult) {
-        let active = self.active.as_mut().unwrap();
-        let directory = active.directory.clone();
-        let retry_audio = active.retry_audio.take();
-        let stopped_at = match (active.stop_requested, result.stopped_at) {
-            (Some(control), Some(session)) => Some(control.min(session)),
-            (control, session) => control.or(session),
-        };
-        let target = std::mem::replace(&mut self.bound_target, Ok(None));
-        let glossary = active.glossary.clone();
-        let current_result = self.runtime.join("current-result.txt");
-        let mut timing = result.timing;
-        timing.capture_start_ms = self.snapshot.timing.capture_start_ms;
-        timing.preparation_ms = self.snapshot.timing.preparation_ms;
-        let (tx, rx) = mpsc::channel();
-        self.completion = Some(rx);
-        thread::spawn(move || {
-            let recovered = result.recovered;
-            let text = result.text;
-            let completion = if text.trim().is_empty() {
-                timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
-                Completion::Finished(Completed {
-                    text,
-                    description: result.description,
-                    delivery: None,
-                    detail: String::new(),
-                    save_error: None,
-                    directory,
-                    timing,
-                    memory: None,
-                })
-            } else {
-                let save_started = Instant::now();
-                let save_error = cloud::persist_result(&current_result, text.as_bytes())
-                    .err()
-                    .map(|error| error.to_string());
-                timing.save_ms = Some(elapsed_ms(save_started));
-                match (save_error, retry_audio) {
-                    (Some(error), Some(audio)) => Completion::Failed {
-                        error: format!("Could not save the current result: {error}"),
-                        retry: Some(RetainedCapture {
-                            audio,
-                            directory: directory.clone(),
-                            target,
-                            glossary,
-                        }),
-                        directory,
-                        timing,
-                        retry_scope: None,
-                    },
-                    (save_error, _) => {
-                        let delivery_started = Instant::now();
-                        let outcome = match &save_error {
-                            Some(error) => DeliveryOutcome::fallback(not_delivered(format!(
-                                "Could not save the current result: {error}"
-                            ))),
-                            None if recovered => {
-                                DeliveryOutcome::fallback(recovered_not_delivered())
-                            }
-                            None => deliver(target, &text),
-                        };
-                        timing.delivery_ms = Some(elapsed_ms(delivery_started));
-                        timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
-                        Completion::Finished(Completed {
-                            text,
-                            description: result.description,
-                            delivery: Some(outcome.delivery),
-                            detail: outcome.detail,
-                            save_error,
-                            directory,
-                            timing,
-                            memory: outcome.memory,
-                        })
-                    }
-                }
-            };
-            let _ = tx.send(completion);
-        });
-    }
-
-    fn apply_completion(&mut self, completion: Completion) {
-        match completion {
-            Completion::Finished(completed) if completed.text.trim().is_empty() => {
-                // A completed no-speech session is not a new transcript. In particular,
-                // leave the previous copyable result and its on-disk copy untouched.
-                self.snapshot.timing = completed.timing.clone();
-                self.snapshot.delivery = None;
-                self.record_latency("NoSpeech", &completed.timing, &completed.directory);
-                self.snapshot.retained_audio.clear();
-                self.snapshot.retry_available = false;
-                // The previous result is kept, but it is not what this capture
-                // produced: refine stays off until a complete result exists again.
-                self.delivery_memory = None;
-                self.snapshot.refined_text = None;
-                self.snapshot.refine = Refine::Unavailable(
-                    "The latest capture contained no speech, so there is no complete result to refine."
-                        .into(),
-                );
-                match fs::remove_dir_all(&completed.directory) {
-                    Ok(()) => {
-                        self.snapshot.phase = Phase::NoSpeech;
-                        self.snapshot.detail = format!(
-                            "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {}", completed.description
-                        );
-                    }
-                    Err(error) => self.fail(
-                        Some(&completed.directory),
-                        format!(
-                            "No valid speech detected, but temporary audio could not be cleaned: {error}"
-                        ),
-                    ),
-                }
-            }
-            Completion::Finished(completed) => {
-                self.snapshot.timing = completed.timing.clone();
-                self.snapshot.text = completed.text;
-                self.snapshot.delivery = completed.delivery;
-                // Only a confirmed append leaves a target that a later refine may
-                // safely replace; a fallback result still offers refine but has no
-                // target to write back to.
-                self.delivery_memory = completed.memory;
-                self.snapshot.refined_text = None;
-                self.snapshot.refine = match self.refine_availability() {
-                    Ok(()) => Refine::Available,
-                    Err(reason) => Refine::Unavailable(reason),
-                };
-                self.record_latency("Result", &completed.timing, &completed.directory);
-                let cleanup = if let Some(error) = &completed.save_error {
-                    // A storage failure keeps the audio recoverable, as before.
-                    Err(error.clone())
-                } else {
-                    fs::remove_dir_all(&completed.directory).map_err(|e| e.to_string())
-                };
-                self.snapshot.retained_audio.clear();
-                self.snapshot.retry_available = false;
-                match cleanup {
-                    Ok(()) => {
-                        self.snapshot.phase = Phase::Result;
-                        self.snapshot.detail = self.with_glossary_note(format!(
-                            "{}\nPlayback: {}",
-                            completed.detail, completed.description
-                        ));
-                    }
-                    Err(error) => self.fail(
-                        Some(&completed.directory),
-                        format!(
-                            "Could not save the current result or clean temporary audio: {error}"
-                        ),
-                    ),
-                }
-            }
-            Completion::Failed {
-                error,
-                directory,
-                retry,
-                timing,
-                retry_scope,
-            } => {
-                let retryable = retry.is_some();
-                self.retry = retry;
-                self.snapshot.retry_available = retryable;
-                self.snapshot.timing = timing.clone();
-                self.record_latency("Failure", &timing, &directory);
-                self.fail(Some(&directory), error);
-                if retryable {
-                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Retry processes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
-                } else if let Some(scope) = retry_scope {
-                    self.snapshot.detail.push_str("\n");
-                    self.snapshot.detail.push_str(&scope);
+    /// Save one segment's complete result, reliably and before any target write.
+    /// Only the newest complete result is mirrored to `current-result.txt`, so an
+    /// older segment that finishes late cannot overwrite it.
+    fn save_complete_text(&mut self, sequence: u64, text: &str, current: bool) -> AppResult<()> {
+        let name = self.store.write_text(sequence, text)?;
+        if let Some(record) = self.store.record_mut(sequence) {
+            record.text_file = Some(name);
+            record.text_chars = text.chars().count();
+            record.updated_utc = segments::now_utc();
+            if self.store.problem().is_none() {
+                if let Err(error) = self.store.persist() {
+                    self.note_record_problem(error);
                 }
             }
         }
-        // The final usage of this request was observed by the recognition adapter
-        // before it reported the result, so this is the moment the summary becomes
-        // exact (or stays conservatively reserved when the provider sent none).
-        self.refresh_usage();
+        if current {
+            cloud::persist_result(&self.runtime.join("current-result.txt"), text.as_bytes())
+                .map_err(|error| format!("Could not save the current result: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn finish_recognition(&mut self, index: usize, result: SessionResult) {
+        let sequence = self.segments[index].sequence;
+        let directory = self.segments[index].directory.clone();
+        let description = result.description.clone();
+        let recovered = result.recovered;
+        let text = result.text.clone();
+        let retry_audio = self.segments[index].retry_audio.take();
+        let target = std::mem::replace(&mut self.segments[index].target, Ok(None));
+        let stopped_at = match (self.segments[index].stop_requested, result.stopped_at) {
+            (Some(control), Some(session)) => Some(control.min(session)),
+            (control, session) => control.or(session),
+        };
+        let mut timing = result.timing;
+        timing.capture_start_ms = self.segments[index].capture_start_ms;
+        timing.preparation_ms = self.snapshot.timing.preparation_ms;
+        if text.trim().is_empty() {
+            self.apply_no_speech(index, description, directory, timing, stopped_at);
+            return;
+        }
+        // The segment's own cost is read later, at a safe point after every
+        // recognition session returned: the ledger must not be read mid-capture.
+        self.mark_segment_usage_pending(sequence);
+        self.mark_usage_pending();
+        let is_current = sequence >= self.current_sequence;
+        let save_started = Instant::now();
+        let saved = self.save_complete_text(sequence, &text, is_current);
+        timing.save_ms = Some(elapsed_ms(save_started));
+        if let Err(error) = saved {
+            // Nothing is written to a target and the audio stays as the recovery
+            // basis. The complete text stays readable for this segment.
+            if is_current {
+                self.current_sequence = sequence;
+                self.snapshot.text = text.clone();
+                self.snapshot.delivery = None;
+                self.snapshot.refined_text = None;
+            }
+            self.segments[index].text = Some(text);
+            self.segments[index].timing = timing.clone();
+            if let Some(audio) = retry_audio {
+                self.segments[index].retained = Some(RetainedCapture { audio });
+            }
+            self.fail_segment(index, error, timing);
+            return;
+        }
+        self.current_sequence = self.current_sequence.max(sequence);
+        self.segments[index].timing = timing.clone();
+        self.segments[index].finalizing = true;
+        let tx = self.completion_tx.clone();
+        let worker_text = text.clone();
+        let worker_timing = timing.clone();
+        let worker_directory = directory.clone();
+        thread::spawn(move || {
+            let delivery_started = Instant::now();
+            let outcome = if recovered {
+                DeliveryOutcome::fallback(recovered_not_delivered())
+            } else {
+                deliver(target, &worker_text)
+            };
+            let mut timing = worker_timing;
+            timing.delivery_ms = Some(elapsed_ms(delivery_started));
+            let _ = tx.send(Delivered {
+                sequence,
+                text: worker_text,
+                description,
+                outcome,
+                timing,
+                directory: worker_directory,
+                stopped_at,
+            });
+        });
+    }
+
+    fn apply_no_speech(
+        &mut self,
+        index: usize,
+        description: String,
+        directory: PathBuf,
+        mut timing: Timing,
+        stopped_at: Option<Instant>,
+    ) {
+        timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
+        let primary = index + 1 == self.segments.len();
+        {
+            let segment = &mut self.segments[index];
+            segment.state = SegmentState::NoSpeech;
+            segment.session_state = SessionState::Complete;
+            segment.detail = format!(
+                "No valid speech detected; nothing was delivered.\nPlayback: {description}"
+            );
+            segment.timing = timing.clone();
+        }
+        // A no-speech segment has no result to keep, so its audio and record go.
+        let cleanup = fs::remove_dir_all(&directory).map_err(|error| error.to_string());
+        self.remove_segment_record(index);
+        self.segments_dirty = true;
+        self.persist_segment(index);
+        if primary {
+            self.snapshot.timing = timing.clone();
+            self.snapshot.delivery = None;
+            self.record_latency("NoSpeech", &timing, &directory, 0, None);
+            self.snapshot.retained_audio.clear();
+            self.snapshot.retry_available = false;
+            self.delivery_memory = None;
+            self.snapshot.refined_text = None;
+            self.snapshot.refine = Refine::Unavailable(
+                "The latest capture contained no speech, so there is no complete result to refine."
+                    .into(),
+            );
+            match cleanup {
+                Ok(()) => {
+                    self.snapshot.phase = Phase::NoSpeech;
+                    self.snapshot.detail = format!(
+                        "No valid speech detected; nothing was delivered. The previous current result is unchanged.\nPlayback: {description}"
+                    );
+                }
+                Err(error) => {
+                    self.segments[index].retained_paths = audio_paths(&directory);
+                    self.fail(
+                        Some(&directory),
+                        format!(
+                            "No valid speech detected, but temporary audio could not be cleaned: {error}"
+                        ),
+                    );
+                }
+            }
+        } else if let Err(error) = cleanup {
+            self.segments[index].detail = format!(
+                "No valid speech detected, but this segment's temporary audio could not be cleaned: {error}"
+            );
+        }
+        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_usage_pending();
+        self.refresh_recovery_snapshot();
+    }
+
+    fn apply_delivery(&mut self, delivered: Delivered) {
+        let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.sequence == delivered.sequence)
+        else {
+            return;
+        };
+        let primary = index + 1 == self.segments.len();
+        let current = delivered.sequence == self.current_sequence;
+        let delivery = delivered.outcome.delivery;
+        let detail = delivered.outcome.detail.clone();
+        {
+            let segment = &mut self.segments[index];
+            segment.finalizing = false;
+            segment.state = SegmentState::Result;
+            segment.session_state = SessionState::Complete;
+            segment.text = Some(delivered.text.clone());
+            segment.delivery = Some(delivery);
+            segment.timing = delivered.timing.clone();
+            segment.detail = detail.clone();
+        }
+        let mut cleanup_error = None;
+        match fs::remove_dir_all(&delivered.directory) {
+            Ok(()) => {}
+            Err(error) => cleanup_error = Some(error.to_string()),
+        }
+        let keep_record = delivery == Delivery::Fallback || cleanup_error.is_some();
+        if let Some(record) = self.store.record_mut(delivered.sequence) {
+            record.state = self.segments[index].state.name().to_owned();
+            record.detail = self.segments[index].detail.clone();
+            record.text_file = Some(SegmentStore::text_name(delivered.sequence));
+            record.text_chars = delivered.text.chars().count();
+            record.delivery = Some(delivery_name(delivery).into());
+            record.updated_utc = segments::now_utc();
+            if self.store.problem().is_none() {
+                if let Err(error) = self.store.persist() {
+                    self.note_record_problem(error);
+                }
+            }
+        }
+        if let Some(error) = &cleanup_error {
+            self.segments[index].retained_paths = audio_paths(&delivered.directory);
+            self.segments[index].detail = format!(
+                "{detail}\nThe temporary audio for this segment could not be cleaned ({error}); the result is still complete."
+            );
+            self.persist_segment(index);
+        }
+        if current {
+            self.snapshot.text = delivered.text.clone();
+            self.snapshot.delivery = Some(delivery);
+            self.delivery_memory = delivered.outcome.memory;
+            self.snapshot.refined_text = None;
+            self.snapshot.refine = match self.refine_availability() {
+                Ok(()) => Refine::Available,
+                Err(reason) => Refine::Unavailable(reason),
+            };
+            let mut timing = delivered.timing.clone();
+            timing.stop_to_result_ms = delivered.stopped_at.map(elapsed_ms);
+            self.snapshot.timing = timing.clone();
+            self.record_latency(
+                "Result",
+                &timing,
+                &delivered.directory,
+                delivered.text.chars().count(),
+                Some(delivery),
+            );
+        }
+        if primary {
+            self.snapshot.retained_audio.clear();
+            self.snapshot.retry_available = false;
+            match &cleanup_error {
+                None => {
+                    self.snapshot.phase = Phase::Result;
+                    self.snapshot.detail = self.with_glossary_note(format!(
+                        "{}\nPlayback: {}",
+                        detail, delivered.description
+                    ));
+                }
+                Some(error) => self.fail(
+                    Some(&delivered.directory),
+                    format!("Could not save the current result or clean temporary audio: {error}"),
+                ),
+            }
+        }
+        if keep_record {
+            self.persist_segment(index);
+        } else {
+            self.remove_segment_record(index);
+        }
+        // The request's final usage was observed before the result was reported, so
+        // the per-segment and cumulative figures become exact at this safe point.
+        self.mark_segment_usage_pending(delivered.sequence);
+        self.mark_usage_pending();
+        self.refresh_recovery_snapshot();
+        self.segments_dirty = true;
+    }
+
+    /// Record one failure for exactly one segment. A failure from an older segment
+    /// changes nothing the capsule shows; only the newest segment can move the
+    /// global phase to `Failure`.
+    fn fail_segment(&mut self, index: usize, error: String, timing: Timing) {
+        let directory = self.segments[index].directory.clone();
+        let paths = audio_paths(&directory);
+        let partial = fs::read_to_string(directory.join("partial-result.txt"))
+            .ok()
+            .filter(|text| !text.is_empty());
+        let detail = failure_detail(&error, &paths);
+        {
+            let segment = &mut self.segments[index];
+            segment.state = SegmentState::Failed;
+            segment.session_state = SessionState::Failed;
+            segment.terminal = true;
+            segment.retained_paths = paths.clone();
+            segment.timing = timing.clone();
+            segment.detail = detail;
+            if let Some(partial) = &partial {
+                segment.detail.push_str(&format!(
+                    ". The capture was interrupted, so this text is incomplete and kept with this segment: {}. This is not a completed transcription.",
+                    partial.chars().count()
+                ));
+            }
+        }
+        self.segments_dirty = true;
+        self.persist_segment(index);
+        if index + 1 == self.segments.len() {
+            self.snapshot.timing = timing.clone();
+            self.record_latency("Failure", &timing, &directory, 0, None);
+            self.fail(Some(&directory), error);
+        }
+        // A failed segment still has paid requests; its own cost is persisted at the
+        // next safe point even though no result was produced.
+        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_usage_pending();
+        self.refresh_recovery_snapshot();
+    }
+
+    /// Fill `segments.json` from the current segment state. Cheap enough to call on
+    /// every transition; the index is a small text document.
+    fn persist_segment(&mut self, index: usize) {
+        let Some(segment) = self.segments.get(index) else {
+            return;
+        };
+        let sequence = segment.sequence;
+        let state = segment.state.name().to_owned();
+        let detail = segment.detail.clone();
+        let Some(record) = self.store.record_mut(sequence) else {
+            return;
+        };
+        if record.state == state && record.detail == detail {
+            return;
+        }
+        record.state = state;
+        record.detail = detail;
+        record.updated_utc = segments::now_utc();
+        if self.store.problem().is_some() {
+            return;
+        }
+        if let Err(error) = self.store.persist() {
+            self.note_record_problem(error);
+        }
+    }
+
+    fn remove_segment_record(&mut self, index: usize) {
+        let Some(segment) = self.segments.get(index) else {
+            return;
+        };
+        let sequence = segment.sequence;
+        if let Err(error) = self.store.remove(sequence) {
+            self.note_record_problem(error);
+        }
+    }
+
+    fn note_record_problem(&mut self, error: String) {
+        if self.record_problem.is_some() || error.is_empty() {
+            return;
+        }
+        self.record_problem = Some(error.clone());
+        if !self.snapshot.detail.contains(&error) {
+            self.snapshot.detail.push_str(&format!("\n{error}"));
+        }
+    }
+
+    fn refresh_recovery_snapshot(&mut self) {
+        self.snapshot.retry_available = self.any_retained();
+        match self
+            .segments
+            .iter()
+            .rev()
+            .find(|segment| !segment.retained_paths.is_empty())
+        {
+            Some(segment) => self.snapshot.retained_audio = segment.retained_paths.clone(),
+            None => self.snapshot.retained_audio.clear(),
+        }
+    }
+
+    /// Rebuild the panel's segment list, in capture order, when anything changed.
+    fn refresh_segments(&mut self) {
+        if !self.segments_dirty {
+            return;
+        }
+        self.segments_dirty = false;
+        self.snapshot.segments = self
+            .segments
+            .iter()
+            .map(|segment| SegmentSummary {
+                sequence: segment.sequence,
+                state: segment.state,
+                detail: segment.detail.clone(),
+                text: segment.text.clone().unwrap_or_default(),
+                delivery: segment.delivery,
+                usage: segment.usage.clone(),
+            })
+            .collect();
     }
 
     /// Append one machine-readable latency record. The session directory is
     /// removed after success, so this keeps the measured breakdown in the
     /// runtime directory for later review instead of relying on GUI timing.
-    fn record_latency(&self, phase: &str, timing: &Timing, directory: &Path) {
+    fn record_latency(
+        &self,
+        phase: &str,
+        timing: &Timing,
+        directory: &Path,
+        text_chars: usize,
+        delivery: Option<Delivery>,
+    ) {
         use std::io::Write;
         let entry = serde_json::json!({
             "utc": SystemTime::now()
@@ -1693,8 +2292,8 @@ impl Application {
             "session": directory.file_name().and_then(|name| name.to_str()).unwrap_or(""),
             "phase": phase,
             "backend": self.snapshot.backend,
-            "delivery": format!("{:?}", self.snapshot.delivery),
-            "text_chars": self.snapshot.text.chars().count(),
+            "delivery": format!("{delivery:?}"),
+            "text_chars": text_chars,
             "capture_start_ms": timing.capture_start_ms,
             "preparation_ms": timing.preparation_ms,
             "stop_to_result_ms": timing.stop_to_result_ms,
@@ -1716,24 +2315,9 @@ impl Application {
     }
 
     fn fail(&mut self, directory: Option<&Path>, error: String) {
+        let mut retained_audio = Vec::new();
         if let Some(directory) = directory {
-            let mut pending = vec![directory.to_path_buf()];
-            while let Some(directory) = pending.pop() {
-                if let Ok(entries) = fs::read_dir(&directory) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            pending.push(path);
-                        } else if path
-                            .extension()
-                            .is_some_and(|extension| extension == "wav" || extension == "pcm")
-                            && !self.snapshot.retained_audio.contains(&path)
-                        {
-                            self.snapshot.retained_audio.push(path);
-                        }
-                    }
-                }
-            }
+            retained_audio = audio_paths(directory);
         }
         self.snapshot.phase = Phase::Failure;
         self.snapshot.recognition = Some(SessionState::Failed);
@@ -1744,20 +2328,13 @@ impl Application {
         self.snapshot.refine = Refine::Unavailable(
             "The latest operation failed, so there is no complete result to refine.".into(),
         );
-        let error = error.trim_end_matches('.').to_string();
-        self.snapshot.detail = if self.snapshot.retained_audio.is_empty() {
-            error
-        } else {
-            format!(
-                "{error}. Audio retained for local recovery: {}",
-                self.snapshot
-                    .retained_audio
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+        self.snapshot.detail = failure_detail(&error, &retained_audio);
+        self.snapshot.retained_audio.clear();
+        for path in retained_audio {
+            if !self.snapshot.retained_audio.contains(&path) {
+                self.snapshot.retained_audio.push(path);
+            }
+        }
         if let Some(directory) = directory {
             let path = directory.join("partial-result.txt");
             if let Ok(text) = fs::read_to_string(&path) {
@@ -1767,9 +2344,57 @@ impl Application {
                 }
             }
         }
+        self.segments_dirty = true;
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
     }
+}
+
+fn delivery_name(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Appended => "appended",
+        Delivery::Fallback => "fallback",
+    }
+}
+
+/// One failure message with the retained audio paths, never a credential.
+fn failure_detail(error: &str, retained_audio: &[PathBuf]) -> String {
+    let error = error.trim_end_matches('.').to_string();
+    if retained_audio.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}. Audio retained for local recovery: {}",
+            retained_audio
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// Every audio file still under one segment's directory, recursively. Used only to
+/// report what is recoverable; nothing here is deleted.
+fn audio_paths(directory: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if let Ok(entries) = fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "wav" || extension == "pcm")
+                {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
 }
