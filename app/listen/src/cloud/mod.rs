@@ -29,7 +29,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -41,6 +41,89 @@ pub use transport::NativeMessageTransport;
 
 pub const ALI_MODEL: &str = "qwen-audio-3.1-asr-flash-message";
 pub const ALI_REGION: &str = "cn-beijing";
+
+/// A transient cloud failure is retried with a bounded, growing delay. The
+/// capture owns the received audio meanwhile, so waiting never discards it.
+const MAX_CONNECTION_ATTEMPTS: u32 = 8;
+const RETRY_WINDOW: Duration = Duration::from_secs(20);
+const RETRY_BASE: Duration = Duration::from_millis(100);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+/// Sleep in slices so a stop or a device failure is noticed promptly instead of
+/// after a whole backoff period.
+const RETRY_POLL: Duration = Duration::from_millis(25);
+
+fn retry_delay(attempt: u32) -> Duration {
+    let factor = 1u32 << attempt.saturating_sub(1).min(5);
+    (RETRY_BASE * factor).min(RETRY_MAX_DELAY)
+}
+
+/// Transient failures keep the capture alive and are retried. Credential,
+/// balance, model, configuration and protocol errors are not retried.
+fn retryable(error: &CloudError) -> bool {
+    matches!(
+        error,
+        CloudError::Network
+            | CloudError::Timeout
+            | CloudError::RateLimited
+            | CloudError::RateOrBudget
+            | CloudError::Provider
+    )
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Link {
+    #[default]
+    Connecting,
+    Streaming,
+    Waiting,
+    /// Recognition cannot continue, but the capture is still saving audio.
+    Blocked,
+}
+
+/// The connection state the worker publishes so `status` can tell "waiting for
+/// the network" apart from a failed capture or a finished task.
+#[derive(Default)]
+struct LinkState {
+    state: Mutex<Link>,
+    problem: Mutex<Option<String>>,
+}
+
+impl LinkState {
+    fn set(&self, state: Link) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    }
+    fn connecting(&self) {
+        self.set(Link::Connecting);
+    }
+    fn streaming(&self) {
+        self.set(Link::Streaming);
+    }
+    fn waiting(&self) {
+        self.set(Link::Waiting);
+    }
+    fn is_waiting(&self) -> bool {
+        matches!(
+            *self.state.lock().unwrap_or_else(|error| error.into_inner()),
+            Link::Waiting
+        )
+    }
+    /// Publish a failure that retrying cannot fix. Capture keeps saving audio and
+    /// the user sees the actionable reason instead of a bare "failed".
+    fn blocked(&self, problem: &str) {
+        *self
+            .problem
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(problem.into());
+        self.set(Link::Blocked);
+    }
+    fn problem(&self) -> Option<String> {
+        self.problem
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AliSettings {
@@ -314,28 +397,20 @@ impl RecognitionSessions for CloudSessions {
     }
     fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
         let policy = self.available().map_err(|e| e.to_string())?;
-        let mut vocabulary = serde_json::Map::new();
-        for term in request.glossary.canonical_terms() {
-            if vocabulary.len() >= 2000
-                || (term.is_ascii() && term.split_whitespace().count() > 7)
-                || (!term.is_ascii() && term.chars().count() > 15)
-            {
-                return Err("The capture glossary exceeds Alibaba Message limits (2000 terms, 15 characters for mixed/non-ASCII terms, 7 space-separated words for ASCII terms). Correct the local glossary; no cloud request was sent".into());
+        let vocabulary = request_vocabulary(&request)?;
+        let segment = segment_name(&request.directory)?;
+        // The first request is reserved and named before capture starts, so an
+        // unavailable budget refuses the capture instead of failing later.
+        let initial_task = match &policy {
+            Some(policy) => {
+                let task = task_id()?;
+                self.ledger
+                    .reserve(&task, &segment, &self.settings, policy.clone())
+                    .map_err(|e| e.to_string())?;
+                Some(task)
             }
-            vocabulary.insert(term.into(), json!(4));
-        }
-        let task = task_id()?;
-        let segment = request
-            .directory
-            .file_name()
-            .and_then(|v| v.to_str())
-            .ok_or("Invalid capture directory")?
-            .to_owned();
-        if let Some(policy) = &policy {
-            self.ledger
-                .reserve(&task, &segment, &self.settings, policy.clone())
-                .map_err(|e| e.to_string())?;
-        }
+            None => None,
+        };
         fs::create_dir(&request.directory).map_err(|e| e.to_string())?;
         let mut recording = self.audio.start(&request.directory)?;
         let stream = recording.take_pcm_stream().ok_or("Cloud trial requires continuous retained PCM; local overlapping windows are not a cloud stream")?;
@@ -345,6 +420,8 @@ impl RecognitionSessions for CloudSessions {
         let capture_worker = capture.clone();
         let stable = Arc::new(AtomicBool::new(false));
         let stable_signal = stable.clone();
+        let link = Arc::new(LinkState::default());
+        let worker_link = link.clone();
         let transport = self.transport.clone();
         let settings = self.settings.clone();
         let key = self.key.as_ref().map_err(|e| e.to_string())?.clone();
@@ -353,9 +430,24 @@ impl RecognitionSessions for CloudSessions {
         let id = request.id;
         let (tx, result) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let update = match run(capture_worker, stream, stable_signal, transport, &settings, &key, &task, &segment, policy, &ledger, clock, vocabulary) {
+            let update = match run(
+                capture_worker,
+                stream,
+                stable_signal,
+                worker_link,
+                transport,
+                &settings,
+                &key,
+                initial_task,
+                &segment,
+                policy,
+                &ledger,
+                clock,
+                vocabulary,
+                false,
+            ) {
                 Ok(result) => SessionUpdate::Finished(result),
-                Err(error) => SessionUpdate::Failed(SessionFailure { error, retry_audio: None, retry_scope: Some("Received continuous PCM is retained. Automatic network/restart recovery belongs to the later recovery task; no local result was substituted.".into()), timing: Timing::default() }),
+                Err(failure) => SessionUpdate::Failed(failure),
             };
             let _ = tx.send(SessionEvent { id, update });
         });
@@ -363,6 +455,7 @@ impl RecognitionSessions for CloudSessions {
             id,
             capture,
             stable,
+            link,
             result,
             state: SessionState::Capturing,
             endpoint,
@@ -370,18 +463,83 @@ impl RecognitionSessions for CloudSessions {
             description: self.settings.description(),
         }))
     }
+    /// Reprocess the exact retained recording on the explicit user request. This
+    /// is a new, separately reserved remote task tied to the same segment; it never
+    /// uses the local engine and never claims the retransmission is free. The
+    /// recovered result is delivered conservatively (the panel), because it is late.
     fn retry(
         &mut self,
-        _request: SessionRequest,
-        _audio: CapturedAudio,
+        request: SessionRequest,
+        audio: CapturedAudio,
     ) -> AppResult<Box<dyn RecognitionSession>> {
-        Err("Cloud trial does not silently retry or use the local engine. Received PCM and its pending reservation are retained for the later recovery task".into())
+        let policy = self.available().map_err(|e| e.to_string())?;
+        let vocabulary = request_vocabulary(&request)?;
+        let segment = segment_name(&request.directory)?;
+        let initial_task = match &policy {
+            Some(policy) => {
+                let task = task_id()?;
+                self.ledger
+                    .reserve(&task, &segment, &self.settings, policy.clone())
+                    .map_err(|e| e.to_string())?;
+                Some(task)
+            }
+            None => None,
+        };
+        let stream = PcmStream::resume(&audio.path)?;
+        let progress = stream.progress.clone();
+        let capture = CaptureControl::retained(audio);
+        let capture_worker = capture.clone();
+        let stable = Arc::new(AtomicBool::new(false));
+        let stable_signal = stable.clone();
+        let link = Arc::new(LinkState::default());
+        let worker_link = link.clone();
+        let transport = self.transport.clone();
+        let settings = self.settings.clone();
+        let key = self.key.as_ref().map_err(|e| e.to_string())?.clone();
+        let ledger = self.ledger.clone();
+        let clock = self.clock.clone();
+        let id = request.id;
+        let (tx, result) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let update = match run(
+                capture_worker,
+                stream,
+                stable_signal,
+                worker_link,
+                transport,
+                &settings,
+                &key,
+                initial_task,
+                &segment,
+                policy,
+                &ledger,
+                clock,
+                vocabulary,
+                true,
+            ) {
+                Ok(result) => SessionUpdate::Finished(result),
+                Err(failure) => SessionUpdate::Failed(failure),
+            };
+            let _ = tx.send(SessionEvent { id, update });
+        });
+        Ok(Box::new(CloudSession {
+            id,
+            capture,
+            stable,
+            link,
+            result,
+            state: SessionState::AwaitingFinal,
+            endpoint: None,
+            progress,
+            description: self.settings.description(),
+        }))
     }
 }
 struct CloudSession {
     id: crate::recognition::SessionId,
     capture: Arc<CaptureControl>,
     stable: Arc<AtomicBool>,
+    link: Arc<LinkState>,
     result: mpsc::Receiver<SessionEvent>,
     state: SessionState,
     endpoint: Option<crate::CaptureEndpoint>,
@@ -394,25 +552,44 @@ impl RecognitionSession for CloudSession {
         self.state = SessionState::AwaitingFinal;
     }
     fn status(&self) -> SessionStatus {
+        let problem = self.link.problem();
+        let waiting = !matches!(self.state, SessionState::Complete | SessionState::Failed)
+            && self.link.is_waiting();
         SessionStatus {
-            state: self.state,
+            state: if waiting {
+                SessionState::WaitingForNetwork
+            } else {
+                self.state
+            },
             progress: self.progress.snapshot(),
             endpoint: self.endpoint.clone(),
             detail: format!(
                 "{}\n{}",
                 self.description,
-                if self.capture.is_stopped() {
-                    "Waiting for whole-task cloud confirmation; unconfirmed sentences are not delivered."
+                if let Some(problem) = problem {
+                    if self.capture.is_stopped() {
+                        format!(
+                            "Cloud recognition cannot continue: {problem}. The complete recording is saved on this machine; no unconfirmed text was delivered."
+                        )
+                    } else {
+                        format!(
+                            "Cloud recognition cannot continue: {problem}. Playback is still being captured and saved on this machine so the recording can be retried after the problem is fixed."
+                        )
+                    }
+                } else if waiting {
+                    "Waiting for the network. The received playback is saved on this machine; Listen retries the cloud connection automatically and never delivers an unconfirmed sentence.".into()
+                } else if self.capture.is_stopped() {
+                    "Waiting for whole-task cloud confirmation; unconfirmed sentences are not delivered.".into()
                 } else {
-                    "Capturing continuous playback to local PCM before upload. Only this capture and its glossary are supplied to Alibaba; no messages are sent automatically."
+                    "Capturing continuous playback to local PCM before upload. Only this capture and its glossary are supplied to Alibaba; no messages are sent automatically.".into()
                 }
             ),
         }
     }
     fn poll(&mut self) -> Option<SessionEvent> {
-        if self.capture.failure().is_some() {
-            self.stop();
-        }
+        // The worker owns device-failure detection. Stopping the capture here
+        // would race it and turn a real capture failure into a generic network
+        // retry, losing the reason the audio source disappeared.
         match self.result.try_recv() {
             Ok(event) => {
                 self.state = if matches!(event.update, SessionUpdate::Finished(_)) {
@@ -447,183 +624,513 @@ fn run(
     capture: Arc<CaptureControl>,
     mut stream: PcmStream,
     stable: Arc<AtomicBool>,
+    link: Arc<LinkState>,
     transport: Arc<dyn MessageTransport>,
     settings: &AliSettings,
     key: &Secret,
-    task: &str,
+    initial_task: Option<String>,
     segment: &str,
     policy: Option<TrialCostPolicy>,
     ledger: &TrialLedger,
     clock: Arc<dyn TrialClock>,
     vocabulary: serde_json::Map<String, Value>,
-) -> AppResult<SessionResult> {
+    // True when this session replays already retained audio on a later request,
+    // so its result is late and must not be written to the target automatically.
+    late: bool,
+) -> Result<SessionResult, SessionFailure> {
     let started_at = Instant::now();
     let mut description = String::new();
-    let result = (|| -> AppResult<SessionResult> {
-        let policy = match policy {
-            Some(policy) => policy,
-            None => {
-                let policy = transport
-                    .cost_policy(settings, key)
-                    .map_err(|e| e.to_string())?;
-                ledger
-                    .reserve(task, segment, settings, policy.clone())
-                    .map_err(|e| e.to_string())?;
-                policy
+    let mut recovered = late;
+    let timing = Timing {
+        recognition_ms: Some(elapsed_ms(started_at)),
+        ..Timing::default()
+    };
+    let policy = match policy {
+        Some(policy) => policy,
+        None => match transport.cost_policy(settings, key) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return Err(blocked_failure(&capture, &link, error.to_string(), timing));
             }
-        };
-        let max_pcm_bytes = policy.max_pcm_bytes();
-        let session_started = clock.now();
-        let within_time = || {
-            if policy.max_duration().is_some_and(|limit| {
-                clock.now().saturating_duration_since(session_started) >= limit
-            }) {
-                Err("Cloud trial time allowance reached. Received audio is retained; unconfirmed text was not delivered".to_owned())
-            } else {
-                Ok(())
-            }
-        };
-        let connecting_at = Instant::now();
-        let mut socket = transport
-            .connect(settings, key)
-            .map_err(|e| e.to_string())?;
-        within_time()?;
-        socket.send_text(&json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":settings.model,"parameters":{"format":"pcm","sample_rate":16000,"disfluency_removal_enabled":false,"intermediate_result_enabled":false,"keep_dialect":true,"heartbeat":true,"vocabulary":vocabulary},"input":{}}}).to_string()).map_err(|e| e.to_string())?;
-        let mut ready = false;
-        let mut finish_sent = None;
-        let mut sent = 0u64;
-        let mut sentences = BTreeMap::<u64, String>::new();
-        let mut pending = BTreeSet::new();
-        loop {
-            within_time()?;
-            if capture.failure().is_some() {
-                capture.stop();
-            }
-            let captured = capture.outcome();
-            if let Some(audio) = &captured {
-                description = audio.as_ref().map_err(Clone::clone)?.description.clone();
-            }
-            for _ in 0..8 {
-                let Some(raw) = socket.poll().map_err(|e| e.to_string())? else {
-                    break;
-                };
-                if raw.len() > 1024 * 1024 {
-                    return Err(CloudError::Protocol.to_string());
-                }
-                let event: Value =
-                    serde_json::from_str(&raw).map_err(|_| CloudError::Protocol.to_string())?;
-                if event["header"]["task_id"].as_str() != Some(task) {
-                    continue;
-                }
-                let kind = event["header"]["event"]
-                    .as_str()
-                    .ok_or_else(|| CloudError::Protocol.to_string())?;
-                match kind {
-                    "task-started" => ready = true,
-                    "result-generated" if ready => {
-                        ledger
-                            .observe(task, reported_usage(&event["payload"]["usage"]), false)
-                            .map_err(|e| e.to_string())?;
-                        let sentence = &event["payload"]["output"]["sentence"];
-                        if sentence["heartbeat"] == true {
-                            continue;
-                        }
-                        if sentence["sentence_id"].as_u64().is_none()
-                            || sentence["text"].as_str().is_none()
-                            || sentence["sentence_end"].as_bool().is_none()
-                        {
-                            return Err(CloudError::Protocol.to_string());
-                        }
-                        if sentence["sentence_end"] == true {
-                            let id = sentence["sentence_id"]
-                                .as_u64()
-                                .ok_or_else(|| CloudError::Protocol.to_string())?;
-                            let text = sentence["text"]
-                                .as_str()
-                                .ok_or_else(|| CloudError::Protocol.to_string())?;
-                            sentences.insert(id, text.into());
-                            if sentences.len() > 10_000
-                                || sentences.values().map(String::len).sum::<usize>()
-                                    > 4 * 1024 * 1024
-                            {
-                                return Err("The cloud transcript exceeded the bounded text allowance; received audio is retained and no partial result was delivered".into());
-                            }
-                            pending.remove(&id);
-                            stable.store(true, Ordering::Release);
-                        } else if sentence["text"]
-                            .as_str()
-                            .is_some_and(|text| !text.trim().is_empty())
-                        {
-                            let id = sentence["sentence_id"]
-                                .as_u64()
-                                .ok_or_else(|| CloudError::Protocol.to_string())?;
-                            if !sentences.contains_key(&id) {
-                                pending.insert(id);
-                            }
-                            if pending.len() > 10_000 {
-                                return Err(CloudError::Protocol.to_string());
-                            }
-                        }
-                    }
-                    "task-finished" if finish_sent.is_some() => {
-                        ledger
-                            .observe(task, reported_usage(&event["payload"]["usage"]), true)
-                            .map_err(|e| e.to_string())?;
-                        if !pending.is_empty() {
-                            return Err(CloudError::Protocol.to_string());
-                        }
-                        return Ok(SessionResult {
-                            text: sentences.into_values().collect::<Vec<_>>().join(""),
-                            description: format!("{}; {}", settings.description(), description),
-                            timing: Timing {
-                                recognition_ms: Some(elapsed_ms(started_at)),
-                                ..Timing::default()
-                            },
-                            stopped_at: capture.stopped_at(),
-                        });
-                    }
-                    "task-failed" => {
-                        return Err(
-                            provider_failure(event["header"]["error_code"].as_str()).to_string()
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            if ready {
-                if let Some(pcm) = stream.next()? {
-                    if sent.saturating_add(pcm.len() as u64) > max_pcm_bytes {
-                        return Err("Verified upload allowance reached; no unreserved PCM was sent, received audio is retained".into());
-                    }
-                    within_time()?;
-                    socket.send_audio(&pcm).map_err(|e| e.to_string())?;
-                    sent += pcm.len() as u64;
-                }
-                if stream.drained() && captured.is_some() && finish_sent.is_none() {
-                    within_time()?;
-                    socket.send_text(&json!({"header":{"action":"finish-task","task_id":task,"streaming":"duplex"},"payload":{"input":{}}}).to_string()).map_err(|e| e.to_string())?;
-                    finish_sent = Some(Instant::now());
-                }
-            }
-            if (!ready && connecting_at.elapsed() > Duration::from_secs(15))
-                || (finish_sent.is_none()
-                    && capture
-                        .stopped_at()
-                        .is_some_and(|at| at.elapsed() > Duration::from_secs(15)))
-                || finish_sent.is_some_and(|at| at.elapsed() > Duration::from_secs(15))
-            {
-                return Err(CloudError::Timeout.to_string());
-            }
-            thread::sleep(Duration::from_millis(2));
+        },
+    };
+    let session_started = clock.now();
+    // One remote task per attempt. The first task was already reserved by
+    // `start`; a rebuild reserves its own request so retry cost stays visible
+    // and bounded instead of silently reusing a stale charge. Received audio is
+    // replayed from the retained PCM, never from an in-memory copy.
+    let mut next_task = initial_task;
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if let Some(error) = capture.failure() {
+            return Err(device_failure(
+                &capture,
+                capture_failure(&error),
+                timing.clone(),
+            ));
         }
-    })();
-    capture.stop();
-    match (result, capture.wait()) {
-        (Err(error), Err(capture_error)) => Err(format!("{error}. Capture: {capture_error}")),
-        (result, Ok(_)) => result,
-        (Ok(_), Err(capture_error)) => Err(capture_error),
+        let task = match next_task.take() {
+            Some(task) => task,
+            None => {
+                let task = match task_id() {
+                    Ok(task) => task,
+                    Err(error) => {
+                        return Err(blocked_failure(&capture, &link, error, timing.clone()));
+                    }
+                };
+                if let Err(error) = ledger.reserve(&task, segment, settings, policy.clone()) {
+                    return Err(blocked_failure(
+                        &capture,
+                        &link,
+                        error.to_string(),
+                        timing.clone(),
+                    ));
+                }
+                task
+            }
+        };
+        link.connecting();
+        let mut socket = match transport.connect(settings, key) {
+            Ok(socket) => socket,
+            Err(error) if retryable(&error) => {
+                // The session is not failed: the capture keeps saving audio
+                // while the connection is retried with a bounded backoff.
+                recovered = true;
+                link.waiting();
+                if attempts >= MAX_CONNECTION_ATTEMPTS
+                    || clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW
+                {
+                    return Err(blocked_failure(
+                        &capture,
+                        &link,
+                        retry_exhausted(attempts, &error),
+                        timing.clone(),
+                    ));
+                }
+                if let Err(message) =
+                    wait_before_retry(&capture, clock.as_ref(), session_started, attempts)
+                {
+                    return Err(device_failure(&capture, message, timing.clone()));
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(blocked_failure(
+                    &capture,
+                    &link,
+                    error.to_string(),
+                    timing.clone(),
+                ));
+            }
+        };
+        link.streaming();
+        match stream_attempt(
+            &capture,
+            &mut stream,
+            socket.as_mut(),
+            &stable,
+            settings,
+            &task,
+            &policy,
+            ledger,
+            clock.as_ref(),
+            session_started,
+            &vocabulary,
+            &mut description,
+            started_at,
+        ) {
+            Ok(mut result) => {
+                capture.stop();
+                result.recovered = recovered;
+                return Ok(result);
+            }
+            Err(AttemptError::Transient(error)) => {
+                recovered = true;
+                link.waiting();
+                if attempts >= MAX_CONNECTION_ATTEMPTS
+                    || clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW
+                {
+                    return Err(blocked_failure(
+                        &capture,
+                        &link,
+                        retry_exhausted(attempts, &error),
+                        timing.clone(),
+                    ));
+                }
+                if let Err(message) =
+                    wait_before_retry(&capture, clock.as_ref(), session_started, attempts)
+                {
+                    return Err(device_failure(&capture, message, timing.clone()));
+                }
+                // The vendor has no resumable session here, so the whole task is
+                // rebuilt from the retained continuous audio. Never assume a resume
+                // offset: replaying from the start cannot lose a byte, and the
+                // fresh task's text starts empty, so nothing is doubled.
+                if let Err(error) = stream.rewind() {
+                    return Err(blocked_failure(
+                        &capture,
+                        &link,
+                        format!("Cannot re-read the retained audio for recovery: {error}"),
+                        timing.clone(),
+                    ));
+                }
+            }
+            Err(AttemptError::Blocked(message)) => {
+                return Err(blocked_failure(&capture, &link, message, timing.clone()));
+            }
+            Err(AttemptError::Device(message)) => {
+                return Err(device_failure(&capture, message, timing.clone()));
+            }
+        }
     }
 }
+
+/// A failure that retrying cannot fix keeps the capture running and saving audio.
+/// The actionable reason is published immediately; the session only reports a
+/// failure once the user stops the capture (or the device itself fails), and then
+/// keeps the recording available for an explicit retry.
+fn blocked_failure(
+    capture: &Arc<CaptureControl>,
+    link: &LinkState,
+    message: String,
+    timing: Timing,
+) -> SessionFailure {
+    link.blocked(&message);
+    let mut error = message;
+    let retry_audio = loop {
+        if let Some(device) = capture.failure() {
+            capture.stop();
+            error.push_str(&format!(
+                ". The playback device also failed: {device}. Waiting for the network cannot restore this capture"
+            ));
+            break capture.wait().ok();
+        }
+        if capture.is_stopped() {
+            break capture.wait().ok();
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    SessionFailure {
+        error,
+        retry_audio,
+        retry_scope: None,
+        timing,
+    }
+}
+
+fn device_failure(
+    capture: &Arc<CaptureControl>,
+    message: String,
+    timing: Timing,
+) -> SessionFailure {
+    capture.stop();
+    let retry_audio = capture.wait().ok();
+    SessionFailure {
+        error: message,
+        retry_audio,
+        retry_scope: Some(
+            "The playback device failed, so this capture cannot continue; waiting for the network cannot restore it."
+                .into(),
+        ),
+        timing,
+    }
+}
+
+/// How one remote task ended before the whole result was confirmed.
+enum AttemptError {
+    /// A transient connection or service failure; the segment can be rebuilt.
+    Transient(CloudError),
+    /// A failure that retrying cannot fix (credentials, balance, model, protocol,
+    /// budget, storage); the message is user-readable.
+    Blocked(String),
+    /// The playback device itself failed; the capture is over.
+    Device(String),
+}
+
+fn retry_exhausted(attempts: u32, error: &CloudError) -> String {
+    format!(
+        "The cloud connection could not be restored automatically after {attempts} attempt(s): {error}. Received audio is retained on this machine; no unconfirmed text was delivered"
+    )
+}
+
+/// Sleep in bounded slices so a stop or a device failure is noticed promptly.
+fn wait_before_retry(
+    capture: &Arc<CaptureControl>,
+    clock: &dyn TrialClock,
+    session_started: Instant,
+    attempt: u32,
+) -> Result<(), String> {
+    let delay = retry_delay(attempt);
+    let mut waited = Duration::ZERO;
+    while waited < delay {
+        if let Some(error) = capture.failure() {
+            capture.stop();
+            return Err(capture_failure(&error));
+        }
+        let slice = RETRY_POLL.min(delay - waited);
+        thread::sleep(slice);
+        waited += slice;
+        if clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn classify(error: CloudError) -> AttemptError {
+    if retryable(&error) {
+        AttemptError::Transient(error)
+    } else {
+        AttemptError::Blocked(error.to_string())
+    }
+}
+
+fn run_task_text(
+    settings: &AliSettings,
+    task: &str,
+    vocabulary: &serde_json::Map<String, Value>,
+) -> String {
+    json!({
+        "header": {"action":"run-task","task_id":task,"streaming":"duplex"},
+        "payload": {
+            "task_group":"audio","task":"asr","function":"recognition","model":settings.model,
+            "parameters": {
+                "format":"pcm","sample_rate":16000,
+                "disfluency_removal_enabled":false,"intermediate_result_enabled":false,
+                "keep_dialect":true,"heartbeat":true,"vocabulary":vocabulary
+            },
+            "input": {}
+        }
+    })
+    .to_string()
+}
+
+fn finish_task_text(task: &str) -> String {
+    json!({
+        "header": {"action":"finish-task","task_id":task,"streaming":"duplex"},
+        "payload": {"input": {}}
+    })
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_attempt(
+    capture: &Arc<CaptureControl>,
+    stream: &mut PcmStream,
+    socket: &mut dyn MessageSocket,
+    stable: &Arc<AtomicBool>,
+    settings: &AliSettings,
+    task: &str,
+    policy: &TrialCostPolicy,
+    ledger: &TrialLedger,
+    clock: &dyn TrialClock,
+    session_started: Instant,
+    vocabulary: &serde_json::Map<String, Value>,
+    description: &mut String,
+    started_at: Instant,
+) -> Result<SessionResult, AttemptError> {
+    let max_pcm_bytes = policy.max_pcm_bytes();
+    let within_time = || {
+        if policy
+            .max_duration()
+            .is_some_and(|limit| clock.now().saturating_duration_since(session_started) >= limit)
+        {
+            Err(AttemptError::Blocked(
+                "Cloud trial time allowance reached. Received audio is retained; unconfirmed text was not delivered".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    within_time()?;
+    socket
+        .send_text(&run_task_text(settings, task, vocabulary))
+        .map_err(classify)?;
+    let connecting_at = Instant::now();
+    let mut ready = false;
+    let mut finish_sent = None;
+    let mut sent = 0u64;
+    // Text belongs to this attempt only: a rebuilt task regenerates all of it
+    // from the replayed audio, so no sentence from an earlier connection is kept.
+    let mut sentences = BTreeMap::<u64, String>::new();
+    let mut pending = BTreeSet::new();
+    loop {
+        within_time()?;
+        if let Some(error) = capture.failure() {
+            capture.stop();
+            return Err(AttemptError::Device(capture_failure(&error)));
+        }
+        let captured = capture.outcome();
+        if let Some(audio) = &captured {
+            match audio {
+                Ok(audio) => *description = audio.description.clone(),
+                Err(error) => {
+                    return Err(AttemptError::Device(format!(
+                        "The playback capture could not be finished: {error}. Received audio is retained on this machine"
+                    )));
+                }
+            }
+        }
+        for _ in 0..8 {
+            let Some(raw) = socket.poll().map_err(classify)? else {
+                break;
+            };
+            if raw.len() > 1024 * 1024 {
+                return Err(AttemptError::Blocked(CloudError::Protocol.to_string()));
+            }
+            let event: Value = serde_json::from_str(&raw)
+                .map_err(|_| AttemptError::Blocked(CloudError::Protocol.to_string()))?;
+            if event["header"]["task_id"].as_str() != Some(task) {
+                continue;
+            }
+            let kind = event["header"]["event"]
+                .as_str()
+                .ok_or_else(|| AttemptError::Blocked(CloudError::Protocol.to_string()))?;
+            match kind {
+                "task-started" => ready = true,
+                "result-generated" if ready => {
+                    ledger
+                        .observe(task, reported_usage(&event["payload"]["usage"]), false)
+                        .map_err(|error| AttemptError::Blocked(error.to_string()))?;
+                    let sentence = &event["payload"]["output"]["sentence"];
+                    if sentence["heartbeat"] == true {
+                        continue;
+                    }
+                    if sentence["sentence_id"].as_u64().is_none()
+                        || sentence["text"].as_str().is_none()
+                        || sentence["sentence_end"].as_bool().is_none()
+                    {
+                        return Err(AttemptError::Blocked(CloudError::Protocol.to_string()));
+                    }
+                    if sentence["sentence_end"] == true {
+                        let id = sentence["sentence_id"].as_u64().ok_or_else(|| {
+                            AttemptError::Blocked(CloudError::Protocol.to_string())
+                        })?;
+                        let text = sentence["text"].as_str().ok_or_else(|| {
+                            AttemptError::Blocked(CloudError::Protocol.to_string())
+                        })?;
+                        sentences.insert(id, text.into());
+                        if sentences.len() > 10_000
+                            || sentences.values().map(String::len).sum::<usize>() > 4 * 1024 * 1024
+                        {
+                            return Err(AttemptError::Blocked("The cloud transcript exceeded the bounded text allowance; received audio is retained and no partial result was delivered".into()));
+                        }
+                        pending.remove(&id);
+                        stable.store(true, Ordering::Release);
+                    } else if sentence["text"]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        let id = sentence["sentence_id"].as_u64().ok_or_else(|| {
+                            AttemptError::Blocked(CloudError::Protocol.to_string())
+                        })?;
+                        if !sentences.contains_key(&id) {
+                            pending.insert(id);
+                        }
+                        if pending.len() > 10_000 {
+                            return Err(AttemptError::Blocked(CloudError::Protocol.to_string()));
+                        }
+                    }
+                }
+                "task-finished" if finish_sent.is_some() => {
+                    ledger
+                        .observe(task, reported_usage(&event["payload"]["usage"]), true)
+                        .map_err(|error| AttemptError::Blocked(error.to_string()))?;
+                    if !pending.is_empty() {
+                        return Err(AttemptError::Blocked(CloudError::Protocol.to_string()));
+                    }
+                    return Ok(SessionResult {
+                        text: sentences.into_values().collect::<Vec<_>>().join(""),
+                        description: format!(
+                            "{}; {}",
+                            settings.description(),
+                            description.as_str()
+                        ),
+                        timing: Timing {
+                            recognition_ms: Some(elapsed_ms(started_at)),
+                            ..Timing::default()
+                        },
+                        stopped_at: capture.stopped_at(),
+                        // The attempt loop marks any rebuilt result as recovered.
+                        recovered: false,
+                    });
+                }
+                "task-failed" => {
+                    return Err(classify(provider_failure(
+                        event["header"]["error_code"].as_str(),
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if ready {
+            if let Some(pcm) = stream.next().map_err(|error| {
+                AttemptError::Blocked(format!(
+                    "Cannot read the retained audio: {error}. Received audio is retained on this machine"
+                ))
+            })? {
+                if sent.saturating_add(pcm.len() as u64) > max_pcm_bytes {
+                    return Err(AttemptError::Blocked(
+                        "Verified upload allowance reached; no unreserved PCM was sent, received audio is retained".into(),
+                    ));
+                }
+                within_time()?;
+                socket.send_audio(&pcm).map_err(classify)?;
+                sent += pcm.len() as u64;
+            }
+            if stream.drained() && captured.is_some() && finish_sent.is_none() {
+                within_time()?;
+                socket
+                    .send_text(&finish_task_text(task))
+                    .map_err(classify)?;
+                finish_sent = Some(Instant::now());
+            }
+        }
+        if (!ready && connecting_at.elapsed() > Duration::from_secs(15))
+            || (finish_sent.is_none()
+                && capture
+                    .stopped_at()
+                    .is_some_and(|at| at.elapsed() > Duration::from_secs(15)))
+            || finish_sent.is_some_and(|at| at.elapsed() > Duration::from_secs(15))
+        {
+            return Err(AttemptError::Transient(CloudError::Timeout));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A capture failure is not a network wait: the audio source itself is gone, so
+/// the session fails immediately instead of retrying a connection.
+fn capture_failure(reason: &str) -> String {
+    format!(
+        "The playback device was interrupted ({reason}); this capture ended and waiting for the network cannot restore it. Received audio is retained on this machine"
+    )
+}
+fn request_vocabulary(request: &SessionRequest) -> AppResult<serde_json::Map<String, Value>> {
+    let mut vocabulary = serde_json::Map::new();
+    for term in request.glossary.canonical_terms() {
+        if vocabulary.len() >= 2000
+            || (term.is_ascii() && term.split_whitespace().count() > 7)
+            || (!term.is_ascii() && term.chars().count() > 15)
+        {
+            return Err("The capture glossary exceeds Alibaba Message limits (2000 terms, 15 characters for mixed/non-ASCII terms, 7 space-separated words for ASCII terms). Correct the local glossary; no cloud request was sent".into());
+        }
+        vocabulary.insert(term.into(), json!(4));
+    }
+    Ok(vocabulary)
+}
+
+/// The per-capture identity used by the ledger. Retries reuse it so every request
+/// and its cost stay attached to the one recording.
+fn segment_name(directory: &std::path::Path) -> AppResult<String> {
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "Invalid capture directory".to_string())
+}
+
 fn task_id() -> AppResult<String> {
     #[cfg(windows)]
     {

@@ -25,6 +25,10 @@ pub enum SessionState {
     Capturing,
     Stable,
     AwaitingFinal,
+    /// A transient cloud connection failure interrupted this capture. The capture
+    /// itself is still running (or its recording is still saved) and the session is
+    /// retrying in the background; this is not a failed capture.
+    WaitingForNetwork,
     Complete,
     Failed,
 }
@@ -36,6 +40,7 @@ impl SessionState {
             Self::Capturing => "capturing",
             Self::Stable => "stable",
             Self::AwaitingFinal => "awaiting_final",
+            Self::WaitingForNetwork => "waiting_for_network",
             Self::Complete => "complete",
             Self::Failed => "failed",
         }
@@ -69,6 +74,10 @@ pub struct SessionResult {
     pub description: String,
     pub timing: Timing,
     pub stopped_at: Option<Instant>,
+    /// True when this session had to wait for the network and later recovered.
+    /// Such a result is a late result: the application must not write it to the
+    /// target automatically before the late-backfill checks exist (#34).
+    pub recovered: bool,
 }
 
 pub struct SessionFailure {
@@ -323,6 +332,7 @@ impl RecognitionSessions for LocalSessions {
                     description: audio.description,
                     timing,
                     stopped_at: None,
+                    recovered: false,
                 }),
                 Err(error) => SessionUpdate::Failed(SessionFailure {
                     error: format!("Local retry failed: {error}"),
@@ -463,6 +473,7 @@ impl LocalSession {
                     description: audio.description,
                     timing,
                     stopped_at: Some(stopped_at),
+                    recovered: false,
                 }),
                 Err(error) => {
                     let recognized_segments = progress

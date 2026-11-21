@@ -127,6 +127,32 @@ impl Drop for PcmSpoolWriter {
     }
 }
 impl PcmStream {
+    /// Read an already finished continuous recording again. Used only by the
+    /// explicit retry control after the session reported a failure; the complete
+    /// spool is kept on disk until a result is reliably saved.
+    pub fn resume(path: &Path) -> AppResult<Self> {
+        let file = File::open(path)
+            .map_err(|error| format!("Cannot open the retained recording: {error}"))?;
+        let bytes = file
+            .metadata()
+            .map_err(|error| format!("Cannot inspect the retained recording: {error}"))?
+            .len();
+        if bytes == 0 || bytes % 2 != 0 {
+            return Err(
+                "The retained recording is empty or incomplete, so it cannot be recognized again"
+                    .into(),
+            );
+        }
+        let progress = Arc::new(PcmProgress::default());
+        progress.committed.store(bytes, Ordering::Release);
+        progress.received.store(bytes / 2, Ordering::Release);
+        progress.complete.store(true, Ordering::Release);
+        Ok(Self {
+            file,
+            read: 0,
+            progress,
+        })
+    }
     pub(crate) fn next(&mut self) -> AppResult<Option<Vec<u8>>> {
         let bytes = (self.progress.committed.load(Ordering::Acquire) - self.read)
             .min(PCM_CHUNK_BYTES as u64) as usize;
@@ -143,5 +169,15 @@ impl PcmStream {
     pub(crate) fn drained(&self) -> bool {
         self.progress.complete.load(Ordering::Acquire)
             && self.read == self.progress.committed.load(Ordering::Acquire)
+    }
+    /// Re-read the retained spool from its beginning. A vendor without resumable
+    /// sessions is rebuilt from the complete retained audio; nothing is kept in
+    /// memory, so the replay is bounded by the on-disk budget.
+    pub(crate) fn rewind(&mut self) -> AppResult<()> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("Cannot re-read retained PCM: {error}"))?;
+        self.read = 0;
+        Ok(())
     }
 }

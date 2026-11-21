@@ -402,6 +402,9 @@ struct RetainedCapture {
     audio: CapturedAudio,
     directory: PathBuf,
     target: AppResult<Option<Box<dyn Target>>>,
+    /// The 术语表 snapshot fixed when this capture started, so a retry sends the
+    /// same terms even if the file has been edited since.
+    glossary: glossary::Glossary,
 }
 
 enum Completion {
@@ -621,6 +624,14 @@ fn not_delivered(reason: String) -> String {
     )
 }
 
+/// A result that only exists because the session waited for the network and later
+/// recovered is a late result. Until the late-backfill safety checks can prove the
+/// original draft is unchanged (#34), it is never written to the target
+/// automatically; the complete text is saved and shown in the panel instead.
+fn recovered_not_delivered() -> String {
+    "The complete result was recovered after waiting for the network, so it was not written to the original target automatically. The complete text is saved on this machine and shown in the expanded result panel; review and copy it to the intended input. Nothing is sent automatically.".into()
+}
+
 /// Reports what the target actually holds after a failed write, without ever claiming
 /// a complete delivery. The read-back distinguishes a refused write from a truncated
 /// one, a late complete write, and a possibly partial one.
@@ -689,6 +700,8 @@ struct ActiveSession {
     terminal: bool,
     stop_requested: Option<Instant>,
     retry_audio: Option<CapturedAudio>,
+    /// The fixed 术语表 snapshot this capture was started with.
+    glossary: glossary::Glossary,
 }
 
 pub struct Application {
@@ -988,7 +1001,7 @@ impl Application {
             Control::Start if !self.is_capturing() && !self.is_processing() => {
                 let start_requested = Instant::now();
                 if self.retry.is_some() {
-                    self.snapshot.detail = "A failed capture's audio is retained for local retry. Retry local recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
+                    self.snapshot.detail = "A failed capture's audio is retained for retry. Retry recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
                     return;
                 }
                 // Bind once before any UI feedback. Recognition receives neither
@@ -1017,10 +1030,11 @@ impl Application {
                         .join(format!("session-{}-{unique}", std::process::id()));
                     started_directory = Some(directory.clone());
                     let id = self.next_id();
+                    let glossary = self.glossary.clone();
                     let handle = self.sessions.start(SessionRequest {
                         id,
                         directory: directory.clone(),
-                        glossary: self.glossary.clone(),
+                        glossary: glossary.clone(),
                     })?;
                     let status = handle.status();
                     self.snapshot.endpoint = status.endpoint;
@@ -1035,6 +1049,7 @@ impl Application {
                         terminal: false,
                         stop_requested: None,
                         retry_audio: None,
+                        glossary,
                     });
                     Ok::<_, String>(())
                 })();
@@ -1143,14 +1158,14 @@ impl Application {
                     return;
                 }
                 if self.is_capturing() {
-                    self.snapshot.detail = "Still capturing the current playback locally; stop it and wait for the result before retrying.".into();
+                    self.snapshot.detail = "Still capturing the current playback; stop it and wait for the result before retrying.".into();
                     return;
                 }
                 if self.is_processing() {
-                    self.snapshot.detail = "Still processing the current playback locally; wait for the result before retrying.".into();
+                    self.snapshot.detail = "Still processing the current playback; wait for the result before retrying.".into();
                     return;
                 }
-                self.retry_local_recognition();
+                self.retry_retained_recognition();
             }
             Control::CleanupAudio => {
                 if self.snapshot.preparation == Preparation::Pending {
@@ -1195,13 +1210,13 @@ impl Application {
         }
     }
 
-    /// Re-run local recognition over the exact audio kept from a failed attempt.
-    /// This never starts capture, never re-selects a target, and never uses a
-    /// remote service: the only recognizer is the configured local transcriber.
-    fn retry_local_recognition(&mut self) {
+    /// Reprocess the exact audio kept from a failed attempt. This never starts
+    /// capture, never re-selects a target and never asks for the speech to be
+    /// replayed: the configured recognizer processes the same recording again.
+    fn retry_retained_recognition(&mut self) {
         let Some(retry) = self.retry.take() else {
             self.snapshot.retry_available = false;
-            self.snapshot.detail = "No retained audio is available for a local retry, so nothing was recognized and no result was delivered. The current result is unchanged.".into();
+            self.snapshot.detail = "No retained audio is available for a retry, so nothing was recognized and no result was delivered. The current result is unchanged.".into();
             return;
         };
         if !retry.audio.path.is_file() {
@@ -1212,10 +1227,11 @@ impl Application {
             return;
         }
         let id = self.next_id();
+        let glossary = retry.glossary.clone();
         let request = SessionRequest {
             id,
             directory: retry.directory.clone(),
-            glossary: self.glossary.clone(),
+            glossary: glossary.clone(),
         };
         match self.sessions.retry(request, retry.audio.clone()) {
             Ok(handle) => {
@@ -1228,12 +1244,15 @@ impl Application {
                     terminal: false,
                     stop_requested: None,
                     retry_audio: Some(retry.audio),
+                    glossary: retry.glossary,
                 });
                 self.snapshot.phase = Phase::Processing;
                 self.snapshot.recognition = Some(SessionState::AwaitingFinal);
                 self.snapshot.delivery = None;
                 self.snapshot.retry_available = false;
-                self.snapshot.detail = "Retrying recognition locally on the retained audio; no replay is needed and no messages are sent.".into();
+                self.snapshot.detail =
+                    "Retrying recognition on the retained audio; the speech is not replayed."
+                        .into();
             }
             Err(error) => {
                 let directory = retry.directory.clone();
@@ -1264,7 +1283,7 @@ impl Application {
                 self.retry = Some(retry);
                 self.snapshot.retry_available = true;
                 self.snapshot.detail = format!(
-                    "The temporarily retained audio could not be deleted ({error}), so it is still available for a local retry."
+                    "The temporarily retained audio could not be deleted ({error}), so it is still available for a retry."
                 );
             }
         }
@@ -1326,15 +1345,24 @@ impl Application {
                 active.stop_requested = Some(Instant::now());
                 self.snapshot.phase = Phase::Processing;
             }
-            if !active.stopped || preparation_changed {
+            // A transition into waiting-for-network must be visible even after stop,
+            // when the detail is otherwise held stable. A normal local stop keeps the
+            // last capture detail, which carries the backlog/interruption note.
+            let state_changed = self.snapshot.recognition != Some(status.state);
+            let waiting_now = status.state == SessionState::WaitingForNetwork;
+            if !active.stopped || preparation_changed || (waiting_now && state_changed) {
                 self.snapshot.detail = match &self.glossary_note {
                     Some(note) => format!("{}\n{note}", status.detail),
                     None => status.detail,
                 };
             }
-            // A stable sentence remains observable until the next session event;
-            // a status refresh must not turn it into a completed result.
-            if self.snapshot.recognition != Some(SessionState::Stable) || active.stopped {
+            // A stable sentence stays observable until the next session event; a
+            // status refresh must not turn it into a completed result. A waiting or
+            // failed state still supersedes it.
+            let keep_stable = self.snapshot.recognition == Some(SessionState::Stable)
+                && !active.stopped
+                && status.state == SessionState::Capturing;
+            if !keep_stable {
                 self.snapshot.recognition = Some(status.state);
             }
             if let Some(event) = event {
@@ -1378,11 +1406,13 @@ impl Application {
                 active.terminal = true;
                 self.snapshot.recognition = Some(SessionState::Failed);
                 let directory = active.directory.clone();
+                let glossary = active.glossary.clone();
                 let target = std::mem::replace(&mut self.bound_target, Ok(None));
                 let retry = failure.retry_audio.map(|audio| RetainedCapture {
                     audio,
                     directory: directory.clone(),
                     target,
+                    glossary,
                 });
                 let mut timing = failure.timing;
                 timing.preparation_ms = self.snapshot.timing.preparation_ms;
@@ -1408,6 +1438,7 @@ impl Application {
             (control, session) => control.or(session),
         };
         let target = std::mem::replace(&mut self.bound_target, Ok(None));
+        let glossary = active.glossary.clone();
         let current_result = self.runtime.join("current-result.txt");
         let mut timing = result.timing;
         timing.capture_start_ms = self.snapshot.timing.capture_start_ms;
@@ -1415,6 +1446,7 @@ impl Application {
         let (tx, rx) = mpsc::channel();
         self.completion = Some(rx);
         thread::spawn(move || {
+            let recovered = result.recovered;
             let text = result.text;
             let completion = if text.trim().is_empty() {
                 timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
@@ -1441,6 +1473,7 @@ impl Application {
                             audio,
                             directory: directory.clone(),
                             target,
+                            glossary,
                         }),
                         directory,
                         timing,
@@ -1452,6 +1485,9 @@ impl Application {
                             Some(error) => DeliveryOutcome::fallback(not_delivered(format!(
                                 "Could not save the current result: {error}"
                             ))),
+                            None if recovered => {
+                                DeliveryOutcome::fallback(recovered_not_delivered())
+                            }
                             None => deliver(target, &text),
                         };
                         timing.delivery_ms = Some(elapsed_ms(delivery_started));
@@ -1558,7 +1594,7 @@ impl Application {
                 self.record_latency("Failure", &timing, &directory);
                 self.fail(Some(&directory), error);
                 if retryable {
-                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Local retry recognizes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
+                    self.snapshot.detail.push_str("\nThe audio from this capture is retained. Retry processes the same audio again without replaying the speech; the target bound at capture start is kept, or the expanded result panel is used if it is no longer valid.");
                 } else if let Some(scope) = retry_scope {
                     self.snapshot.detail.push_str("\n");
                     self.snapshot.detail.push_str(&scope);
