@@ -45,6 +45,13 @@ pub const ALI_REGION: &str = "cn-beijing";
 
 /// A transient cloud failure is retried with a bounded, growing delay. The
 /// capture owns the received audio meanwhile, so waiting never discards it.
+///
+/// The attempt count is bounded per capture. The time window is bounded per
+/// **outage**: it starts at the first transient failure that is retried, not at
+/// capture start, so a connection that drops after minutes of healthy streaming
+/// still gets a real bounded retry window (a capture-start anchor would make every
+/// late drop fail with zero retries). A later successful connection ends the
+/// outage, so the next drop gets its own window.
 const MAX_CONNECTION_ATTEMPTS: u32 = 8;
 const RETRY_WINDOW: Duration = Duration::from_secs(20);
 const RETRY_BASE: Duration = Duration::from_millis(100);
@@ -708,6 +715,10 @@ fn run(
     // replayed from the retained PCM, never from an in-memory copy.
     let mut next_task = initial_task;
     let mut attempts = 0u32;
+    // Starts at the first transient failure that is retried, so the retry window
+    // belongs to the outage rather than to the capture's age. A successful
+    // connection clears it: the next drop gets a fresh window.
+    let mut retry_window_started: Option<Instant> = None;
     // The last successful transport connect (#38). The first connection happens
     // during capture; the final one is the attempt whose confirmation the stop
     // path waits for.
@@ -746,6 +757,9 @@ fn run(
         let connect_started = Instant::now();
         let mut socket = match transport.connect(settings, key) {
             Ok(socket) => {
+                // The previous outage, if any, is over. A later transient failure
+                // must open a new bounded retry window of its own.
+                retry_window_started = None;
                 connect_ms = Some(elapsed_ms(connect_started));
                 socket
             }
@@ -754,9 +768,7 @@ fn run(
                 // while the connection is retried with a bounded backoff.
                 recovered = true;
                 link.waiting();
-                if attempts >= MAX_CONNECTION_ATTEMPTS
-                    || clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW
-                {
+                if retry_budget_exhausted(attempts, &mut retry_window_started, clock.as_ref()) {
                     return Err(blocked_failure(
                         &capture,
                         &link,
@@ -764,8 +776,9 @@ fn run(
                         timing.clone(),
                     ));
                 }
+                let window_started = retry_window_started.unwrap_or_else(|| clock.now());
                 if let Err(message) =
-                    wait_before_retry(&capture, clock.as_ref(), session_started, attempts)
+                    wait_before_retry(&capture, clock.as_ref(), window_started, attempts)
                 {
                     return Err(device_failure(&capture, message, timing.clone()));
                 }
@@ -805,9 +818,7 @@ fn run(
             Err(AttemptError::Transient(error)) => {
                 recovered = true;
                 link.waiting();
-                if attempts >= MAX_CONNECTION_ATTEMPTS
-                    || clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW
-                {
+                if retry_budget_exhausted(attempts, &mut retry_window_started, clock.as_ref()) {
                     return Err(blocked_failure(
                         &capture,
                         &link,
@@ -815,8 +826,9 @@ fn run(
                         timing.clone(),
                     ));
                 }
+                let window_started = retry_window_started.unwrap_or_else(|| clock.now());
                 if let Err(message) =
-                    wait_before_retry(&capture, clock.as_ref(), session_started, attempts)
+                    wait_before_retry(&capture, clock.as_ref(), window_started, attempts)
                 {
                     return Err(device_failure(&capture, message, timing.clone()));
                 }
@@ -911,11 +923,33 @@ fn retry_exhausted(attempts: u32, error: &CloudError) -> String {
     )
 }
 
+/// Whether a transient failure may still be retried. `window_started` is opened on
+/// the first retried failure of an outage; later failures in the same outage are
+/// measured against that anchor. The attempt count stays bounded per capture, so an
+/// endless failure still stops even when every attempt fails quickly.
+fn retry_budget_exhausted(
+    attempts: u32,
+    window_started: &mut Option<Instant>,
+    clock: &dyn TrialClock,
+) -> bool {
+    if attempts >= MAX_CONNECTION_ATTEMPTS {
+        return true;
+    }
+    match *window_started {
+        Some(started) => clock.now().saturating_duration_since(started) >= RETRY_WINDOW,
+        None => {
+            // First retried failure of this outage: it owns a fresh window.
+            *window_started = Some(clock.now());
+            false
+        }
+    }
+}
+
 /// Sleep in bounded slices so a stop or a device failure is noticed promptly.
 fn wait_before_retry(
     capture: &Arc<CaptureControl>,
     clock: &dyn TrialClock,
-    session_started: Instant,
+    window_started: Instant,
     attempt: u32,
 ) -> Result<(), String> {
     let delay = retry_delay(attempt);
@@ -928,7 +962,7 @@ fn wait_before_retry(
         let slice = RETRY_POLL.min(delay - waited);
         thread::sleep(slice);
         waited += slice;
-        if clock.now().saturating_duration_since(session_started) >= RETRY_WINDOW {
+        if clock.now().saturating_duration_since(window_started) >= RETRY_WINDOW {
             break;
         }
     }
