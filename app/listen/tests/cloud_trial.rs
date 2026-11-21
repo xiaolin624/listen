@@ -530,6 +530,16 @@ fn live_model_protection_and_the_matching_unique_default_workspace_are_required_
         "total":1000000,"expires":"9999-12-31","autoStop":true
     });
     let mut cases = vec![(valid_workspaces.clone(), valid_quota.clone(), true)];
+    // `bl usage free --model ...` wraps the single quota record in a one-element
+    // array on the installed CLI; the live check must read that real shape, and
+    // must still refuse anything that is not exactly one record.
+    cases.push((valid_workspaces.clone(), json!([valid_quota.clone()]), true));
+    cases.push((
+        valid_workspaces.clone(),
+        json!([valid_quota.clone(), valid_quota.clone()]),
+        false,
+    ));
+    cases.push((valid_workspaces.clone(), json!([]), false));
     for (field, value) in [
         ("autoStop", json!(false)),
         ("autoStop", Value::Null),
@@ -1060,7 +1070,33 @@ fn account_errors_are_actionable_and_remote_credentials_or_audio_echoes_are_neve
     assert!(!failure.retained_audio.is_empty());
 }
 
-struct ReserveOnly;
+#[test]
+fn an_unpurchased_model_is_reported_as_model_access_not_a_generic_rejection() {
+    // The live account answered `AccessDenied.Unpurchased` with "Access to model
+    // denied": the free quota exists but the model is not opened for this account,
+    // so the user needs an actionable model-access message, not a generic one.
+    let mut scenario = Scenario::new();
+    let task = scenario.start();
+    scenario
+        .input
+        .send(Ok(json!({"header":{
+        "task_id":task,"event":"task-failed","error_code":"AccessDenied.Unpurchased",
+        "error_message":"Access to model denied. Please make sure you are eligible for using the model."
+    },"payload":{}})
+        .to_string()))
+        .unwrap();
+    let failure = wait(&mut scenario.app, Phase::Failure);
+    assert!(
+        failure.detail.contains("unavailable or not enabled"),
+        "{failure:?}"
+    );
+    assert!(
+        !failure.detail.contains("Access to model denied"),
+        "{failure:?}"
+    );
+    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    assert!(!failure.retained_audio.is_empty());
+}
 
 #[test]
 fn a_persisted_attempt_must_keep_exactly_one_consistent_cost_policy() {
@@ -1143,6 +1179,8 @@ fn a_persisted_attempt_must_keep_exactly_one_consistent_cost_policy() {
         assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
     }
 }
+
+struct ReserveOnly;
 
 impl MessageTransport for ReserveOnly {
     fn verified_bounds(&self, _: &AliSettings) -> Option<VerifiedBounds> {

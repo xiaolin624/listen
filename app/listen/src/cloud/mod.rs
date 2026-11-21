@@ -648,7 +648,11 @@ fn provider_failure(code: Option<&str>) -> CloudError {
             CloudError::Unauthorized
         }
         Some("Arrearage") => CloudError::BillingUnavailable,
-        Some("ModelNotFound" | "NotFound") => CloudError::ModelUnavailable,
+        // The live account answers this when the model's free quota exists but the
+        // model itself is not opened for the account/workspace.
+        Some("ModelNotFound" | "NotFound" | "AccessDenied.Unpurchased") => {
+            CloudError::ModelUnavailable
+        }
         Some("Throttling.RateQuota" | "Throttling.AllocationQuota") => CloudError::RateLimited,
         _ => CloudError::Provider,
     }

@@ -81,8 +81,7 @@ pub(super) fn verify(
     if matching != 1 || defaults != 1 {
         return Err(CloudError::ProtectionUnavailable);
     }
-    let quota = source.quota()?;
-    let quota = parse(&quota)?;
+    let quota = single_record(source.quota()?)?;
     let now = source
         .checked_at()?
         .duration_since(UNIX_EPOCH)
@@ -122,6 +121,18 @@ fn parse(bytes: &[u8]) -> Result<Value, CloudError> {
         return Err(CloudError::ProtectionUnavailable);
     }
     serde_json::from_slice(bytes).map_err(|_| CloudError::ProtectionUnavailable)
+}
+/// The installed CLI prints a one-element array for a single-model free quota.
+/// Accept that real shape (and a bare object for compatibility), but never pick
+/// among several records: an ambiguous answer must not authorize an upload.
+fn single_record(bytes: Vec<u8>) -> Result<Value, CloudError> {
+    match parse(&bytes)? {
+        Value::Array(mut items) if items.len() == 1 => {
+            items.pop().ok_or(CloudError::ProtectionUnavailable)
+        }
+        Value::Array(_) => Err(CloudError::ProtectionUnavailable),
+        record => Ok(record),
+    }
 }
 fn leap(year: u32) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
