@@ -10,7 +10,7 @@ mod free_only;
 #[cfg(windows)]
 mod transport;
 use crate::{
-    AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, elapsed_ms,
+    AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, UsageSummary, elapsed_ms,
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
@@ -381,6 +381,12 @@ impl CloudSessions {
 impl RecognitionSessions for CloudSessions {
     fn requires_valid_glossary(&self) -> bool {
         true
+    }
+    /// The durable trial ledger is the one record of what this tool spent, so the
+    /// summary is read from it rather than accumulated in memory. An unreadable
+    /// ledger is reported as unknown, never as zero.
+    fn usage(&mut self) -> Option<UsageSummary> {
+        Some(self.ledger.usage())
     }
     fn preparation(&mut self) -> RecognitionReadiness {
         let error = self.available().err().map(|e| e.to_string());
