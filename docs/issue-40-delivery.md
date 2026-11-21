@@ -112,6 +112,12 @@
 | 密钥/运行数据/测试环境扫描 | 22 个可扫描文件全部通过；扫描器自检通过 |
 | 包内凭据助手可用性 | `scripts\configure-cloud-trial.ps1 -SelfTest` 输出 `Credential Manager self-test passed; temporary entry removed. No network or paid call was made.` |
 
+最终干净构建（本文件所在提交，工作树干净）的 `manifest.json` 记录 `git_commit` 为该提交、
+`git_dirty_at_package_time=false`；同一 `verify-listen-package.ps1` 结果保持为 15 项必需文件、
+21 个哈希、2 个启动器、22 个扫描文件、本地 `Ready`、无配置云端 `Failure`、合成本地配置
+云端 `Ready`、账本 0 次预留。启动到状态约 1.2–1.5 秒是单机冒烟观测，不是延迟承诺；最终
+JSON 在 `.artifacts\issue-40\package-verify.json`。`--control quit` 退出码 0。
+
 负向探针（证明检查不是空转；均在同一临时包副本内注入后立即删除）：
 
 | 注入内容 | 实际失败信息 |
