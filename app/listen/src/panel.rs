@@ -10,7 +10,7 @@
 
 use listen::{
     Delivery, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot, UsageSummary,
-    streaming::SAMPLE_RATE,
+    storage::StorageLevel, streaming::SAMPLE_RATE,
 };
 
 /// The panel's button availability. `refine` is only enabled when the application
@@ -175,8 +175,9 @@ fn capture_progress(snapshot: &Snapshot) -> String {
 }
 
 /// The panel's label for one segment's state. It is a user-facing fact, never a
-/// number the capsule shows.
-fn segment_label(segment: &SegmentSummary) -> &'static str {
+/// number the capsule shows. The tray's per-segment cleanup submenu reuses it, so
+/// both surfaces describe a segment the same way.
+pub fn segment_label(segment: &SegmentSummary) -> &'static str {
     match segment.state {
         SegmentState::Capturing => "正在采集",
         SegmentState::WaitingForNetwork => "等待联网，已收到的声音保存在这台电脑上",
@@ -318,6 +319,89 @@ fn usage_lines(usage: &UsageSummary) -> Vec<String> {
     ]
 }
 
+/// One amount of bytes for the storage lines. Storage is displayed as a rough size
+/// only; every decision is made in exact bytes by `listen::storage`.
+fn storage_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Whether this segment still has a pending recording or pending result the user may
+/// delete explicitly (#36). The live capture is stopped first, so it is never offered;
+/// a result that was already appended to its target has nothing pending left.
+fn deletable(segment: &SegmentSummary) -> bool {
+    match segment.state {
+        SegmentState::Capturing | SegmentState::NoSpeech => false,
+        SegmentState::WaitingForNetwork | SegmentState::Processing | SegmentState::Failed => true,
+        SegmentState::Result => segment.delivery == Some(Delivery::Fallback),
+    }
+}
+
+/// The capture orders whose pending recording and/or pending result the user may
+/// delete right now, in capture order. This is what the tray's per-segment cleanup
+/// submenu offers; the application repeats the safety checks before deleting.
+pub fn deletable_segments(snapshot: &Snapshot) -> Vec<u64> {
+    snapshot
+        .segments
+        .iter()
+        .filter(|segment| deletable(segment))
+        .map(|segment| segment.sequence)
+        .collect()
+}
+
+/// The storage block for the panel's status area (#36): the warning before the
+/// budget, the two hard stops, and a real write/save failure. A normal measurement
+/// adds no line, so the ordinary flow reads exactly as before.
+pub fn storage_note(snapshot: &Snapshot) -> Option<String> {
+    let status = snapshot.storage.as_ref()?;
+    let mut lines = Vec::new();
+    match status.level() {
+        StorageLevel::Ok => {}
+        StorageLevel::Warning => lines.push(format!(
+            "存储接近待处理音频上限：已用 {}，上限 {}（跨全部段统计，含临时上传、重叠分片和修复文件）。达到上限后会停止开始新的采集，已收到的声音和旧段都会保留；可清理不再需要的段或调整预算。",
+            storage_size(status.pending_audio_bytes),
+            storage_size(status.budget_bytes)
+        )),
+        StorageLevel::Full => lines.push(format!(
+            "待处理音频已达上限：已用 {}，上限 {}。不会再开始新的采集，正在采集的段也会停止；已经收到的声音和旧段都保留在本机，不会被覆盖。清理不需要的段或调高预算后可继续。",
+            storage_size(status.pending_audio_bytes),
+            storage_size(status.budget_bytes)
+        )),
+        StorageLevel::DiskLow => lines.push(format!(
+            "运行目录所在磁盘只剩 {}，低于 {} 底线。不会再开始新的采集；已经收到的声音和旧段都保留在本机。请先释放磁盘空间。这是本机存储问题，不是联网等待或播放设备中断。",
+            status
+                .free_disk_bytes
+                .map(storage_size)
+                .unwrap_or_else(|| "未知".into()),
+            storage_size(status.free_disk_floor_bytes)
+        )),
+    }
+    if let Some(fault) = &status.fault {
+        lines.push(format!(
+            "存储写入失败：{fault}\n这不是联网等待，也不是播放设备中断；录音和已收到的结果仍保留在本机。"
+        ));
+    }
+    if !lines.is_empty() {
+        if snapshot.segments.iter().any(deletable) {
+            lines.push(
+                "可逐段清理：托盘菜单「清理待处理段」，或运行 listen.exe --control delete-segment:<段号>。只删除选定的段，不影响其他未完成内容。"
+                    .into(),
+            );
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 /// Everything the panel's status area shows: state, meaning, the live capture line
 /// while capturing, the application's own human-readable detail, and a note when a
 /// failed preparation blocks new captures. The live line comes before the long
@@ -344,6 +428,11 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     let detail = snapshot.detail.trim();
     if !detail.is_empty() {
         lines.push(detail.to_string());
+    }
+    // The storage bounds are a fact about this machine's pending audio, shown with
+    // their consequence before any older segment's own line.
+    if let Some(note) = storage_note(snapshot) {
+        lines.push(note);
     }
     // The multi-segment block comes after the current operation's detail: it never
     // hides what is happening now, and each older segment keeps its own state.
@@ -514,6 +603,7 @@ mod tests {
             notice: None,
             usage: None,
             segments: Vec::new(),
+            storage: None,
         }
     }
 
@@ -1129,6 +1219,79 @@ mod tests {
         assert_eq!(segments_note(&state), None);
         assert!(!status_text(&state).contains("多段记录"));
         assert_eq!(result_text(&state), "单段完整结果");
+    }
+
+    fn storage(
+        pending: u64,
+        free: Option<u64>,
+        fault: Option<&str>,
+    ) -> listen::storage::StorageStatus {
+        listen::storage::StorageStatus {
+            pending_audio_bytes: pending,
+            budget_bytes: 1_000,
+            warning_at_bytes: 800,
+            free_disk_bytes: free,
+            free_disk_floor_bytes: 500,
+            text_bytes: 0,
+            text_budget_bytes: 4_000,
+            fault: fault.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn storage_lines_warn_before_the_limit_and_name_both_hard_stops_and_a_real_fault() {
+        let mut state = snapshot(Phase::Ready, Preparation::Ready);
+        assert_eq!(storage_note(&state), None, "a normal measurement is quiet");
+        state.storage = Some(storage(100, Some(5_000), None));
+        assert_eq!(storage_note(&state), None);
+
+        state.storage = Some(storage(850, Some(5_000), None));
+        let warning = storage_note(&state).expect("a warning line");
+        assert!(warning.contains("接近待处理音频上限"), "{warning}");
+        assert!(warning.contains("停止开始新的采集"), "{warning}");
+
+        state.storage = Some(storage(1_000, Some(5_000), None));
+        let full = storage_note(&state).expect("a full line");
+        assert!(full.contains("已达上限"), "{full}");
+        assert!(full.contains("已经收到的声音和旧段都保留"), "{full}");
+
+        state.storage = Some(storage(10, Some(500), None));
+        let disk_low = storage_note(&state).expect("a disk line");
+        assert!(disk_low.contains("磁盘"), "{disk_low}");
+        assert!(disk_low.contains("低于"), "{disk_low}");
+        assert!(disk_low.contains("不是联网等待"), "{disk_low}");
+
+        state.storage = Some(storage(
+            10,
+            Some(5_000),
+            Some("Storage fault: Could not save the complete result (disk full)."),
+        ));
+        let faulted = storage_note(&state).expect("a fault line even at a normal level");
+        assert!(faulted.contains("存储写入失败"), "{faulted}");
+        assert!(faulted.contains("不是联网等待"), "{faulted}");
+        assert!(faulted.contains("播放设备中断"), "{faulted}");
+    }
+
+    #[test]
+    fn only_segments_that_still_have_pending_work_are_offered_for_explicit_deletion() {
+        let mut state = snapshot(Phase::Capturing, Preparation::Ready);
+        state.segments = vec![
+            segment(1, SegmentState::Result, "已交付", Some(Delivery::Appended)),
+            segment(2, SegmentState::Result, "待取", Some(Delivery::Fallback)),
+            segment(3, SegmentState::WaitingForNetwork, "", None),
+            segment(4, SegmentState::Processing, "", None),
+            segment(5, SegmentState::Failed, "", None),
+            segment(6, SegmentState::NoSpeech, "", None),
+            segment(7, SegmentState::Capturing, "", None),
+        ];
+        assert_eq!(deletable_segments(&state), vec![2, 3, 4, 5]);
+
+        // The cleanup hint only appears where it can act.
+        state.storage = Some(storage(850, Some(5_000), None));
+        let note = storage_note(&state).expect("a warning line");
+        assert!(note.contains("delete-segment:"), "{note}");
+        let no_pending = snapshot(Phase::Result, Preparation::Ready);
+        assert!(deletable_segments(&no_pending).is_empty());
     }
 
     #[test]

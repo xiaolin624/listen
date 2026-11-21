@@ -20,6 +20,7 @@ pub mod recognition;
 pub(crate) mod segments;
 #[cfg(windows)]
 pub mod sensevoice;
+pub mod storage;
 pub mod streaming;
 pub mod usage;
 pub use usage::UsageSummary;
@@ -37,6 +38,7 @@ use recognition::{
     SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
 };
 use segments::SegmentStore;
+use storage::Storage;
 use streaming::{CaptureProgress, SegmentStream};
 
 pub type AppResult<T> = Result<T, String>;
@@ -208,6 +210,11 @@ pub enum Control {
     Toggle,
     Retry,
     CleanupAudio,
+    /// Explicitly delete the pending recording and/or pending result of exactly one
+    /// capture order, at the user's request (#36). Every other segment, including
+    /// unfinished work, is untouched; a segment that is still recovering is stopped
+    /// safely first, and its late events can never recreate it.
+    DeleteSegment(u64),
     /// 精修: ask the configured text-refine port to correct the complete current
     /// result and replace only the transcript that was appended from it.
     Refine,
@@ -287,6 +294,10 @@ pub enum Notice {
     /// It is a reminder only: nothing was stopped, cancelled, purchased or raised,
     /// and the capture flow is unaffected.
     UsageReminder,
+    /// Pending capture audio is approaching the configured budget (#36). Capture
+    /// still works; the reminder names the consequence so the user can clean up or
+    /// raise the limit before the hard stop.
+    StorageWarning,
 }
 
 impl Notice {
@@ -301,6 +312,7 @@ impl Notice {
                 "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
             ),
             Notice::UsageReminder => "本月云端识别费用估计已达每月 100 元提醒线。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
+            Notice::StorageWarning => "待处理录音已接近缓存上限。达到上限或磁盘余量低于底线时，Listen 会停止开始新的采集并保留已经收到的声音和旧段；可清理不再需要的段，或调整待处理音频预算。".into(),
         }
     }
 }
@@ -409,6 +421,11 @@ pub struct Snapshot {
     /// its own entry and its own complete text; `text` above is only the newest
     /// complete result.
     pub segments: Vec<SegmentSummary>,
+    /// The measured storage conditions (#36): pending audio across every segment,
+    /// the configured budget and warning line, free disk against the floor, the
+    /// separate saved-text bound and the last real storage fault. `None` only in a
+    /// synthetic snapshot that was never produced by an `Application`.
+    pub storage: Option<storage::StorageStatus>,
 }
 
 impl Snapshot {
@@ -515,6 +532,10 @@ struct SegmentSession {
     state: SegmentState,
     session_state: SessionState,
     detail: String,
+    /// Set only when the storage bounds stopped this segment's capture (#36). It is
+    /// kept with the segment so a later progress detail cannot erase why capture
+    /// stopped, and it is never mistaken for a network wait.
+    storage_note: Option<String>,
     endpoint: Option<CaptureEndpoint>,
     progress: CaptureProgress,
     capture_start_ms: Option<u64>,
@@ -996,6 +1017,9 @@ pub struct Application {
     /// started write and its confirmed outcome off the UI thread.
     delivery: Arc<DeliveryLedger>,
     record_problem: Option<String>,
+    /// The configured storage bounds and the injected free-space probe (#36). All
+    /// accounting decisions go through this one module.
+    storage: Storage,
     next_session_id: u64,
     /// The highest capture order whose complete text is the current result. An older
     /// segment that completes later must never overwrite it.
@@ -1103,6 +1127,7 @@ impl Application {
                 notice: None,
                 usage: None,
                 segments: Vec::new(),
+                storage: None,
             },
             sessions,
             runtime,
@@ -1110,6 +1135,7 @@ impl Application {
             store,
             delivery,
             record_problem: delivery_problem,
+            storage: Storage::new(),
             next_session_id: 0,
             current_sequence: 0,
             completion_tx,
@@ -1131,8 +1157,47 @@ impl Application {
         // The durable ledger already exists before the first capture, so the cost
         // this tool has accumulated is readable immediately and after a restart.
         // This is also the one safe place to raise an already-reached reminder.
+        application.refresh_storage();
         application.refresh_usage();
         application
+    }
+
+    /// Apply an explicit storage policy (#36). The default is a 1 GiB pending-audio
+    /// budget, a 1 GiB free-disk floor and a warning at four fifths of the budget.
+    pub fn with_storage_policy(mut self, policy: storage::StoragePolicy) -> Self {
+        self.storage.set_policy(policy);
+        self.refresh_storage();
+        self
+    }
+
+    /// Replace the free-space probe. Production reads the runtime volume; tests
+    /// inject a value so storage conditions are a state, never real disk pressure.
+    pub fn with_free_space(mut self, free_space: Arc<dyn storage::FreeSpace>) -> Self {
+        self.storage.set_free_space(free_space);
+        self.refresh_storage();
+        self
+    }
+
+    /// Measure the storage bounds and publish them beside the capture state. A
+    /// warning is recorded once as a [`Notice`] and disappears when the measurement
+    /// falls back below the warning line; a real storage fault is carried separately
+    /// and is never turned into a network wait.
+    fn refresh_storage(&mut self) {
+        let status = self.storage.status(&self.runtime);
+        self.apply_storage_status(status);
+    }
+
+    fn apply_storage_status(&mut self, status: storage::StorageStatus) {
+        if status.near_limit() && !status.blocking() {
+            if self.snapshot.notice.is_none()
+                || matches!(self.snapshot.notice, Some(Notice::StorageWarning))
+            {
+                self.snapshot.notice = Some(Notice::StorageWarning);
+            }
+        } else if matches!(self.snapshot.notice, Some(Notice::StorageWarning)) {
+            self.snapshot.notice = None;
+        }
+        self.snapshot.storage = Some(status);
     }
 
     /// The segment whose capture is still running. The playback device admits one
@@ -1580,6 +1645,10 @@ impl Application {
                 }
                 self.cleanup_failed_audio();
             }
+            // An explicit per-segment delete never waits for the whole backlog: it
+            // removes exactly the selected segment's pending recording/result and
+            // stops its later processing safely.
+            Control::DeleteSegment(sequence) => self.delete_segment(sequence),
             // A Start while a capture is live is about the live capture, whatever
             // older segments are doing; it must say so instead of reporting them.
             Control::Start => {
@@ -1605,6 +1674,9 @@ impl Application {
                 }
             }
         }
+        // Storage measurements change with every action (a completed segment may
+        // release its audio, a delete may free it); publish the fresh values.
+        self.refresh_storage();
         self.segments_dirty = true;
         self.refresh_segments();
     }
@@ -1615,6 +1687,19 @@ impl Application {
         let start_requested = Instant::now();
         if self.any_retained() {
             self.snapshot.detail = "A failed capture's audio is retained for retry. Retry recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
+            return;
+        }
+        // Storage is checked before the target is bound and before any session
+        // directory exists: over the pending-audio budget or at/below the free-disk
+        // floor, no capture may start and nothing may be overwritten.
+        let storage_status = self.storage.status(&self.runtime);
+        if let Some(refusal) = storage::start_refusal(&storage_status) {
+            self.apply_storage_status(storage_status);
+            self.snapshot.phase = Phase::Failure;
+            self.snapshot.recognition = Some(SessionState::Failed);
+            self.snapshot.detail = refusal;
+            self.segments_dirty = true;
+            self.refresh_segments();
             return;
         }
         // Bind once before any UI feedback. Recognition receives neither the target
@@ -1676,6 +1761,7 @@ impl Application {
                     state: SegmentState::Capturing,
                     session_state: status.state,
                     detail: status.detail.clone(),
+                    storage_note: None,
                     endpoint: status.endpoint.clone(),
                     progress: status.progress.clone(),
                     capture_start_ms,
@@ -1709,6 +1795,10 @@ impl Application {
                 if let Some(error) = record_error {
                     self.note_record_problem(error);
                 }
+                // A capture that started means the storage state is usable again;
+                // the next real write failure will set a new fault.
+                self.storage.clear_fault();
+                self.refresh_storage();
             }
             Err(error) => {
                 self.snapshot.recognition = Some(SessionState::Failed);
@@ -1901,6 +1991,197 @@ impl Application {
         self.persist_segment(index);
     }
 
+    /// Explicitly delete exactly one segment's pending recording and/or pending
+    /// result (#36). Nothing else is touched. A segment that is still recovering is
+    /// stopped and its session handle dropped first, so a late event can never
+    /// recreate the entry or write to a target. A segment whose delivery is already
+    /// writing to its target is refused, so a delete can never race a target write.
+    fn delete_segment(&mut self, sequence: u64) {
+        let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.sequence == sequence)
+        else {
+            self.snapshot.detail = format!(
+                "No segment {sequence} is recorded, so nothing was deleted. The current result and every other segment are unchanged."
+            );
+            return;
+        };
+        if self.segments[index].handle.is_some()
+            && !self.segments[index].stopped
+            && !self.segments[index].terminal
+        {
+            self.snapshot.detail = format!(
+                "Segment {sequence} is still being captured. Stop it before deleting; nothing was deleted and capture continues."
+            );
+            return;
+        }
+        if self.segments[index].finalizing {
+            self.snapshot.detail = format!(
+                "Segment {sequence}'s complete result is being written to its target right now. Wait for that write to finish before deleting; nothing was deleted."
+            );
+            return;
+        }
+        if self.refine_job.is_some() {
+            // The refine worker owns the current result's delivery memory and may
+            // still write the refined text; deleting under it could bring the text
+            // back after the delete.
+            self.snapshot.detail = format!(
+                "A refine request is still running for the current result. Wait for it to finish before deleting segment {sequence}; nothing was deleted."
+            );
+            return;
+        }
+        let segment = &self.segments[index];
+        let pending_payload = segment.state.in_flight()
+            || segment.state == SegmentState::Failed
+            || (segment.state == SegmentState::Result
+                && segment.delivery == Some(Delivery::Fallback))
+            || segment.retained.is_some()
+            || !segment.retained_paths.is_empty();
+        if !pending_payload {
+            self.snapshot.detail = format!(
+                "Segment {sequence} has no pending recording or pending result to delete (its result was already delivered), so nothing was deleted. The text already in the target is untouched and the current result is unchanged."
+            );
+            return;
+        }
+        let directory = self.segments[index].directory.clone();
+        let text_name = SegmentStore::text_name(sequence);
+        let primary = index + 1 == self.segments.len();
+        let current = sequence == self.current_sequence;
+        let had_text = self.segments[index].text.is_some();
+        // Stop this segment's later processing first, then close its event channel by
+        // dropping the handle. A confirmation or failure already in flight can no
+        // longer reach the application, so it cannot resurrect this segment.
+        if let Some(mut handle) = self.segments[index].handle.take() {
+            handle.stop();
+            self.segments[index].terminal = true;
+        }
+        let mut problem: Option<String> = None;
+        if let Err(error) = fs::remove_dir_all(&directory) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                problem = Some(format!("its audio could not be deleted ({error})"));
+            }
+        }
+        if let Err(error) = fs::remove_file(self.runtime.join(&text_name)) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                let text_problem = format!("its saved text could not be deleted ({error})");
+                problem = Some(match problem {
+                    Some(existing) => format!("{existing}; {text_problem}"),
+                    None => text_problem,
+                });
+            }
+        }
+        if let Some(problem) = problem {
+            // Keep the segment and its durable record so the user can try again;
+            // every other segment is still untouched. Its session is already gone,
+            // so it must not keep claiming that it is still processing.
+            if self.segments[index].state.in_flight() {
+                self.segments[index].state = SegmentState::Failed;
+                self.segments[index].session_state = SessionState::Failed;
+            }
+            self.segments[index].retained_paths = audio_paths(&directory);
+            self.segments[index].detail = format!(
+                "Segment {sequence} could not be completely deleted: {problem}. Its record and remaining files are kept; every other segment is unchanged."
+            );
+            self.persist_segment(index);
+            self.snapshot.detail = self.segments[index].detail.clone();
+            self.refresh_recovery_snapshot();
+            return;
+        }
+        self.segments.remove(index);
+        self.segments_dirty = true;
+        if let Err(error) = self.store.remove(sequence) {
+            self.note_record_problem(error);
+        }
+        // A deleted segment can never be retried, so its stop-time draft reference
+        // must not survive to judge a future result (#34).
+        self.delivery.forget(sequence);
+        if current {
+            // The deleted pending result must not come back as the current result
+            // after a restart, so the durable copy is cleared as well.
+            self.snapshot.text = String::new();
+            self.snapshot.delivery = None;
+            self.snapshot.refined_text = None;
+            self.delivery_memory = None;
+            self.snapshot.refine = Refine::Unavailable(
+                "The deleted segment's result is no longer the current result. Other pending results stay in the expanded panel."
+                    .into(),
+            );
+            if let Err(error) = cloud::persist_result(&self.runtime.join("current-result.txt"), b"")
+            {
+                self.note_record_problem(format!(
+                    "Could not clear current-result.txt after deleting segment {sequence}: {error}"
+                ));
+            }
+        }
+        if primary {
+            if self.is_processing() {
+                self.snapshot.phase = Phase::Processing;
+                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+            } else if !self.is_capturing() {
+                self.snapshot.phase = Phase::Ready;
+                self.snapshot.recognition = None;
+            }
+        }
+        let what = if had_text {
+            "its pending recording and pending result are"
+        } else {
+            "its pending recording is"
+        };
+        let mut detail = format!(
+            "Segment {sequence} was deleted at your request: {what} gone. Every other segment's audio, result and record is untouched."
+        );
+        if current {
+            detail.push_str(
+                " It was the current result, so it is no longer shown as the current result.",
+            );
+        }
+        self.snapshot.detail = detail;
+        self.refresh_recovery_snapshot();
+    }
+
+    /// Stop a live capture when the pending-audio budget or the free-disk floor is
+    /// reached. The received audio stays on disk and the segment still finishes
+    /// normally: the application never pretends to keep recording into a full store.
+    fn check_storage_pressure(&mut self) {
+        let status = self.storage.status(&self.runtime);
+        if status.blocking() {
+            if let Some(index) = self.capturing_index() {
+                let reason = storage::capture_stopped_detail(&status);
+                self.stop_capture_for_storage(index, &reason);
+            }
+        }
+        self.apply_storage_status(status);
+    }
+
+    fn stop_capture_for_storage(&mut self, index: usize, reason: &str) {
+        let primary = index + 1 == self.segments.len();
+        {
+            let segment = &mut self.segments[index];
+            if segment.stopped {
+                return;
+            }
+            segment.stopped = true;
+            segment.stop_requested = Some(Instant::now());
+            segment.state = SegmentState::Processing;
+            segment.storage_note = Some(reason.to_string());
+            segment.detail = reason.to_string();
+            if let Some(handle) = segment.handle.as_mut() {
+                handle.stop();
+            }
+        }
+        if primary {
+            self.snapshot.phase = Phase::Processing;
+            self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+            self.snapshot.detail = reason.to_string();
+        }
+        // A storage stop is still a stop: a later late result is judged against the
+        // draft read now (#34), not against one taken a poll later.
+        self.capture_stop_draft(index);
+        self.persist_segment(index);
+        self.mark_usage_pending();
+    }
+
     pub fn poll(&mut self) {
         if let Some(job) = &self.refine_job {
             match job.try_recv() {
@@ -1992,6 +2273,10 @@ impl Application {
         if let Some((_, delivered)) = self.deliveries.pop_first() {
             self.apply_delivery(delivered);
         }
+        // Measure storage after statuses, events and deliveries: a segment that just
+        // released its audio no longer counts, and a budget that is reached while
+        // recording stops the capture instead of pretending it still works.
+        self.check_storage_pressure();
         // Cost summaries and per-segment cost are read only once no recognition
         // session is alive, so the ledger's admission lock is never contended.
         self.flush_deferred_usage();
@@ -2014,10 +2299,18 @@ impl Application {
     ) {
         let primary = index + 1 == self.segments.len();
         let previous_state = self.segments[index].state;
+        // A storage stop's reason is kept beside the adapters' own progress detail,
+        // so a later status refresh cannot silently turn it back into a normal
+        // capture message.
+        let mut detail = status.detail.clone();
+        if let Some(note) = &self.segments[index].storage_note {
+            detail.push('\n');
+            detail.push_str(note);
+        }
         {
             let segment = &mut self.segments[index];
             segment.session_state = status.state;
-            segment.detail = status.detail.clone();
+            segment.detail = detail.clone();
             // A retry processes the already captured audio; keep that capture's
             // route/progress rather than reporting a new unidentified device.
             if segment.retry_audio.is_none() {
@@ -2074,8 +2367,8 @@ impl Application {
         let waiting_now = status.state == SessionState::WaitingForNetwork;
         if !self.segments[index].stopped || preparation_changed || (waiting_now && state_changed) {
             self.snapshot.detail = match &self.glossary_note {
-                Some(note) => format!("{}\n{note}", status.detail),
-                None => status.detail,
+                Some(note) => format!("{detail}\n{note}"),
+                None => detail,
             };
         }
         // A stable sentence stays observable until the next session event; a status
@@ -2153,6 +2446,10 @@ impl Application {
     /// Only the newest complete result is mirrored to `current-result.txt`, so an
     /// older segment that finishes late cannot overwrite it.
     fn save_complete_text(&mut self, sequence: u64, text: &str, current: bool) -> AppResult<()> {
+        // Saved text has its own bound, independent of the pending-audio budget: a
+        // full audio store never blocks saving text, and a text over its own bound
+        // is a storage fault that keeps the audio as the recovery basis.
+        self.storage.check_text_budget(&self.runtime, text)?;
         let name = self.store.write_text(sequence, text)?;
         if let Some(record) = self.store.record_mut(sequence) {
             record.text_file = Some(name);
@@ -2168,6 +2465,8 @@ impl Application {
             cloud::persist_result(&self.runtime.join("current-result.txt"), text.as_bytes())
                 .map_err(|error| format!("Could not save the current result: {error}"))?;
         }
+        // A complete result saved durably means storage is writable again.
+        self.storage.clear_fault();
         Ok(())
     }
 
@@ -2409,6 +2708,13 @@ impl Application {
     /// changes nothing the capsule shows; only the newest segment can move the
     /// global phase to `Failure`.
     fn fail_segment(&mut self, index: usize, error: String, timing: Timing) {
+        // A local write/save failure is presented as a storage fault, not as a
+        // network wait or a playback-device interruption. The recorded fault stays
+        // observable in `Snapshot::storage` until a later write succeeds.
+        let error = match storage::storage_fault_message(&error) {
+            Some(message) => self.storage.note_fault(message),
+            None => error,
+        };
         let directory = self.segments[index].directory.clone();
         let paths = audio_paths(&directory);
         let partial = fs::read_to_string(directory.join("partial-result.txt"))

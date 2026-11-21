@@ -110,6 +110,7 @@ mod tests {
             notice: None,
             usage: None,
             segments: Vec::new(),
+            storage: None,
         }
     }
 
