@@ -85,7 +85,11 @@
 8. `quitting_does_not_wait_for_the_cloud_and_the_next_launch_recovers_the_capture`：云端一直不返回时
    `prepare_exit` 在限定时间内返回、录音已带结束标记落盘；下次启动恢复同一段并补出结果，旧目标不变。
 
-另有 `src/segments.rs` 1 个单元测试：没有术语快照字段的旧版索引仍可读取（空快照）。
+另有：
+
+- `src/segments.rs` 1 个单元测试：没有术语快照字段的旧版索引仍可读取（空快照）；
+- `src/panel.rs` 1 个单元测试：`uncertain` 交付既不显示为“尚未写入任何输入框”，也不像普通追加，
+  仍作为待取结果可删除、可在需要时自动展开面板。
 
 ## 验证命令与结果
 
@@ -94,7 +98,7 @@
 .\scripts\build-listen.ps1 -Task CheckFormat
 ```
 
-离线、锁定依赖构建与测试通过：**288 passed / 0 failed / 17 ignored**（忽略项都是需要真实模型、真实
+离线、锁定依赖构建与测试通过：**289 passed / 0 failed / 17 ignored**（忽略项都是需要真实模型、真实
 密钥或操作员编辑器的既有测试，不计为通过）。`cargo fmt --check` 通过。
 
 ## 与 #38（200e9ef）合并后的核对

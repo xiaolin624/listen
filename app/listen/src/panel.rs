@@ -668,6 +668,49 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_result_whose_write_may_have_happened_is_not_shown_as_a_plain_panel_fallback() {
+        // #35: after a restart an unknown delivery must never read like "nothing was
+        // written" and never like "already appended".
+        let uncertain = result("重启后恢复的完整结果", Delivery::Uncertain);
+        let shown = text(&uncertain);
+        assert!(
+            shown.starts_with("已完成：是否已写入目标无法确认"),
+            "{shown}"
+        );
+        assert!(shown.contains("没有再次写入"), "{shown}");
+        assert!(shown.contains("请先检查原目标"), "{shown}");
+        assert!(
+            !shown.contains("尚未写入任何输入框"),
+            "an unknown write is not a proven fallback: {shown}"
+        );
+        assert_ne!(
+            shown,
+            text(&result("重启后恢复的完整结果", Delivery::Fallback))
+        );
+
+        // It still counts as a result the user must take or check, and it is offered
+        // for explicit cleanup like any other pending result.
+        let mut state = result("重启后恢复的完整结果", Delivery::Uncertain);
+        state.segments = vec![
+            segment(1, SegmentState::Result, "旧结果", Some(Delivery::Uncertain)),
+            segment(
+                2,
+                SegmentState::Result,
+                "当前结果",
+                Some(Delivery::Appended),
+            ),
+        ];
+        state.text = "当前结果".into();
+        assert_eq!(pending_results(&state).len(), 1);
+        assert_eq!(deletable_segments(&state), vec![1]);
+        assert_eq!(
+            auto_open_key(&state).as_deref(),
+            Some("uncertain:当前结果"),
+            "an uncertain result is not hidden behind a calm appended delivery"
+        );
+    }
+
+    #[test]
     fn no_speech_says_nothing_was_delivered_and_keeps_the_previous_result_visible() {
         let mut state = snapshot(Phase::NoSpeech, Preparation::Ready);
         state.text = "上一次的结果".into();
