@@ -16,7 +16,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -767,13 +767,21 @@ struct Scenario {
 }
 impl Scenario {
     fn new() -> Self {
+        Self::build(None)
+    }
+    /// A scenario whose retry accounting reads the test's clock, so a pending
+    /// retry can be held open while its user-visible state is asserted.
+    fn with_clock(clock: Arc<dyn TrialClock>) -> Self {
+        Self::build(Some(clock))
+    }
+    fn build(clock: Option<Arc<dyn TrialClock>>) -> Self {
         let runtime = Runtime::new();
         let playback = Arc::new(Playback::default());
         let editor = Arc::new(Editor(Mutex::new("protected draft".into())));
         let (input, incoming) = mpsc::channel();
         let (output, outgoing) = mpsc::channel();
         let ledger = TrialLedger::new(runtime.0.join("shared-ledger"));
-        let sessions = CloudSessions::new(
+        let mut sessions = CloudSessions::new(
             Arc::new(Device(playback.clone())),
             Arc::new(Remote {
                 inbound: Mutex::new(Some(incoming)),
@@ -783,6 +791,9 @@ impl Scenario {
             AliSettings::beijing("offline-workspace".into()),
             ledger.clone(),
         );
+        if let Some(clock) = clock {
+            sessions = sessions.with_clock(clock);
+        }
         let app = Application::with_recognition_sessions(
             Box::new(sessions),
             runtime.0.join("app"),
@@ -835,9 +846,79 @@ impl Scenario {
     }
 }
 
+/// A clock whose retry accounting the test can hold.
+///
+/// On a transient failure the cloud worker publishes `WaitingForNetwork` and only
+/// then reads `TrialClock::now()` to open the retry window. When armed, this clock
+/// parks that read, so the real user-visible waiting state stays published while
+/// the test asserts it instead of being sampled inside a ~100 ms wall-clock window
+/// that a loaded test thread can miss while the product is behaving correctly.
+struct HeldRetryClock {
+    now: Instant,
+    park: Mutex<Park>,
+    reached: Condvar,
+    released: Condvar,
+}
+#[derive(Default)]
+struct Park {
+    armed: bool,
+    reached: bool,
+    released: bool,
+}
+impl HeldRetryClock {
+    fn new() -> Self {
+        Self {
+            now: Instant::now(),
+            park: Mutex::new(Park::default()),
+            reached: Condvar::new(),
+            released: Condvar::new(),
+        }
+    }
+    /// Arm the hold before the drop is injected: the worker is then still polling
+    /// the socket, and the next clock read is the retry accounting itself.
+    fn hold(&self) {
+        self.park.lock().unwrap().armed = true;
+    }
+    /// Bounded wait for the worker to reach the held read, so a product change
+    /// fails the test instead of hanging it.
+    fn wait_held(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut park = self.park.lock().unwrap();
+        while !park.reached {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            park = self.reached.wait_timeout(park, left).unwrap().0;
+        }
+        true
+    }
+    fn release(&self) {
+        self.park.lock().unwrap().released = true;
+        self.released.notify_all();
+    }
+}
+impl TrialClock for HeldRetryClock {
+    fn now(&self) -> Instant {
+        let mut park = self.park.lock().unwrap();
+        if park.armed {
+            park.armed = false;
+            park.reached = true;
+            self.reached.notify_all();
+            while !park.released {
+                park = self.released.wait(park).unwrap();
+            }
+        }
+        self.now
+    }
+}
+
 #[test]
 fn stable_sentences_and_wrong_task_acknowledgments_cannot_deliver_after_connection_loss() {
-    let mut scenario = Scenario::new();
+    // The pending retry is held open on an injected clock read, so the waiting
+    // state is observed deterministically rather than raced against its backoff.
+    let clock = Arc::new(HeldRetryClock::new());
+    let mut scenario = Scenario::with_clock(clock.clone());
     let task = scenario.start();
     scenario.sentence(
         &task,
@@ -854,19 +935,30 @@ fn stable_sentences_and_wrong_task_acknowledgments_cannot_deliver_after_connecti
     scenario.send("another-task", "task-finished", json!({}));
     // The connection drops after stop. The session waits and retries instead of
     // ending the capture, and nothing unconfirmed is delivered meanwhile.
+    clock.hold();
     scenario.input.send(Err(CloudError::Network)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        scenario.app.poll();
-        let state = scenario.app.snapshot();
-        if state.recognition == Some(listen::recognition::SessionState::WaitingForNetwork) {
-            assert_eq!(state.phase, Phase::Processing);
-            break;
-        }
-        assert!(Instant::now() < deadline, "{state:?}");
-        thread::sleep(Duration::from_millis(2));
-    }
+    assert!(
+        clock.wait_held(Duration::from_secs(5)),
+        "the retry accounting never read the injected clock after the drop"
+    );
+    // The worker is parked on that read, so this state is stable and real: the
+    // wait is published to the user, the capture has not failed, and nothing was
+    // delivered.
+    scenario.app.poll();
+    let waiting = scenario.app.snapshot();
+    assert_eq!(
+        waiting.recognition,
+        Some(listen::recognition::SessionState::WaitingForNetwork),
+        "{waiting:?}"
+    );
+    assert_eq!(waiting.phase, Phase::Processing);
+    assert!(
+        waiting.detail.contains("Waiting for the network"),
+        "{waiting:?}"
+    );
+    assert!(waiting.text.is_empty());
     assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    clock.release();
     // A second paid request cannot be reserved inside the shared cap, so the
     // bounded automatic recovery stops without delivering anything. The recording
     // stays available for an explicit retry once the user decides to spend again.
