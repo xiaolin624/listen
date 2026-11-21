@@ -26,6 +26,17 @@ impl CaptureControl {
             changed: Condvar::new(),
         })
     }
+    /// The already finished boundary for a retry of retained audio. There is no
+    /// device anymore, but the stop boundary and the complete outcome are known.
+    pub fn retained(audio: CapturedAudio) -> Arc<Self> {
+        Arc::new(Self {
+            recording: Mutex::new(None),
+            stopped: AtomicBool::new(true),
+            stopped_at: Mutex::new(Some(Instant::now())),
+            outcome: Mutex::new(Some(Ok(audio))),
+            changed: Condvar::new(),
+        })
+    }
     pub fn stop(self: &Arc<Self>) {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;

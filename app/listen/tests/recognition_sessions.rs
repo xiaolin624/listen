@@ -147,6 +147,7 @@ fn complete(id: SessionId, text: &str) -> SessionEvent {
             description: "controlled playback".into(),
             timing: Timing::default(),
             stopped_at: None,
+            recovered: false,
         }),
     }
 }

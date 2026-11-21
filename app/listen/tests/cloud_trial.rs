@@ -15,21 +15,28 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(0);
 
 struct Runtime(PathBuf);
 impl Runtime {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "listen-cloud-{}-{}",
+            "listen-cloud-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -173,6 +180,21 @@ fn wait(app: &mut Application, phase: Phase) -> listen::Snapshot {
         app.poll();
         let snapshot = app.snapshot();
         if snapshot.phase == phase {
+            return snapshot;
+        }
+        assert!(Instant::now() < deadline, "{snapshot:?}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Wait for a user-visible message without assuming a phase change: a problem
+/// that retrying cannot fix is reported while the capture keeps running.
+fn wait_detail(app: &mut Application, phrase: &str) -> listen::Snapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.poll();
+        let snapshot = app.snapshot();
+        if snapshot.detail.contains(phrase) {
             return snapshot;
         }
         assert!(Instant::now() < deadline, "{snapshot:?}");
@@ -470,10 +492,18 @@ fn the_free_only_time_allowance_closes_an_unfinished_session_and_retains_audio()
         )))
         .unwrap();
     *clock.0.lock().unwrap() += Duration::from_secs(33_615);
+    // The cost guard stops recognition, but the capture itself is still valid and
+    // keeps saving; the user stops it, and the recording stays recoverable.
+    let blocked = wait_detail(&mut app, "time allowance");
+    assert_eq!(blocked.phase, Phase::Capturing);
+    assert!(blocked.text.is_empty());
+    assert_eq!(*editor.0.lock().unwrap(), "protected draft");
+    app.dispatch(Control::Stop);
     let failure = wait(&mut app, Phase::Failure);
     assert!(failure.detail.contains("time allowance"), "{failure:?}");
     assert!(failure.text.is_empty());
     assert_eq!(*editor.0.lock().unwrap(), "protected draft");
+    assert!(failure.retry_available);
     assert!(!failure.retained_audio.is_empty());
     assert!(failure.retained_audio.iter().all(|path| path.is_file()));
 }
@@ -613,12 +643,17 @@ fn live_model_protection_and_the_matching_unique_default_workspace_are_required_
                 .unwrap();
             wait(&mut app, Phase::NoSpeech);
         } else {
+            // The protection check fails before any upload, but the capture that
+            // already started is not thrown away; stop it to keep the recording.
+            let blocked = wait_detail(&mut app, "free-only protection");
+            assert_eq!(blocked.phase, Phase::Capturing);
+            assert!(outgoing.try_recv().is_err());
+            app.dispatch(Control::Stop);
             let failure = wait(&mut app, Phase::Failure);
             assert!(
                 failure.detail.contains("free-only protection"),
                 "{failure:?}"
             );
-            assert!(outgoing.try_recv().is_err());
             assert!(!failure.retained_audio.is_empty());
             assert!(failure.retained_audio.iter().all(|path| path.is_file()));
         }
@@ -670,6 +705,12 @@ impl Scenario {
     }
     fn start(&mut self) -> String {
         self.app.dispatch(Control::Start);
+        let state = self.app.snapshot();
+        assert_eq!(
+            state.phase,
+            Phase::Capturing,
+            "capture did not start: {state:?}"
+        );
         self.playback.speak();
         let run = receive_text(&self.outgoing, "run-task");
         let task = run["header"]["task_id"].as_str().unwrap().to_string();
@@ -715,8 +756,29 @@ fn stable_sentences_and_wrong_task_acknowledgments_cannot_deliver_after_connecti
     assert_eq!(scenario.app.snapshot().phase, Phase::Capturing);
     scenario.stop();
     scenario.send("another-task", "task-finished", json!({}));
+    // The connection drops after stop. The session waits and retries instead of
+    // ending the capture, and nothing unconfirmed is delivered meanwhile.
     scenario.input.send(Err(CloudError::Network)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        scenario.app.poll();
+        let state = scenario.app.snapshot();
+        if state.recognition == Some(listen::recognition::SessionState::WaitingForNetwork) {
+            assert_eq!(state.phase, Phase::Processing);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{state:?}");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    // A second paid request cannot be reserved inside the shared cap, so the
+    // bounded automatic recovery stops without delivering anything. The recording
+    // stays available for an explicit retry once the user decides to spend again.
     let failure = wait(&mut scenario.app, Phase::Failure);
+    assert!(
+        failure.detail.contains("shared CNY 50 trial budget"),
+        "{failure:?}"
+    );
     assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
     assert!(failure.text.is_empty());
     assert!(
@@ -729,8 +791,8 @@ fn stable_sentences_and_wrong_task_acknowledgments_cannot_deliver_after_connecti
         28_500_000_000
     );
     assert!(
-        !failure.retry_available,
-        "a cloud failure must not offer a silent local retry"
+        failure.retry_available,
+        "retained audio is offered for an explicit retry, not a silent local fallback"
     );
 }
 
@@ -1057,17 +1119,24 @@ fn account_errors_are_actionable_and_remote_credentials_or_audio_echoes_are_neve
     },"payload":{}})
         .to_string()))
         .unwrap();
+    let reported = wait_detail(&mut scenario.app, "balance, quota or a billing budget");
+    assert_eq!(reported.phase, Phase::Capturing);
+    let observable = format!("{reported:?} {:?}", scenario.ledger.snapshot().unwrap());
+    assert!(!observable.contains("offline-test-key"));
+    assert!(!observable.contains("private audio echo"));
+    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    // Recognition cannot continue, but the capture is still saved, so stopping
+    // ends in a recoverable failure instead of ending the meeting capture.
+    scenario.app.dispatch(Control::Stop);
     let failure = wait(&mut scenario.app, Phase::Failure);
     assert!(
         failure
             .detail
             .contains("balance, quota or a billing budget")
     );
-    let observable = format!("{failure:?} {:?}", scenario.ledger.snapshot().unwrap());
-    assert!(!observable.contains("offline-test-key"));
-    assert!(!observable.contains("private audio echo"));
-    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    assert!(failure.retry_available);
     assert!(!failure.retained_audio.is_empty());
+    assert!(failure.retained_audio.iter().all(|path| path.is_file()));
 }
 
 #[test]
@@ -1085,16 +1154,20 @@ fn an_unpurchased_model_is_reported_as_model_access_not_a_generic_rejection() {
     },"payload":{}})
         .to_string()))
         .unwrap();
+    let reported = wait_detail(&mut scenario.app, "unavailable or not enabled");
+    assert_eq!(reported.phase, Phase::Capturing);
+    assert!(
+        !reported.detail.contains("Access to model denied"),
+        "{reported:?}"
+    );
+    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    scenario.app.dispatch(Control::Stop);
     let failure = wait(&mut scenario.app, Phase::Failure);
     assert!(
         failure.detail.contains("unavailable or not enabled"),
         "{failure:?}"
     );
-    assert!(
-        !failure.detail.contains("Access to model denied"),
-        "{failure:?}"
-    );
-    assert_eq!(*scenario.editor.0.lock().unwrap(), "protected draft");
+    assert!(failure.retry_available);
     assert!(!failure.retained_audio.is_empty());
 }
 
@@ -1249,7 +1322,15 @@ fn cross_process_budget_actor() {
         Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()));
     app.dispatch(Control::Start);
     if app.snapshot().phase == Phase::Capturing {
-        wait(&mut app, Phase::Failure);
+        // This process booked the one available reservation. A second paid request
+        // is refused by the shared cap; the capture is kept until the user stops.
+        wait_detail(&mut app, "shared CNY 50 trial budget");
+        app.dispatch(Control::Stop);
+        let failure = wait(&mut app, Phase::Failure);
+        assert!(
+            failure.detail.contains("shared CNY 50 trial budget"),
+            "{failure:?}"
+        );
         println!("budget_actor=admitted");
     } else {
         let detail = app.snapshot().detail;
