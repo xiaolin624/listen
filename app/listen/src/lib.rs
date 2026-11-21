@@ -187,6 +187,16 @@ pub enum Preparation {
 /// `stop_to_result_ms` is measured from the Stop control to the moment the result
 /// was saved and delivered (or the failure was recorded), not from the next GUI
 /// refresh. `preparation_ms` covers first-use model loading only.
+///
+/// `stop_to_confirmed_ms` is the ticket #38 end-to-end number: from the Stop
+/// control to the moment the real target's complete replacement was read back and
+/// the confirmed append was durably recorded. It is present only for a confirmed
+/// append; a fallback deliberately has no target read-back to claim. The stages
+/// partition that interval: stop finalisation ([`Timing::finalize_ms`]), the cloud
+/// final confirmation ([`Timing::cloud_drain_ms`] + [`Timing::cloud_final_ms`]), the
+/// durable save ([`Timing::save_ms`]), application scheduling
+/// ([`Timing::schedule_ms`] and its three measured gaps) and target delivery
+/// ([`Timing::delivery_ms`] and its read/write/lock/record parts).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
     /// `Control::Start`/hotkey dispatch to `Phase::Capturing`, including binding the
@@ -201,6 +211,43 @@ pub struct Timing {
     pub save_ms: Option<u64>,
     pub delivery_ms: Option<u64>,
     pub recognition_windows: usize,
+    /// Stop control to the confirmed, durably recorded target read-back. `None` when
+    /// nothing was written to the bound target (a fallback result).
+    pub stop_to_confirmed_ms: Option<u64>,
+    /// Cloud: the successful transport connect of the final attempt.
+    pub cloud_connect_ms: Option<u64>,
+    /// Cloud: session start to the vendor's first `task-started`, the first
+    /// connection/handshake cost. It happens while audio is still being captured.
+    pub first_task_started_ms: Option<u64>,
+    /// Cloud: capture finalisation to `finish-task` sent. This is the final upload
+    /// drain of received audio.
+    pub cloud_drain_ms: Option<u64>,
+    /// Cloud: `finish-task` sent to the vendor's `task-finished`. Only a whole-task
+    /// confirmation counts; an intermediate sentence is never this stage.
+    pub cloud_final_ms: Option<u64>,
+    /// Application scheduling: from the Stop control to the start of the durable
+    /// save, minus the adapter's own final stages. It includes the stop-time
+    /// durable segment record, event delivery and the poll cadence.
+    pub event_wait_ms: Option<u64>,
+    /// Application scheduling: the gap between the durable save and the delivery
+    /// worker starting (thread start plus the one-target-writer gate).
+    pub delivery_queue_ms: Option<u64>,
+    /// Application scheduling: the gap between the confirmed delivery and the poll
+    /// that applies it to the panel/phase. It cannot change the target text.
+    pub apply_wait_ms: Option<u64>,
+    /// The sum of the three application scheduling gaps above.
+    pub schedule_ms: Option<u64>,
+    /// Time spent waiting for the one-target-writer gate (an older segment's
+    /// delivery). A backlog must never make the new segment's write wait.
+    pub delivery_lock_ms: Option<u64>,
+    /// The target draft read immediately before the write.
+    pub delivery_read_ms: Option<u64>,
+    /// The one write attempt and its complete read-back confirmation, as the target
+    /// adapter reports them.
+    pub delivery_write_ms: Option<u64>,
+    /// The fail-closed delivery record (`delivery.json`) saves before and after the
+    /// write. This is the part that grows with confirmed history.
+    pub delivery_save_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -481,6 +528,15 @@ fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+/// The elapsed milliseconds from `earlier` to `later`, clamped at zero so a
+/// timestamp taken a fraction later than its reference can never underflow.
+fn millis_between(later: Instant, earlier: Instant) -> u64 {
+    later
+        .saturating_duration_since(earlier)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 /// Audio from a failed recognition attempt, kept on disk so the user can retry
 /// without replaying the speech. The target and glossary stay on the segment:
 /// retrying never selects the focus that happens to be active later.
@@ -499,6 +555,9 @@ struct Delivered {
     timing: Timing,
     directory: PathBuf,
     stopped_at: Option<Instant>,
+    /// When the delivery worker returned: the append was confirmed by a target
+    /// read-back (or the fallback decision was made). The next poll only applies it.
+    delivery_finished_at: Instant,
 }
 
 /// One start/stop segment. It owns its capture directory, its bound target and its
@@ -565,6 +624,12 @@ struct DeliveryOutcome {
     /// Present only for a confirmed append. Fallback deliveries have no target to
     /// read again, so they can never be replaced in place.
     memory: Option<DeliveryMemory>,
+    /// The measured parts of the delivery, carried into [`Timing`]. A fallback on
+    /// the no-target path has none of them.
+    lock_ms: Option<u64>,
+    read_ms: Option<u64>,
+    write_ms: Option<u64>,
+    save_ms: Option<u64>,
 }
 
 impl DeliveryOutcome {
@@ -573,6 +638,10 @@ impl DeliveryOutcome {
             delivery: Delivery::Fallback,
             detail,
             memory: None,
+            lock_ms: None,
+            read_ms: None,
+            write_ms: None,
+            save_ms: None,
         }
     }
 }
@@ -614,9 +683,12 @@ fn deliver(
             return DeliveryOutcome::fallback(detail);
         }
     };
+    let lock_started = Instant::now();
     let _writer = TARGET_WRITER
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let lock_ms = elapsed_ms(lock_started);
+    let read_started = Instant::now();
     let latest = match target
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -629,7 +701,11 @@ fn deliver(
             return DeliveryOutcome::fallback(detail);
         }
     };
-    append_to_target(target, sequence, ledger, latest, text, AppendKind::Normal)
+    let read_ms = elapsed_ms(read_started);
+    let mut outcome = append_to_target(target, sequence, ledger, latest, text, AppendKind::Normal);
+    outcome.lock_ms = Some(lock_ms);
+    outcome.read_ms = Some(read_ms);
+    outcome
 }
 
 /// A late result (it waited for the network or was recovered from retained audio).
@@ -657,9 +733,12 @@ fn deliver_late(
     if let Err(reason) = ledger.wait_baseline(sequence) {
         return keep_late(ledger, sequence, &reason);
     }
+    let lock_started = Instant::now();
     let _writer = TARGET_WRITER
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let lock_ms = elapsed_ms(lock_started);
+    let read_started = Instant::now();
     let current = match target
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -674,10 +753,15 @@ fn deliver_late(
             );
         }
     };
+    let read_ms = elapsed_ms(read_started);
     match ledger.plan_late_append(sequence, &current) {
         LatePlan::Keep { reason } => keep_late(ledger, sequence, &reason),
         LatePlan::Append => {
-            append_to_target(target, sequence, ledger, current, text, AppendKind::Late)
+            let mut outcome =
+                append_to_target(target, sequence, ledger, current, text, AppendKind::Late);
+            outcome.lock_ms = Some(lock_ms);
+            outcome.read_ms = Some(read_ms);
+            outcome
         }
     }
 }
@@ -706,18 +790,28 @@ fn append_to_target(
     } else {
         format!("{before}\n{text}")
     };
-    if let Err(reason) = ledger.begin_append(sequence, &before) {
+    // The fail-closed marker must be on disk before the write, and the confirmed
+    // append on disk before the outcome is trusted. Both are measured: this is the
+    // part of a delivery that grows with confirmed history.
+    let save_started = Instant::now();
+    let begin = ledger.begin_append(sequence, &before);
+    let begin_ms = elapsed_ms(save_started);
+    if let Err(reason) = begin {
         if kind == AppendKind::Late {
             return keep_late(ledger, sequence, &reason);
         }
     }
+    let write_started = Instant::now();
     let write = target
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .replace(&before, &replacement);
+    let write_ms = elapsed_ms(write_started);
     match write {
         Ok(()) => {
+            let confirm_started = Instant::now();
             ledger.confirm_append(sequence, &before, &replacement);
+            let confirm_ms = elapsed_ms(confirm_started);
             DeliveryOutcome {
                 delivery: Delivery::Appended,
                 detail: match kind {
@@ -730,6 +824,10 @@ fn append_to_target(
                     after: replacement,
                     appended: text.to_string(),
                 }),
+                lock_ms: None,
+                read_ms: None,
+                write_ms: Some(write_ms),
+                save_ms: Some(begin_ms + confirm_ms),
             }
         }
         Err(error) => {
@@ -753,6 +851,10 @@ fn append_to_target(
                 delivery: failed.delivery,
                 detail,
                 memory: None,
+                lock_ms: None,
+                read_ms: None,
+                write_ms: Some(write_ms),
+                save_ms: Some(begin_ms),
             }
         }
     }
@@ -2224,11 +2326,8 @@ impl Application {
                 Preparation::Pending => {}
             }
         }
-        // Refresh every live segment in capture order, but apply at most one session
-        // event per poll: the oldest waiting segment cannot be reordered behind a
-        // newer one inside one poll, and the poll stays bounded. Only the segments up
-        // to the first event are polled, so no session's event is consumed and
-        // dropped when two of them finish between polls.
+        // Refresh every live segment's own status and progress. This is cheap and
+        // display-only; it never consumes an event.
         for index in 0..self.segments.len() {
             if self.segments[index].handle.is_none() || self.segments[index].terminal {
                 continue;
@@ -2240,26 +2339,25 @@ impl Application {
                 .status();
             self.note_segment_status(index, status, preparation_changed);
         }
-        let mut event: Option<(usize, SessionEvent)> = None;
-        for index in 0..self.segments.len() {
-            if self.segments[index].handle.is_none() || self.segments[index].terminal {
-                continue;
-            }
-            let session_event = self.segments[index]
-                .handle
-                .as_mut()
-                .expect("checked above")
-                .poll();
-            if let Some(session_event) = session_event {
-                event = Some((index, session_event));
+        // The newest segment's event is consumed first, so the segment the user just
+        // stopped never waits a whole poll tick behind an older backlog. At most one
+        // older segment follows per poll, oldest first: a finished backlog is still
+        // recovered one at a time in capture order (#33) and cannot occupy the
+        // current segment's save or delivery slots.
+        let primary = self.segments.len().saturating_sub(1);
+        if let Some(event) = self.poll_segment_event(primary) {
+            self.apply_session_event(primary, event);
+        }
+        for index in 0..primary {
+            if let Some(event) = self.poll_segment_event(index) {
+                self.apply_session_event(index, event);
                 break;
             }
         }
-        if let Some((index, event)) = event {
-            self.apply_session_event(index, event);
-        }
-        // Apply finished deliveries oldest capture order first, at most one per
-        // poll, so a burst of completions cannot reorder the panel.
+        // Apply a finished delivery, newest first. The current segment's confirmed
+        // append is never held behind an older background delivery; an older one is
+        // applied on the next poll, and the panel order still comes from the segment
+        // list, not from the order deliveries happen to finish.
         loop {
             match self.completion_rx.try_recv() {
                 Ok(delivered) => {
@@ -2270,7 +2368,7 @@ impl Application {
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        if let Some((_, delivered)) = self.deliveries.pop_first() {
+        if let Some((_, delivered)) = self.deliveries.pop_last() {
             self.apply_delivery(delivered);
         }
         // Measure storage after statuses, events and deliveries: a segment that just
@@ -2287,6 +2385,15 @@ impl Application {
             self.note_record_problem(problem);
         }
         self.refresh_segments();
+    }
+
+    /// Poll one segment's pending session event, if it still owns a live session.
+    fn poll_segment_event(&mut self, index: usize) -> Option<SessionEvent> {
+        let segment = self.segments.get_mut(index)?;
+        if segment.handle.is_none() || segment.terminal {
+            return None;
+        }
+        segment.handle.as_mut().expect("checked above").poll()
     }
 
     /// Keep one segment's own status up to date, and copy it into the phase/capsule
@@ -2496,7 +2603,18 @@ impl Application {
         let is_current = sequence >= self.current_sequence;
         let save_started = Instant::now();
         let saved = self.save_complete_text(sequence, &text, is_current);
-        timing.save_ms = Some(elapsed_ms(save_started));
+        let save_finished_at = Instant::now();
+        timing.save_ms = Some(millis_between(save_finished_at, save_started));
+        // The application only learns about the confirmed session result when it is
+        // polled. Everything between the adapter's own final stages and this durable
+        // save is scheduling, and it is measured instead of being folded into the
+        // total.
+        timing.event_wait_ms = stopped_at.map(|stopped_at| {
+            let adapter = timing.finalize_ms.unwrap_or(0)
+                + timing.cloud_drain_ms.unwrap_or(0)
+                + timing.cloud_final_ms.unwrap_or(0);
+            millis_between(save_started, stopped_at).saturating_sub(adapter)
+        });
         if let Err(error) = saved {
             // Nothing is written to a target and the audio stays as the recovery
             // basis. The complete text stays readable for this segment.
@@ -2523,14 +2641,22 @@ impl Application {
         let worker_timing = timing.clone();
         let worker_directory = directory.clone();
         thread::spawn(move || {
-            let delivery_started = Instant::now();
+            let delivery_started_at = Instant::now();
             let outcome = if recovered {
                 deliver_late(target, &worker_text, sequence, ledger.as_ref())
             } else {
                 deliver(target, &worker_text, sequence, ledger.as_ref())
             };
+            let delivery_finished_at = Instant::now();
             let mut timing = worker_timing;
-            timing.delivery_ms = Some(elapsed_ms(delivery_started));
+            timing.delivery_ms = Some(millis_between(delivery_finished_at, delivery_started_at));
+            timing.delivery_queue_ms = Some(millis_between(delivery_started_at, save_finished_at));
+            // The target read and the write/read-back are part of `delivery_ms`;
+            // keeping them separate says where a slow editor spent the time.
+            timing.delivery_lock_ms = outcome.lock_ms;
+            timing.delivery_read_ms = outcome.read_ms;
+            timing.delivery_write_ms = outcome.write_ms;
+            timing.delivery_save_ms = outcome.save_ms;
             let _ = tx.send(Delivered {
                 sequence,
                 text: worker_text,
@@ -2539,6 +2665,7 @@ impl Application {
                 timing,
                 directory: worker_directory,
                 stopped_at,
+                delivery_finished_at,
             });
         });
     }
@@ -2551,7 +2678,18 @@ impl Application {
         mut timing: Timing,
         stopped_at: Option<Instant>,
     ) {
-        timing.stop_to_result_ms = stopped_at.map(elapsed_ms);
+        let applied_at = Instant::now();
+        timing.stop_to_result_ms =
+            stopped_at.map(|stopped_at| millis_between(applied_at, stopped_at));
+        // Silence has no target delivery, but the wait for the session's whole-task
+        // confirmation is still scheduling rather than recognition.
+        timing.event_wait_ms = stopped_at.map(|stopped_at| {
+            let adapter = timing.finalize_ms.unwrap_or(0)
+                + timing.cloud_drain_ms.unwrap_or(0)
+                + timing.cloud_final_ms.unwrap_or(0);
+            millis_between(applied_at, stopped_at).saturating_sub(adapter)
+        });
+        timing.schedule_ms = timing.event_wait_ms;
         let primary = index + 1 == self.segments.len();
         {
             let segment = &mut self.segments[index];
@@ -2618,6 +2756,31 @@ impl Application {
         let current = delivered.sequence == self.current_sequence;
         let delivery = delivered.outcome.delivery;
         let detail = delivered.outcome.detail.clone();
+        let applied_at = Instant::now();
+        // Complete the one measurement from the user's Stop to the real target's
+        // confirmed read-back, and account for the scheduling gaps around it. This
+        // is derived here because only the application thread knows when it applied
+        // the delivery; the worker already recorded when the target was confirmed.
+        let mut timing = delivered.timing.clone();
+        timing.stop_to_result_ms = delivered
+            .stopped_at
+            .map(|stopped_at| millis_between(applied_at, stopped_at));
+        timing.apply_wait_ms = Some(millis_between(applied_at, delivered.delivery_finished_at));
+        timing.schedule_ms = match (
+            timing.event_wait_ms,
+            timing.delivery_queue_ms,
+            timing.apply_wait_ms,
+        ) {
+            (Some(event_wait), Some(queue), Some(apply_wait)) => {
+                Some(event_wait + queue + apply_wait)
+            }
+            _ => None,
+        };
+        if delivery == Delivery::Appended {
+            timing.stop_to_confirmed_ms = delivered
+                .stopped_at
+                .map(|stopped_at| millis_between(delivered.delivery_finished_at, stopped_at));
+        }
         {
             let segment = &mut self.segments[index];
             segment.finalizing = false;
@@ -2625,7 +2788,7 @@ impl Application {
             segment.session_state = SessionState::Complete;
             segment.text = Some(delivered.text.clone());
             segment.delivery = Some(delivery);
-            segment.timing = delivered.timing.clone();
+            segment.timing = timing.clone();
             segment.detail = detail.clone();
         }
         let mut cleanup_error = None;
@@ -2663,8 +2826,6 @@ impl Application {
                 Ok(()) => Refine::Available,
                 Err(reason) => Refine::Unavailable(reason),
             };
-            let mut timing = delivered.timing.clone();
-            timing.stop_to_result_ms = delivered.stopped_at.map(elapsed_ms);
             self.snapshot.timing = timing.clone();
             self.record_latency(
                 "Result",
@@ -2861,6 +3022,20 @@ impl Application {
             "save_ms": timing.save_ms,
             "delivery_ms": timing.delivery_ms,
             "recognition_windows": timing.recognition_windows,
+            // #38: one stop-to-confirmed number and every stage that makes it up.
+            "stop_to_confirmed_ms": timing.stop_to_confirmed_ms,
+            "cloud_connect_ms": timing.cloud_connect_ms,
+            "first_task_started_ms": timing.first_task_started_ms,
+            "cloud_drain_ms": timing.cloud_drain_ms,
+            "cloud_final_ms": timing.cloud_final_ms,
+            "event_wait_ms": timing.event_wait_ms,
+            "delivery_queue_ms": timing.delivery_queue_ms,
+            "apply_wait_ms": timing.apply_wait_ms,
+            "schedule_ms": timing.schedule_ms,
+            "delivery_lock_ms": timing.delivery_lock_ms,
+            "delivery_read_ms": timing.delivery_read_ms,
+            "delivery_write_ms": timing.delivery_write_ms,
+            "delivery_save_ms": timing.delivery_save_ms,
         });
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)

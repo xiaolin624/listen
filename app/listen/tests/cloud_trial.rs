@@ -291,6 +291,96 @@ fn cloud_capture_streams_before_stop_and_waits_for_whole_task_confirmation_befor
     assert_eq!(ledger.snapshot().unwrap().committed_nanoyuan, 517_500);
 }
 
+/// #38: the application-measured stop path must make the cloud's own stages
+/// visible. The test holds the whole-task confirmation back for a known 40 ms, so
+/// `cloud_final_ms` is a real elapsed duration rather than a constant.
+#[test]
+fn the_cloud_final_confirmation_and_drain_are_measured_as_their_own_stages() {
+    let runtime = Runtime::new();
+    let playback = Arc::new(Playback::default());
+    let editor = Arc::new(Editor(Mutex::new("draft".into())));
+    let (input, incoming) = mpsc::channel();
+    let (output, outgoing) = mpsc::channel();
+    let ledger = TrialLedger::new(runtime.0.join("shared-ledger"));
+    let sessions = CloudSessions::new(
+        Arc::new(Device(playback.clone())),
+        Arc::new(Remote {
+            inbound: Mutex::new(Some(incoming)),
+            outbound: output,
+        }),
+        Arc::new(Key),
+        AliSettings::beijing("offline-workspace".into()),
+        ledger.clone(),
+    );
+    let mut app =
+        Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()))
+            .with_targets(Arc::new(Selection(editor.clone())));
+    app.dispatch(Control::Start);
+    playback.speak();
+    let run = receive_text(&outgoing, "run-task");
+    let task = run["header"]["task_id"].as_str().unwrap();
+    input
+        .send(Ok(event(task, "task-started", json!({}))))
+        .unwrap();
+    loop {
+        if let Outbound::Audio(_) = outgoing.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break;
+        }
+    }
+    input
+        .send(Ok(event(
+            task,
+            "result-generated",
+            json!({"output":{"sentence":{
+                "sentence_id":1,"text":"第一段完整结果。","sentence_end":true
+            }}}),
+        )))
+        .unwrap();
+    app.poll();
+    app.dispatch(Control::Stop);
+    receive_text(&outgoing, "finish-task");
+    // The vendor needs a known 40 ms to confirm the whole task.
+    thread::sleep(Duration::from_millis(40));
+    input
+        .send(Ok(event(
+            task,
+            "task-finished",
+            json!({"usage":{
+                "input_tokens":84,"output_tokens":3,"total_tokens":87,"duration":0.1
+            }}),
+        )))
+        .unwrap();
+    let result = wait(&mut app, Phase::Result);
+    assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
+
+    let timing = &result.timing;
+    assert!(timing.finalize_ms.is_some(), "{timing:?}");
+    assert!(timing.cloud_connect_ms.is_some(), "{timing:?}");
+    assert!(timing.first_task_started_ms.is_some(), "{timing:?}");
+    assert!(
+        timing.cloud_drain_ms.is_some(),
+        "the final upload drain is measured: {timing:?}"
+    );
+    assert!(
+        timing.cloud_final_ms.is_some_and(|value| value >= 40),
+        "the whole-task confirmation wait is measured: {timing:?}"
+    );
+    let confirmed = timing
+        .stop_to_confirmed_ms
+        .expect("a confirmed append has a stop-to-confirmed number");
+    assert!(confirmed >= timing.cloud_final_ms.unwrap(), "{timing:?}");
+    assert!(
+        timing
+            .stop_to_result_ms
+            .is_some_and(|result| result >= confirmed),
+        "{timing:?}"
+    );
+    let record = fs::read_to_string(runtime.0.join("app/latency.jsonl")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(record.lines().next().unwrap()).unwrap();
+    assert_eq!(value["cloud_final_ms"], timing.cloud_final_ms.unwrap());
+    assert_eq!(value["stop_to_confirmed_ms"], confirmed);
+}
+
 struct FreeOnlyRemote(Remote);
 impl MessageTransport for FreeOnlyRemote {
     fn cost_policy(

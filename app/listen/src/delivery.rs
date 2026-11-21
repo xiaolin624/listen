@@ -33,6 +33,16 @@
 //! The whole draft is stored, not a hash, because a hash collision would turn an
 //! unprovable draft into a safe-looking one. Editable drafts are small; the index
 //! is replaced per decision and is not an audio store.
+//!
+//! **Bounded history (#38).** `before` and `after` hold the complete draft around
+//! each confirmed append, so keeping every resolved segment forever would make the
+//! file — and the two writes that bracket every delivery — grow with the session.
+//! Resolved records are therefore pruned to a byte budget and a record count,
+//! oldest first. Pruning is fail-closed: the late-append proof walks a chain of
+//! `appended` records, so a missing link can only make [`LatePlan::Keep`] more
+//! likely; it can never make an append look safe. `pending`, `started` and
+//! `uncertain` records are never pruned — they are the safety markers that prevent
+//! a second automatic write.
 
 use crate::{AppResult, cloud::persist_result, normalize_newlines};
 use serde::{Deserialize, Serialize};
@@ -62,6 +72,19 @@ const UNCERTAIN: &str = "uncertain";
 /// started at Stop. A slow or hung editor must not delay Stop, and a draft that
 /// cannot be proven unchanged must keep the result pending instead of guessing.
 pub(crate) const DRAFT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds on the resolved (`appended`/`fallback`) delivery history. Enough recent
+/// confirmed appends remain to prove a backlog segment's draft, while the file and
+/// the two saves around each delivery stay bounded through a long session.
+const MAX_RESOLVED_RECORDS: usize = 64;
+/// The newest resolved records are always kept, even under byte pressure: the most
+/// recent append is the one a just-stopped segment's draft is most likely to sit on.
+const MIN_RESOLVED_RECORDS: usize = 4;
+/// The largest serialized `delivery.json` this module writes before pruning older
+/// resolved records. Non-terminal safety records are never dropped to meet it.
+/// Keeping it small matters: every delivery writes this file twice (before and
+/// after the target write), so its size is a direct stop-path cost.
+const MAX_BYTES: usize = 64 * 1024;
 
 /// One segment's durable delivery state. Every field is complete content or a
 /// user-readable reason; nothing here contains a credential.
@@ -335,7 +358,7 @@ impl DeliveryLedger {
                     .into();
             record.updated_utc = now_utc();
         }
-        let bytes = serialize(&data.segments);
+        let bytes = serialize_pruned(&mut data.segments);
         match persist_result(&self.runtime.join(FILE), &bytes) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -412,7 +435,7 @@ impl DeliveryLedger {
         if data.problem.is_some() {
             return;
         }
-        let bytes = serialize(&data.segments);
+        let bytes = serialize_pruned(&mut data.segments);
         if let Err(error) = persist_result(&self.runtime.join(FILE), &bytes) {
             self.note(
                 data,
@@ -457,6 +480,68 @@ fn serialize(segments: &BTreeMap<u64, Record>) -> Vec<u8> {
         segments: segments.values().cloned().collect(),
     };
     serde_json::to_vec(&stored).unwrap_or_default()
+}
+
+/// Serialize while keeping the resolved history bounded. The common small case is
+/// one serialization; pruning starts only when the count or the byte budget is
+/// exceeded.
+fn serialize_pruned(segments: &mut BTreeMap<u64, Record>) -> Vec<u8> {
+    let resolved = resolved_sequences(segments);
+    if resolved.len() <= MAX_RESOLVED_RECORDS {
+        let bytes = serialize(segments);
+        if bytes.len() <= MAX_BYTES {
+            return bytes;
+        }
+    }
+    prune(segments, &resolved);
+    serialize(segments)
+}
+
+/// The capture orders of resolved records, oldest first (a `BTreeMap` iterates in
+/// key order). Non-terminal records are never candidates.
+fn resolved_sequences(segments: &BTreeMap<u64, Record>) -> Vec<u64> {
+    segments
+        .iter()
+        .filter(|(_, record)| is_resolved(&record.state))
+        .map(|(sequence, _)| *sequence)
+        .collect()
+}
+
+/// A resolved record is history: it proves something about a past delivery but can
+/// be dropped without ever permitting another write. Fail-closed pruning relies on
+/// this split, not on the sequence number.
+fn is_resolved(state: &str) -> bool {
+    state == APPENDED || state == FALLBACK
+}
+
+/// Drop the oldest resolved records until the count and byte bounds hold. At least
+/// [`MIN_RESOLVED_RECORDS`] of the newest resolved records always stay, so the
+/// immediately preceding append is still available to prove a draft even when the
+/// drafts are large. A file that is still over budget because of non-terminal
+/// records is left that way: those records are the duplicate-append guards.
+fn prune(segments: &mut BTreeMap<u64, Record>, resolved: &[u64]) {
+    let excess = resolved.len().saturating_sub(MAX_RESOLVED_RECORDS);
+    for sequence in &resolved[..excess] {
+        segments.remove(sequence);
+    }
+    // Drop the oldest resolved records in halves rather than one at a time: a
+    // serialization per removal would itself become the stop-path cost. At least
+    // MIN_RESOLVED_RECORDS of the newest are always kept, so the immediately
+    // preceding append can still prove a draft.
+    loop {
+        if serialize(segments).len() <= MAX_BYTES {
+            break;
+        }
+        let remaining = resolved_sequences(segments);
+        if remaining.len() <= MIN_RESOLVED_RECORDS {
+            break;
+        }
+        let droppable = remaining.len() - MIN_RESOLVED_RECORDS;
+        let count = (droppable / 2).max(1).min(droppable);
+        for sequence in &remaining[..count] {
+            segments.remove(sequence);
+        }
+    }
 }
 
 fn now_utc() -> f64 {
