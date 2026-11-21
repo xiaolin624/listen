@@ -133,9 +133,9 @@ if ($ShowStatus) {
                 if ($attempt.final_usage -and $null -ne $attempt.estimated_nanoyuan) { $committed += [decimal]$attempt.estimated_nanoyuan }
                 else { $committed += [decimal]$attempt.reserved_nanoyuan }
             }
-            Write-Output ('Shared two-provider trial commitment: CNY {0:F9} / 50; frozen={1}' -f ($committed / 1000000000), $ledger.frozen)
+            Write-Output ('Shared single-vendor trial commitment: CNY {0:F9} / 50; frozen={1}' -f ($committed / 1000000000), $ledger.frozen)
         } catch { throw 'The shared ledger is unreadable or invalid; preserve it. The application will refuse new paid tasks.' }
-    } else { Write-Output 'Shared two-provider trial ledger: no task reserved yet (cap CNY 50).' }
+    } else { Write-Output 'Shared single-vendor trial ledger: no task reserved yet (cap CNY 50).' }
     Write-Output 'On each explicit trial start, Listen checks the existing CLI default workspace and exact-model free-only protection before any model task. Unknown protection refuses upload and retains received audio; configuration alone does not grant admission.'
     return
 }

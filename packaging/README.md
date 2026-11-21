@@ -1,12 +1,31 @@
-# Listen 0.1.0：耳机音频本地转写
+# Listen 0.1.0：耳机音频转写（本地默认 + 显式云端试用）
 
-Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 开始采集**默认多媒体播放设备**上的声音，再按一次停止；它在本地把完整结果追加到开始时选定的目标编辑区。无法可靠写入或没有有效目标时，完整结果保留在 Listen 的**展开结果面板**里，由你复制。工具不会自动发送消息，也不会执行转写文字。
+Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 开始采集**默认多媒体播放设备**上的声音，再按一次停止；它把整段完整结果追加到开始时选定的目标编辑区。无法可靠写入或没有有效目标时，完整结果保留在 Listen 的**展开结果面板**里，由你复制。工具不会自动发送消息，也不会执行转写文字。
 
-本目录是可直接运行的交付包，不需要先运行仓库里的开发脚本，也不需要单独启动识别命令。`启动 Listen.cmd` 只负责用包内路径启动 `listen.exe`。
+本目录是可直接运行的交付包，不需要先运行仓库里的开发脚本，也不需要单独启动识别命令。
 
-> **本包仍是 whisper.cpp 版本。** 交付包换用 SenseVoice（sherpa-onnx 运行库 + q8 模型、移除 whisper）是 ticket **#23**，尚未完成；本包不解包、也不声称包含 SenseVoice。开发构建已经把 SenseVoice 作为默认引擎，但本包的启动器显式传入 `--engine`，因此仍按 whisper.cpp 运行。SenseVoice 的署名与许可证原文会在 #23 换包时一并放进本目录。
+- **日常默认仍是本地识别。** 双击 `启动 Listen.cmd` 使用包内 `engine\` 和 `models\` 在 CPU 上识别；本包不包含 SenseVoice 运行库/模型，源码中的 SenseVoice 换包仍属 ticket #23，本次没有改变。
+- **云端试用是显式选择。** 只有双击 `启动 Listen 云端试用.cmd`（或显式传 `--cloud-trial ali`）才会选择阿里云百炼；它使用独立的 `runtime-cloud\`，不会覆盖本地结果，也不会自动切回本地。
+- **云端尚未通过正式验收。** 真实付费网络、真实编辑器的一秒回填和账单对账都未运行，因此云端**没有**被设为日常默认；不声称任何候选已达到 #26 的准确率和时延门槛。
 
-## 快速启动
+## 交付内容
+
+| 路径 | 用途 |
+| --- | --- |
+| `listen.exe` | 正式应用 |
+| `libunwind.dll` | gnullvm 运行库，必须与 `listen.exe` 同目录 |
+| `启动 Listen.cmd` | 本地默认启动器；用包内引擎/模型和本目录 `runtime\` |
+| `启动 Listen 云端试用.cmd` | 显式云端试用启动器；用 `runtime-cloud\` |
+| `scripts\configure-cloud-trial.ps1` | 本机凭据配置助手；隐藏输入，写入 Windows Credential Manager |
+| `CLOUD-TRIAL.md` | 云端试用配置、费用、数据与本地备用的完整说明 |
+| `engine\` | whisper.cpp v1.8.2 CPU 引擎及实际需要的 VC++ 运行库 DLL |
+| `models\` | 可选的两个 ggml 模型；没有模型时按下文准备 |
+| `glossary.txt` | 本地术语表，`listen.exe` 启动器显式使用它 |
+| `README.md`、`VERSION.txt`、`manifest.json` | 使用说明、版本、每个文件的大小与 SHA-256 |
+
+`manifest.json` 记录源码提交、是否包含模型、日常默认（本地）和云端试用的固定厂商/型号/地域；不记录本机密钥或测试环境路径。
+
+## 快速启动（本地默认）
 
 1. 把整个目录解压到一个**可写**位置（例如 `D:\Tools\Listen-0.1.0`）。不要直接放在 `C:\Program Files` 下，因为运行时要在本目录写 `runtime\`。
 2. 如果 `models\` 为空，先按下面“模型准备”放入两个模型文件。包含模型的包可以跳过这一步。
@@ -17,6 +36,18 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 7. 单击胶囊展开**结果面板**，检查完整结果；需要时点“复制完整结果”。由你手动发送；Listen 不发送 Enter，也不点发送按钮。
 
 关闭结果面板不会退出 Listen；程序继续在系统托盘运行。托盘左键打开面板，右键提供打开结果面板、开始/停止、重试、清理和退出。只运行一个实例。
+
+## 云端试用（显式，不改变日常默认）
+
+云端试用固定使用阿里云百炼 Model Studio / `qwen-audio-3.1-asr-flash-message` / `cn-beijing`（北京）。第一次使用前需要：
+
+1. 本机已有可用的阿里云百炼 CLI（`bl.cmd`）登录和该型号的免费额度保护；应用每次开始前都会只读核验，核验不通过就不发送音频。
+2. 用 `powershell -ExecutionPolicy Bypass -File .\scripts\configure-cloud-trial.ps1` 在本机配置 Workspace ID 和 API Key（Key 为隐藏输入，不经过命令行）。
+3. 双击 **`启动 Listen 云端试用.cmd`**，等待就绪后按 **Ctrl+Alt+R**，操作与本地相同。
+
+`runtime-cloud\status.txt` 的 `backend=` 和结果面板会显示实际厂商、型号、地域。缺凭据、配置非法、免费保护核验失败或网络中断时的行为，费用上限（CNY 50）、每月提醒线（CNY 100，仅提醒）、数据外发范围和实际账单仍需自行核对等，均见 **[CLOUD-TRIAL.md](CLOUD-TRIAL.md)**。
+
+本地备用是显式选择：关闭云端模式，双击 `启动 Listen.cmd` 做新的本机识别采集。云端不会在失败后自动改用本地结果，本地模式也不会自动读取 `runtime-cloud\` 的待处理录音。
 
 ## 模型准备（不包含模型时）
 
@@ -39,13 +70,14 @@ Get-FileHash .\models\ggml-small.bin -Algorithm SHA256
 Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 ```
 
-两个模型都准备好后重新启动 Listen。模型只从本目录读取，不需要联网；识别全程在本机 CPU 上完成，没有云端识别、API 调用或自动更新。本包没有配置 `DEEPSEEK_API_KEY`，因此面板里的“精修”不可用，本地功能完全不受影响。
+两个模型都准备好后重新启动 Listen。模型只从本目录读取，不需要联网；本地识别全程在本机 CPU 上完成。本包没有配置 `DEEPSEEK_API_KEY`，因此面板里的“精修”不可用，本地功能完全不受影响。
 
 ## 缺少文件时会怎样
 
-- **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：`启动 Listen.cmd` 会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
-- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：启动器只检查前两个程序文件是否存在并给出提示；如果相邻 DLL 缺失，`listen.exe` 启动后进入失败状态，写明 `backend is unavailable; check its adjacent DLLs`。启动器本身不会预先校验每个相邻 DLL。
-- **缺少模型、模型为空或不是 ggml 格式**：状态为失败，写明 `Local model is unavailable (...)` 或 `Local model is not a whisper.cpp ggml model`。补齐模型后重新启动即可。
+- **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：两个启动器都会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
+- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：本地启动器只检查前两个程序文件是否存在并给出提示；如果相邻 DLL 缺失，`listen.exe` 启动后进入失败状态，写明 `backend is unavailable; check its adjacent DLLs`。
+- **缺少模型、模型为空或不是 ggml 格式**：本地模式状态为失败，写明 `Local model is unavailable (...)` 或 `Local model is not a whisper.cpp ggml model`。补齐模型后重新启动即可。云端试用模式不需要本地模型。
+- **云端缺少配置助手或说明**：云端启动器明确提示缺少 `scripts\configure-cloud-trial.ps1` 或 `CLOUD-TRIAL.md`，不静默启动。
 - **默认多媒体播放设备不可用**：开始采集时进入失败状态，写明无法选择默认多媒体渲染端点；不会打开麦克风，也不会自动改用其他设备。
 - 包内 `engine\` 已放入引擎实际需要的 `whisper.dll`、`ggml.dll`、`ggml-cpu.dll`、`ggml-base.dll`、`vad-speech-segments.exe` 以及 Microsoft VC++ 运行库 DLL；`SDL2.dll`、`whisper-server.exe` 等无关程序没有打包。
 
@@ -54,18 +86,21 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - **只采集 Windows 默认多媒体渲染端点**（`eRender` + `eMultimedia`）上的混合声音，不打开麦克风。默认通信端点或单独路由到其他设备/应用的声音不在采集范围内，即使耳机也在播放。
 - 开始采集时状态会写出实际端点的角色、设备 ID 和友好名称。不要求选择应用类型或声音来源应用。
 - 采集期间默认多媒体端点被切换、移除或失活时，工具立即停止并进入失败状态，写明原端点/新端点和中断原因；已收到的音频或识别检查点保留，并明确标为不完整，不冒充完整采集。工具不会自动跟随到新设备。
-- 不建立会议历史：成功转写只覆盖 `runtime\current-result.txt`，失败时保留本次临时音频并在状态中给出路径。`status.txt` 不包含转写正文。
+- 成功转写只覆盖当前运行目录的 `current-result.txt`，不建立会议历史；失败时保留本次临时音频并在状态中给出路径。`status.txt` 不包含转写正文。
 - **不会自动发送**：没有 Enter、发送按钮、消息 API 或执行转写文本的代码路径。原生/网页写入、剪贴板降级都只追加文本。
 - 写入无法确认时，完整结果进入展开结果面板；你可以选择文字按 Ctrl+C，或点“复制完整结果”。工具不自动重试，也不回滚原目标。
+- 多段待取结果分别保存，后一段不覆盖前一段；未完成录音和待取结果跨重启保留。
+- 云端模式只把本次采集的连续音频和开始时固定的术语表发送给选定厂商；网络断开时继续保存在本机并自动重连、补传，停止后只有取得整段确认才交付。
 
 ## 结果面板
 
 单击胶囊展开/收起面板。面板上方是当前阶段、实时采集进度和完整说明，下方是**完整当前转写文本**；两个文本区都是只读的，可选择、可 Ctrl+C。按钮：
 
 - **复制完整结果**：只写剪贴板，不粘贴、不发送；
-- **重试本地识别**：只对失败捕获保留的音频重跑本地识别，不重放、不换目标；
+- **重试**：对失败捕获保留的音频重新识别（云端模式下是同一厂商的新请求，会计费和再次核验保护）；
 - **清理失败音频**：删除保留的失败音频，之后不能再用它重试；
-- **精修（不可用）**：没有 `DEEPSEEK_API_KEY` 时明确置灰；
+- **删除待处理段**：按采集顺序清理指定段的待处理录音和待取结果，不影响其他段；
+- **精修（不可用）**：没有 `DEEPSEEK_API_KEY` 时明确置灰；精修仍需你单独触发；
 - **关闭**：隐藏面板，程序继续在托盘运行。
 
 没有有效目标、目标失效或写入无法确认时，结果只出现在面板里并自动展开一次；成功追加不会自动打开面板。失败不会自动抢屏：胶囊变红，你点开面板即可看到原因。
@@ -78,7 +113,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - **Codex 桌面端等没有专门适配**：如果它不通过标准可写 Value 模式暴露输入区，Listen 不会猜测控件或注入发送，结果会进入展开结果面板。没有按应用白名单/黑名单分流。
 - UIA 读取、检查和写入不是跨进程原子事务；在最后检查和写入之间发生的并发编辑仍可能造成“可能已部分写入”的提示。失败后只做诊断读回，不自动重试、不回滚。
 - 目标有长度上限时会截断。Listen 会检测稳定前缀，明确报告“只保存了 N/M 个字符，不是完整交付”，并在展开结果面板保留完整结果；不会把截断报告成成功。
-- CPU 识别；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。
+- 本地引擎为 CPU 识别；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。**本包与云端试用都没有重新跑准确率或一秒验收。**
 - 测试中的 10 分钟/60 分钟只是验证样例，**不是产品时长上限**，也不是延迟或准确率 SLA。
 - 尚未覆盖：所有第三方编辑器/浏览器扩展输入区、物理拔插耳机、蓝牙免提/立体声切换、会议软件独占模式、其他 Windows 版本、真实会议录音的分段边界质量。不要把它理解为“任意控件无条件可写”或“任意会议逐字零错误”。
 
@@ -93,26 +128,29 @@ CUDA | ku da, ku
 Rust | re
 ```
 
-识别结果交付前会按术语表校正专名和技术词，并保持原顺序、分段和标点。匹配是近似的（忽略大小写、空格和连字符；多词正式写法还会用有辨识度的前导词召回，并能处理词数变化和词长缩短），所以一个词通常无需列出所有误识别写法；普通句子不会被替换。包内的 `glossary.txt` 就放在 `listen.exe` 旁边：`runtime\glossary.txt` 不存在时程序会使用它，`runtime\status.txt` 的 `glossary=` 行写明实际使用的文件。文件在**每次开始采集时重新读取**，改完保存后下一次采集即生效，不需要重启；文件缺失时不做校正，文件格式错误时状态会说明原因，本次采集仍会交付未校正的文本。
+识别结果交付前会按术语表校正专名和技术词，并保持原顺序、分段和标点。匹配是近似的（忽略大小写、空格和连字符；多词正式写法还会用有辨识度的前导词召回，并能处理词数变化和词长缩短），所以一个词通常无需列出所有误识别写法；普通句子不会被替换。包内的 `glossary.txt` 就放在 `listen.exe` 旁边：`runtime\glossary.txt` 不存在时程序会使用它，`runtime\status.txt` 的 `glossary=` 行写明实际使用的文件。文件在**每次开始采集时重新读取**，改完保存后下一次采集即生效，不需要重启；文件缺失时不做校正，文件格式错误时状态会说明原因，本次采集仍会交付未校正的文本。云端模式在开始时固定同一份术语快照。
 
 ## 本地数据
 
 | 路径 | 用途 |
 | --- | --- |
 | `glossary.txt` | 本地术语表；本地可编辑，下一次采集开始时生效 |
-| `runtime\current-result.txt` | 当前完整 UTF-8 转写；成功后覆盖，不建立会议历史 |
+| `runtime\current-result.txt` | 本地模式当前完整 UTF-8 转写；成功后覆盖，不建立会议历史 |
 | `runtime\panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新 |
 | `runtime\status.txt` | 当前阶段、说明、采集端点、准备/精修/提示状态、面板可见性、失败保留音频路径与各段耗时；不含转写正文 |
 | `runtime\latency.jsonl` | 每次采集的准备/采集启动/收尾/识别/保存/交付耗时；不含音频 |
-| `runtime\` 下本次会话临时目录 | 采集音频与本地后端日志；成功后删除，失败时保留以便人工处理 |
+| `runtime\` 下本次会话临时目录 | 本地采集音频与后端日志；成功后删除，失败时保留以便人工处理 |
+| `runtime-cloud\` | 云端试用独立运行目录；若存在待处理录音，只有再次打开云端试用时才会继续 |
+| `%LOCALAPPDATA%\Listen\cloud-trial\ali.json` | 云端非秘密配置：工作空间、固定型号和地域 |
+| `%LOCALAPPDATA%\Listen\cloud-trial\ledger.json` | 共享 CNY 50 试用账本；不随包分发、不自动重置 |
+| Windows Credential Manager `Listen/CloudTrial/Alibaba/cn-beijing` | 当前用户的云端 API Key；不在包内、状态或日志中 |
 
-确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供“重试本地识别”和“清理失败音频”（`--control retry|cleanup` 走同一入口）；只有“尚未成功消费任何识别窗口”的采集可以整段重试，长会话已有窗口成功后的失败只保留检查点文本和剩余音频路径，状态会明确说明。
+确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理录音保留在自己的运行目录，不用本地模式冒充处理。
 
 ## 版本与验证
 
-- 版本：0.1.0
-- 引擎：whisper.cpp v1.8.2 CPU（SenseVoice 换包见 ticket #23）
+- 版本：0.1.0（见 `VERSION.txt`）
+- 本地引擎：whisper.cpp v1.8.2 CPU（SenseVoice 换包见 ticket #23，未包含在本包）
 - 源码：<https://github.com/xiaolin624/listen>
-- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交和是否包含模型。
-- 包内容、启动契约与 v0.1 端到端验证见仓库 `docs/issue-11-verification.md` 与 `docs/issue-11-release-notes.md`；当前代码的 v0.2 面板/胶囊验收与审查修复见 `docs/issue-20-verification.md`、`docs/issue-review-fixes.md`。本包本身没有跟随 v0.2 的引擎与界面文档一起交付，包内引擎替换由 #23 负责。
-- 本机已在系统级出站封禁下复验：包内三个二进制没有网络导入，运行期只加载本机模块；三条临时出站封禁规则生效期间，从本包跑通真实采集→识别→交付，规则随后删除并读回无残留。证据见仓库 `docs/issue-11-verification.md`。
+- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交、是否包含模型、日常默认（本地）和云端固定厂商/型号/地域。
+- 包内容、启动契约与冒烟验证见仓库 `docs/issue-40-delivery.md`；历史本地包验收见 `docs/issue-11-verification.md`。本包的云端试用**没有**真实付费调用、真实编辑器一秒回填或账单对账证据，详见 `CLOUD-TRIAL.md`。
