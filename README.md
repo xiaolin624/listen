@@ -14,6 +14,9 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 - **结果面板**：单击胶囊展开/收起；面板显示当前阶段、实时采集进度、应用给出的完整说明和**完整当前转写文本**，并提供复制、重试本地识别、清理失败音频、精修、关闭。结果只在面板中（无目标回退）时会自动展开一次；失败不会自动抢屏，胶囊变红后由用户点开查看原因。
 - **精修（可选）**：面板里手动触发，只把**文字**（不含音频）发送到 DeepSeek API，修完在目标内容未变时直接替换本次追加的文本；目标被手改或无法确认时，精修结果留在面板、不覆盖用户编辑。没有 key、断网或 API 失败时保留本地结果并明确说明。本地识别不依赖精修。
 - **不自动发送**：没有任何 Enter、发送按钮或消息 API 路径；结果只追加文本或写入剪贴板。
+- **多段采集**：每次开始/停止是一个独立分段，后一段不会覆盖前一段的文字、目标或费用。旧段等待联网、仍在处理或失败保留音频都不拒绝新段；目标输入框的追加按采集顺序（先旧后新），识别/保存仍优先处理刚停止的当前段。面板按采集序号保留每个待取结果，托盘可按段清理。
+- **重启恢复**：退出不等待云端确认；下次启动从运行目录的 `segments.json`、`delivery.json`、保留音频和已保存文字恢复各段，只把仍可读的文字显示为待取结果（不重复识别、不释放唯一证据），未完成录音按采集顺序一次一段自动补处理。旧的窗口/输入框句柄不能跨进程使用，所以重启后的结果一律留在面板、绝不自动回填。
+- **存储边界**：待处理音频有跨段总预算和磁盘余量底线（见下方选项），超过预算或低于底线时停止开始/继续采集，但保留已经收到的声音与全部旧段；保存文字的 4 MiB 独立上限溢出时按存储故障处理，也不写目标。
 
 ## 本机准备与构建
 
@@ -39,12 +42,21 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 .\scripts\build-listen.ps1
 .\scripts\run-listen.ps1                  # 默认 SenseVoice，不传任何引擎参数
 .\scripts\run-listen.ps1 -Engine whisper  # 显式使用 whisper.cpp 回退
-.\scripts\run-listen.ps1 -Control show    # 打开结果面板；还有 panel/copy/start/stop/quit 等
+.\scripts\run-listen.ps1 -Control show    # 打开结果面板；还有 panel/copy/start/stop/retry/cleanup/refine/quit 等
+.\scripts\run-listen.ps1 -Control delete-segment:2  # 清理面板中采集序号为 2 的待处理音频/待取结果
 ```
 
 `run-listen.ps1 -Engine` 接受 `sensevoice`（默认）、`whisper` 或一个 `whisper-cli.exe` 路径；只有选择 whisper 时才传 `--model`/`--vad-model`/`--backend`。脚本从 Git 共享元数据目录解析仓库根目录，工作树里复用同一份 `.tools`。构建输出为 `app\listen\target\release\listen.exe` 与相邻的 `libunwind.dll`；构建使用锁定且已缓存的依赖，可离线执行。
 
 直接启动 `listen.exe` 也支持 `--engine <sensevoice|whisper|whisper-cli.exe>`、`--runtime <directory>`、`--glossary <file>`、`--threads <count>`、`--hidden`，以及 SenseVoice 的 `--sherpa-lib`、`--sensevoice-model`、`--sensevoice-tokens`、`--sensevoice-vad`、`--sensevoice-language`。帮助文本见 `listen.exe --help`。
+
+存储与清理选项：
+
+- `--pending-audio-budget-mib <MiB>`：跨全部段的待处理音频预算，默认 1024（1 GiB）。统计每个 `session-*\` 里的全部普通文件（云端连续 PCM、本地重叠识别窗口、临时上传分片、修复/重试副本）以及根目录的 `.wav`/`.pcm`；已保存的文字与索引不占这份预算。
+- `--pending-audio-warn-mib <MiB>`：接近预算的警告线，默认预算的五分之四；只提示，不阻止任何操作，且不会高于预算。
+- `--free-disk-floor-mib <MiB>`：运行目录所在卷必须保留的空闲空间，默认 1024（1 GiB）。
+- 达到或超过待处理音频预算（`storage_level=full`）或磁盘余量到达底线（`storage_level=disk_low`）时，不会开始新的采集；正在采集的段会被停止，已经收到的声音、旧段和待取结果都保留在本机，不会被覆盖或删除。清理是显式操作：托盘「清理待处理段」或 `--control delete-segment:<n>`，按面板显示的采集序号删除单个段的待处理音频和/或待取结果。
+- `--control retry|cleanup` 仍只作用于最近一个失败捕获保留的音频；`delete-segment:<n>` 作用于指定段，其他段（包括仍在处理或等待联网的段）不受影响。
 
 ## 术语表（专名校正）
 
@@ -66,7 +78,7 @@ Rust | re
 
 ## 云端识别试用（显式选择）
 
-只有主动用 `--cloud-trial ali` 启动时，应用才会在免费保护、共享费用账本和业务空间鉴权均通过后，把本段耳机音频及开始时固定的术语发给阿里云；核验失败不发送音频，保留已收到的本地录音。日常默认仍是本地 SenseVoice。原生 Message 的真实应用及计费验收尚未完成，配置、数据范围与限制见 [#29 试用指南](docs/issue-29-cloud-trial.md)。
+只有主动用 `--cloud-trial ali` 启动时，应用才会在免费保护、共享费用账本和业务空间鉴权均通过后，把本段耳机音频及开始时固定的术语发给阿里云；核验失败不发送音频，保留已收到的本地录音。日常默认仍是本地 SenseVoice。费用上，CNY 50 是首轮共享硬上限；每月 CNY 100 只是提醒线，并在本月合计达到 90 元（90%）时就提前提醒，提醒不会停止采集、取消录音或提高额度。原生 Message 的真实应用及计费验收尚未完成，配置、数据范围与限制见 [#29 试用指南](docs/issue-29-cloud-trial.md)。
 
 ## Windows 交付包（现状）
 
@@ -79,12 +91,17 @@ Rust | re
 | 内容 | 用途 |
 | --- | --- |
 | `current-result.txt` | 当前完整 UTF-8 转写文本；成功后覆盖，不建立会议历史 |
+| `segments.json` | 带版本的多段索引：采集序号、状态、文字文件名、交付方式、每段费用、捕获时的术语快照和 `current_sequence`；重启恢复与“哪一段是当前结果”的依据。版本不匹配或损坏时只报告降级，不静默重写 |
+| `segment-NNNNNNNN.txt` | 某一段自己的完整文字（8 位采集序号）。结果待取、失败或崩溃窗口时保留；确认追加成功后随该段索引一起删除，不是“每段永久归档” |
+| `delivery.json` | 带版本的交付记录，状态取值固定为 `pending|started|appended|fallback|uncertain`：写目标前先落盘 `started`、确认读回后记 `appended`，`started`/`uncertain` 永不自动重写。历史按条数与字节有界修剪，`pending`/`started`/`uncertain` 永不删除 |
+| `playback.state` | 仅云端连续 PCM 段：`committed_bytes=` 与 `clean_stop=`，是异常退出后判断录音是否完整结束的结束标记 |
+| `recovered.pcm` / `recovered.wav` | 仅在需要修复时生成在该段目录内（云端截断 PCM 的可读前缀 / 本地损坏识别窗口的重拼）；计入待处理音频预算，随完整文字保存后的音频清理释放 |
 | `panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新，供自动化读取 |
-| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、各段耗时、进程 ID；不含转写正文 |
+| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、`segments.json`/`delivery.json` 降级、等待/待取段数、`storage_level`/`storage_fault`、各段耗时、进程 ID；不含转写正文 |
 | `latency.jsonl` | 每次采集/失败的准备、采集启动、收尾、识别、保存、交付耗时；不含音频 |
-| 本次会话临时目录 | 采集音频与本地诊断；成功后删除，失败时保留以便人工恢复 |
+| 本次会话临时目录 | `session-*` 下是采集音频（云端连续 PCM + `pcm-format.txt`/`playback.state`，或本地重叠识别窗口）、临时上传分片与修复副本；完整文字保存后释放，失败时保留以便人工恢复 |
 
-失败时保留本次已采集音频，并在状态和面板中提供“重试本地识别”和“清理失败音频”（`--control retry|cleanup` 走同一入口）。重试只重新运行本地识别并投递给采集开始时绑定的原目标，不重放、不切换云端。长会话中已有识别窗口成功消费后，不提供整段自动重试，状态会明确说明并列出剩余音频路径。成功识别后清理临时音频；清理后不会再用同一音频重试。
+失败时保留本次已采集音频，并在状态和面板中提供“重试本地识别”和“清理失败音频”（`--control retry|cleanup` 走同一入口）。重试只重新运行本地识别并投递给采集开始时绑定的原目标，不重放、不切换云端。长会话中已有识别窗口成功消费后，不提供整段自动重试，状态会明确说明并列出剩余音频路径。失败段的保留音频不会拒绝下一次采集：新段照常绑定自己的目标并采集，旧段仍可在面板中重试或按采集序号显式删除（`--control delete-segment:<n>`）。成功识别后清理临时音频；清理后不会再用同一音频重试。
 
 ## 署名与许可
 

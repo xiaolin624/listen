@@ -51,7 +51,7 @@
 .\scripts\run-listen.ps1 -Control show
 ```
 
-也可直接启动 `app\listen\target\release\listen.exe --cloud-trial ali --runtime <目录>`。`--cloud-trial ali` 不能与 `--engine` 组合。省略试用选择则沿用日常本地引擎；试用失败不会调用本地引擎或豆包。正常 Ctrl+Alt+R、开始/停止、展开结果面板及 `--control` 仍是同一应用入口。
+也可直接启动 `app\listen\target\release\listen.exe --cloud-trial ali --runtime <目录>`。`--cloud-trial ali` 不能与 `--engine` 组合。省略试用选择则沿用日常本地引擎；试用失败不会调用本地引擎或其它厂商。正常 Ctrl+Alt+R、开始/停止、展开结果面板及 `--control` 仍是同一应用入口。
 
 以上命令显式选择原生试用；**开始后只有免费保护核验、账本持久化及业务空间握手鉴权均通过才会发送云端模型任务和音频**。无配置、缺密钥、非法型号/地域给出本机修正提示；保护核验失败会说明本次未发送音频，并保留收到的本地音频。面板及 `status.txt` 的 `backend` 能查看厂商、实际受支持型号、地域和首轮合计上限。助手和应用不会自动购买套餐、增加预算或改变日常默认。
 
@@ -68,7 +68,7 @@
 
 ## 50 元共享账本
 
-固定位置：`%LOCALAPPDATA%\Listen\cloud-trial\ledger.json`，独立于 `--runtime`。阿里、后续第二厂商、重试和最终验收必须复用这份账本，不能各建一份 50 元额度。账本不自动按月重置；日常 100 元/月提醒没有在本票实现。
+固定位置：`%LOCALAPPDATA%\Listen\cloud-trial\ledger.json`，独立于 `--runtime`。阿里、重试和最终验收必须复用这份账本，不能各建一份 50 元额度。账本不自动按月重置；日常 100 元/月提醒没有在本票实现。
 
 每次请求先在跨进程排他锁内持久化费用准入及最高现金费用预留，再允许连接和建立模型任务。所有已结算估计与未决预留之和加新预留不得超过 50 元。金额用整数纳元；每次尝试记录 provider/model/region、segment/task ID、费率或免费保护来源、核验时间、累计用量、是否取得最终用量、估计费用与未知原因。账单实际扣款单独为未知，未填成 0。
 

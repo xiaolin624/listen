@@ -45,9 +45,9 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 2. 用 `powershell -ExecutionPolicy Bypass -File .\scripts\configure-cloud-trial.ps1` 在本机配置 Workspace ID 和 API Key（Key 为隐藏输入，不经过命令行）。
 3. 双击 **`启动 Listen 云端试用.cmd`**，等待就绪后按 **Ctrl+Alt+R**，操作与本地相同。
 
-`runtime-cloud\status.txt` 的 `backend=` 和结果面板会显示实际厂商、型号、地域。缺凭据、配置非法、免费保护核验失败或网络中断时的行为，费用上限（CNY 50）、每月提醒线（CNY 100，仅提醒）、数据外发范围和实际账单仍需自行核对等，均见 **[CLOUD-TRIAL.md](CLOUD-TRIAL.md)**。
+`runtime-cloud\status.txt` 的 `backend=` 和结果面板会显示实际厂商、型号、地域。缺凭据、配置非法、免费保护核验失败或网络中断时的行为，费用上限（CNY 50）、每月提醒线（CNY 100，达到 90 元即提醒，仅提醒，不停采集或加额度）、数据外发范围和实际账单仍需自行核对等，均见 **[CLOUD-TRIAL.md](CLOUD-TRIAL.md)**。
 
-本地备用是显式选择：关闭云端模式，双击 `启动 Listen.cmd` 做新的本机识别采集。云端不会在失败后自动改用本地结果，本地模式也不会自动读取 `runtime-cloud\` 的待处理录音。
+本地备用是显式选择：关闭云端模式，双击 `启动 Listen.cmd` 做新的本机识别采集。云端不会在失败后自动改用本地结果，本地模式也不会自动读取 `runtime-cloud\` 的待处理音频。
 
 ## 模型准备（不包含模型时）
 
@@ -99,7 +99,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - **复制完整结果**：只写剪贴板，不粘贴、不发送；
 - **重试**：对失败捕获保留的音频重新识别（云端模式下是同一厂商的新请求，会计费和再次核验保护）；
 - **清理失败音频**：删除保留的失败音频，之后不能再用它重试；
-- **删除待处理段**：按采集顺序清理指定段的待处理录音和待取结果，不影响其他段；
+- **删除待处理段**：按采集顺序清理指定段的待处理音频和待取结果，不影响其他段；
 - **精修（不可用）**：没有 `DEEPSEEK_API_KEY` 时明确置灰；精修仍需你单独触发；
 - **关闭**：隐藏面板，程序继续在托盘运行。
 
@@ -140,12 +140,12 @@ Rust | re
 | `runtime\status.txt` | 当前阶段、说明、采集端点、准备/精修/提示状态、面板可见性、失败保留音频路径与各段耗时；不含转写正文 |
 | `runtime\latency.jsonl` | 每次采集的准备/采集启动/收尾/识别/保存/交付耗时；不含音频 |
 | `runtime\` 下本次会话临时目录 | 本地采集音频与后端日志；成功后删除，失败时保留以便人工处理 |
-| `runtime-cloud\` | 云端试用独立运行目录；若存在待处理录音，只有再次打开云端试用时才会继续 |
+| `runtime-cloud\` | 云端试用独立运行目录；若存在待处理音频，只有再次打开云端试用时才会继续 |
 | `%LOCALAPPDATA%\Listen\cloud-trial\ali.json` | 云端非秘密配置：工作空间、固定型号和地域 |
 | `%LOCALAPPDATA%\Listen\cloud-trial\ledger.json` | 共享 CNY 50 试用账本；不随包分发、不自动重置 |
 | Windows Credential Manager `Listen/CloudTrial/Alibaba/cn-beijing` | 当前用户的云端 API Key；不在包内、状态或日志中 |
 
-确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理录音保留在自己的运行目录，不用本地模式冒充处理。
+确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理音频保留在自己的运行目录，不用本地模式冒充处理。
 
 ## 版本与验证
 

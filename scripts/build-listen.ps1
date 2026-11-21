@@ -27,12 +27,12 @@ $strict = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
     switch ($Task) {
-        'Build' { & $cargo build --offline --locked --release --manifest-path $manifest 2>&1 | ForEach-Object { Write-Host $_ } }
-        'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session 2>&1 | ForEach-Object { Write-Host $_ } }
-        'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture 2>&1 | ForEach-Object { Write-Host $_ } }
-        'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture 2>&1 | ForEach-Object { Write-Host $_ } }
-        'Format' { & $cargo fmt --manifest-path $manifest 2>&1 | ForEach-Object { Write-Host $_ } }
-        'CheckFormat' { & $cargo fmt --manifest-path $manifest --check 2>&1 | ForEach-Object { Write-Host $_ } }
+        'Build' { & $cargo build --offline --locked --release --manifest-path $manifest 2>&1 | ForEach-Object { Write-Output $_ } }
+        'BuildHarness' { & $cargo build --offline --locked --release --manifest-path $manifest --example long_session 2>&1 | ForEach-Object { Write-Output $_ } }
+        'Test' { & $cargo test --offline --locked --manifest-path $manifest -- --nocapture 2>&1 | ForEach-Object { Write-Output $_ } }
+        'Quality' { & $cargo test --offline --locked --manifest-path $manifest --test local_quality -- --ignored --nocapture 2>&1 | ForEach-Object { Write-Output $_ } }
+        'Format' { & $cargo fmt --manifest-path $manifest 2>&1 | ForEach-Object { Write-Output $_ } }
+        'CheckFormat' { & $cargo fmt --manifest-path $manifest --check 2>&1 | ForEach-Object { Write-Output $_ } }
     }
     $code = $LASTEXITCODE
 }
