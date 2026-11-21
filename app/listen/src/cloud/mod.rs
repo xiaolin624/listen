@@ -14,6 +14,7 @@ use crate::{
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
+        SegmentUsage,
     },
 };
 pub(crate) use budget::atomic_write as persist_result;
@@ -462,6 +463,41 @@ impl RecognitionSessions for CloudSessions {
             progress,
             description: self.settings.description(),
         }))
+    }
+    /// What the shared trial ledger recorded for exactly this segment, including
+    /// every automatic rebuild and an explicit retry. The segment identity is the
+    /// capture directory name, so another segment's cost can never be mixed in.
+    fn segment_usage(&self, directory: &std::path::Path) -> Option<SegmentUsage> {
+        let segment = segment_name(directory).ok()?;
+        let snapshot = self.ledger.snapshot().ok()?;
+        let attempts: Vec<&Attempt> = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.segment_id == segment)
+            .collect();
+        let first = attempts.first()?;
+        let mut estimated = Some(0u64);
+        let mut unknown = false;
+        for attempt in &attempts {
+            match attempt.estimated_nanoyuan.or(attempt.billed_nanoyuan) {
+                Some(value) => {
+                    estimated = estimated.map(|total| total.saturating_add(value));
+                }
+                None => {
+                    // An unfinished request is not a zero-cost request.
+                    unknown = true;
+                    estimated = None;
+                }
+            }
+        }
+        Some(SegmentUsage {
+            provider: first.provider.clone(),
+            model: first.model.clone(),
+            region: first.region.clone(),
+            requests: attempts.len().min(u32::MAX as usize) as u32,
+            estimated_nanoyuan: estimated,
+            unknown,
+        })
     }
     /// Reprocess the exact retained recording on the explicit user request. This
     /// is a new, separately reserved remote task tied to the same segment; it never

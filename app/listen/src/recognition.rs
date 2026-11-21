@@ -7,9 +7,10 @@ use crate::{
     preparation_note,
     streaming::{self, CaptureProgress, RecognitionWorker},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -52,6 +53,22 @@ pub struct RecognitionReadiness {
     pub backend: Option<String>,
     pub elapsed_ms: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentUsage {
+    pub provider: String,
+    pub model: String,
+    pub region: String,
+    /// Every request that belongs to this one segment, including automatic
+    /// reconnect attempts and an explicit retry.
+    pub requests: u32,
+    /// The estimated cost in nano-CNY, only when every request's cost is known.
+    /// An unknown part is never reported as zero.
+    pub estimated_nanoyuan: Option<u64>,
+    /// At least one request's cost is not known yet.
+    pub unknown: bool,
 }
 
 pub struct SessionRequest {
@@ -117,6 +134,12 @@ pub trait RecognitionSessions: Send {
         request: SessionRequest,
         audio: CapturedAudio,
     ) -> AppResult<Box<dyn RecognitionSession>>;
+    /// What this engine knows about one segment's paid usage, for the segment's
+    /// own durable record. The default reports nothing (the local engine meters no
+    /// cost), so an adapter that cannot measure usage never invents a number.
+    fn segment_usage(&self, _directory: &Path) -> Option<SegmentUsage> {
+        None
+    }
 }
 
 pub trait RecognitionSession: Send {

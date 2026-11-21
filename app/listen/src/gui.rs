@@ -331,6 +331,7 @@ impl Ui {
                     || last.refine != state.refine
                     || last.refined_text != state.refined_text
                     || last.notice != state.notice
+                    || last.segments != state.segments
             });
             let phase_changed = self
                 .last
@@ -360,7 +361,7 @@ impl Ui {
                 .map(|notice| notice.text().replace('\r', "").replace('\n', " "))
                 .unwrap_or_default();
             let status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -443,6 +444,12 @@ impl Ui {
                     .recognition
                     .map(|state| state.name())
                     .unwrap_or("none"),
+                state
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.state.in_flight())
+                    .count(),
+                panel::pending_results(&state).len(),
             );
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
