@@ -80,7 +80,7 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
         }
         Refine::Running => Some("正在精修：只发送文字，不发送音频；当前结果暂时保留。".into()),
         Refine::Applied => Some(match snapshot.delivery {
-            Some(Delivery::Fallback) => {
+            Some(Delivery::Fallback) | Some(Delivery::Uncertain) => {
                 "精修完成：没有目标输入框可替换，精修结果已保存为当前结果。".into()
             }
             _ => "精修已应用：目标输入框中的本次转写已替换为精修结果，请检查后手动发送。".into(),
@@ -103,6 +103,7 @@ fn headline(snapshot: &Snapshot) -> &'static str {
         Phase::Result => match snapshot.delivery {
             Some(Delivery::Appended) => "已完成：结果已追加到目标输入框",
             Some(Delivery::Fallback) => "已完成：结果只在面板中",
+            Some(Delivery::Uncertain) => "已完成：是否已写入目标无法确认，结果只在面板中",
             None => "已完成",
         },
         Phase::NoSpeech => "没有检测到语音",
@@ -134,6 +135,9 @@ fn summary(snapshot: &Snapshot) -> &'static str {
             }
             Some(Delivery::Fallback) => {
                 "结果没有追加到目标输入框（没有有效目标，或写入未能确认）。完整文本在下方，请复制后手动粘贴。"
+            }
+            Some(Delivery::Uncertain) => {
+                "是否已写入原目标无法确认（上一进程的写入结果不确定，或响应丢失）；没有再次写入。完整文本在下方，请先检查原目标再复制处理。"
             }
             None => "本次没有向任何目标写入文字；当前完整结果在下方。",
         },
@@ -185,6 +189,9 @@ pub fn segment_label(segment: &SegmentSummary) -> &'static str {
         SegmentState::Result => match segment.delivery {
             Some(Delivery::Appended) => "已完成，结果已追加到目标输入框",
             Some(Delivery::Fallback) => "已完成，结果只在面板中，尚未写入任何输入框",
+            Some(Delivery::Uncertain) => {
+                "已完成，是否已写入原目标无法确认；结果保留在面板中，没有再次写入"
+            }
             None => "已完成",
         },
         SegmentState::NoSpeech => "没有检测到语音",
@@ -194,7 +201,8 @@ pub fn segment_label(segment: &SegmentSummary) -> &'static str {
 
 /// One complete result that is still waiting to be taken, oldest first. The current
 /// result is shown by [`result_text`] itself, so only the other pending results are
-/// listed here; a later segment never replaces an earlier entry.
+/// listed here; a later segment never replaces an earlier entry. A delivery whose
+/// write may have happened is still a result the user must take or check.
 pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
     snapshot
         .segments
@@ -202,7 +210,10 @@ pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
         .filter(|segment| {
             !segment.text.is_empty()
                 && segment.state == SegmentState::Result
-                && segment.delivery == Some(Delivery::Fallback)
+                && matches!(
+                    segment.delivery,
+                    Some(Delivery::Fallback) | Some(Delivery::Uncertain)
+                )
                 && snapshot.text != segment.text
         })
         .collect()
@@ -339,7 +350,10 @@ fn deletable(segment: &SegmentSummary) -> bool {
     match segment.state {
         SegmentState::Capturing | SegmentState::NoSpeech => false,
         SegmentState::WaitingForNetwork | SegmentState::Processing | SegmentState::Failed => true,
-        SegmentState::Result => segment.delivery == Some(Delivery::Fallback),
+        SegmentState::Result => matches!(
+            segment.delivery,
+            Some(Delivery::Fallback) | Some(Delivery::Uncertain)
+        ),
     }
 }
 
@@ -515,6 +529,11 @@ pub fn auto_open_key(snapshot: &Snapshot) -> Option<String> {
         Phase::Result if snapshot.delivery == Some(Delivery::Fallback) => {
             Some(format!("fallback:{}", snapshot.text))
         }
+        // A result whose write may have happened still needs the user: it is not a
+        // calm "already appended" and it must not be discovered only by accident.
+        Phase::Result if snapshot.delivery == Some(Delivery::Uncertain) => {
+            Some(format!("uncertain:{}", snapshot.text))
+        }
         _ => None,
     }
 }
@@ -646,6 +665,49 @@ mod tests {
             "{fallback_text}"
         );
         assert_ne!(appended_text, fallback_text);
+    }
+
+    #[test]
+    fn a_recovered_result_whose_write_may_have_happened_is_not_shown_as_a_plain_panel_fallback() {
+        // #35: after a restart an unknown delivery must never read like "nothing was
+        // written" and never like "already appended".
+        let uncertain = result("重启后恢复的完整结果", Delivery::Uncertain);
+        let shown = text(&uncertain);
+        assert!(
+            shown.starts_with("已完成：是否已写入目标无法确认"),
+            "{shown}"
+        );
+        assert!(shown.contains("没有再次写入"), "{shown}");
+        assert!(shown.contains("请先检查原目标"), "{shown}");
+        assert!(
+            !shown.contains("尚未写入任何输入框"),
+            "an unknown write is not a proven fallback: {shown}"
+        );
+        assert_ne!(
+            shown,
+            text(&result("重启后恢复的完整结果", Delivery::Fallback))
+        );
+
+        // It still counts as a result the user must take or check, and it is offered
+        // for explicit cleanup like any other pending result.
+        let mut state = result("重启后恢复的完整结果", Delivery::Uncertain);
+        state.segments = vec![
+            segment(1, SegmentState::Result, "旧结果", Some(Delivery::Uncertain)),
+            segment(
+                2,
+                SegmentState::Result,
+                "当前结果",
+                Some(Delivery::Appended),
+            ),
+        ];
+        state.text = "当前结果".into();
+        assert_eq!(pending_results(&state).len(), 1);
+        assert_eq!(deletable_segments(&state), vec![1]);
+        assert_eq!(
+            auto_open_key(&state).as_deref(),
+            Some("uncertain:当前结果"),
+            "an uncertain result is not hidden behind a calm appended delivery"
+        );
     }
 
     #[test]

@@ -124,6 +124,36 @@ pub(crate) enum LatePlan {
     Keep { reason: String },
 }
 
+/// The durable delivery state of one segment, as a restart recovery pass reads
+/// it (#35). A target handle cannot survive a restart, so this record is the only
+/// evidence of what happened to the target before the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryState {
+    /// The stop-time draft was read; no write was decided yet.
+    Pending,
+    /// A write was attempted and its outcome is unknown. Never appended again.
+    Started,
+    /// A complete append was confirmed and read back.
+    Appended,
+    /// Nothing was written; the complete text stays this segment's pending result.
+    Fallback,
+    /// A write may have happened and cannot be proven. Never appended again.
+    Uncertain,
+}
+
+impl DeliveryState {
+    fn parse(state: &str) -> Option<Self> {
+        match state {
+            PENDING => Some(Self::Pending),
+            STARTED => Some(Self::Started),
+            APPENDED => Some(Self::Appended),
+            FALLBACK => Some(Self::Fallback),
+            UNCERTAIN => Some(Self::Uncertain),
+            _ => None,
+        }
+    }
+}
+
 /// The durable delivery record, shared by the application thread and every
 /// delivery worker. One mutex keeps the in-memory state and the file consistent.
 pub(crate) struct DeliveryLedger {
@@ -192,6 +222,18 @@ impl DeliveryLedger {
             return None;
         }
         self.lock().problem.clone()
+    }
+
+    /// Every recorded delivery state, for the startup recovery pass (#35). It is
+    /// read once while no delivery worker exists yet, so it cannot race a write.
+    pub fn states(&self) -> BTreeMap<u64, DeliveryState> {
+        self.lock()
+            .segments
+            .iter()
+            .filter_map(|(sequence, record)| {
+                DeliveryState::parse(&record.state).map(|state| (*sequence, state))
+            })
+            .collect()
     }
 
     /// Record the draft read when a segment stopped. Only the first read is kept:

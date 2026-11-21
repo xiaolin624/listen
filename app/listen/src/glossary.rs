@@ -116,6 +116,25 @@ impl Glossary {
     pub fn canonical_terms(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.canonical.as_str())
     }
+    /// Rebuild the fixed 术语表 snapshot of a capture from the canonical terms
+    /// recorded with it, so a segment recovered after a restart is processed
+    /// again with its capture-time terms instead of whatever the glossary file
+    /// holds at the next launch (#35). Aliases were never part of the recorded
+    /// snapshot; recognition only needs the canonical spellings.
+    pub fn from_canonical_terms(terms: &[String]) -> Self {
+        if terms.is_empty() {
+            return Self::default();
+        }
+        let text = terms
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The terms came from a parsed file, so this parse can only fail for a
+        // corrupted record; an empty glossary is safer than a guessed one.
+        Self::parse(&text).unwrap_or_default()
+    }
     /// Read the glossary from a human-editable file. A missing file is an empty
     /// glossary; an unreadable or malformed file is an explicit error.
     pub fn load(path: impl AsRef<Path>) -> AppResult<Self> {

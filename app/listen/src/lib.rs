@@ -17,6 +17,7 @@ pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
 pub mod recognition;
+pub(crate) mod recovery;
 pub(crate) mod segments;
 #[cfg(windows)]
 pub mod sensevoice;
@@ -271,6 +272,11 @@ pub enum Control {
 pub enum Delivery {
     Appended,
     Fallback,
+    /// A write to the original target had started (or may have happened) and its
+    /// outcome cannot be proven — a lost response, or a process that ended while
+    /// the write was in flight. The complete result is kept and is never written
+    /// again automatically (#34, #35); the panel says the state may already hold it.
+    Uncertain,
 }
 
 /// The always-observable 精修 state. It is reported next to, not instead of, `Phase`:
@@ -602,6 +608,14 @@ struct SegmentSession {
     delivery: Option<Delivery>,
     usage: Option<SegmentUsage>,
     timing: Timing,
+    /// This segment was recovered from a previous process after a restart (#35).
+    /// Its original target cannot be reused, so its result is always a late,
+    /// panel-only result even when the recognition adapter reports a normal one.
+    recovered: bool,
+    /// The recovery fact that must survive later status refreshes (#35): the
+    /// recording was not re-recorded, an incomplete one is not a complete
+    /// recording, and the old target is not reused. `None` for a normal capture.
+    recovery_note: Option<String>,
 }
 
 /// What a successful append left behind. The bound target is kept alive so a later
@@ -1151,6 +1165,14 @@ pub struct Application {
     usage_pending: bool,
     /// Segments whose own cost still needs a safe-point ledger read.
     segment_usage_pending: BTreeSet<u64>,
+    /// A query is exiting: no recovered recording is started any more, because a
+    /// quit must not spend a new request. Set by [`Application::prepare_exit`].
+    exiting: bool,
+    /// Startup recovery from the previous process (#35): what was found, and the
+    /// capture-ordered queue of recordings that must be processed again. Only one
+    /// old segment is processed at a time, and only while no capture or current
+    /// result owns the recognition capacity.
+    recovery: recovery::Recovery,
 }
 
 impl Application {
@@ -1255,12 +1277,17 @@ impl Application {
             usage_reminder_announced: false,
             usage_pending: false,
             segment_usage_pending: BTreeSet::new(),
+            exiting: false,
+            recovery: recovery::Recovery::default(),
         };
         // The durable ledger already exists before the first capture, so the cost
         // this tool has accumulated is readable immediately and after a restart.
         // This is also the one safe place to raise an already-reached reminder.
         application.refresh_storage();
         application.refresh_usage();
+        // Whatever the previous process left behind is recovered before the first
+        // user action, so a restart continues the work instead of losing it (#35).
+        application.recover_previous_session();
         application
     }
 
@@ -1452,6 +1479,361 @@ impl Application {
         }
     }
 
+    /// Recover what the previous process left in the runtime directory (#35).
+    ///
+    /// A segment whose complete text is already durable becomes its own pending
+    /// result and is never recognized again; its audio is released because the
+    /// text is now the durable copy. A segment that still only has its recording
+    /// is validated and queued for background processing in capture order. No
+    /// target is bound: a target handle cannot survive a restart, so every
+    /// recovered result stays in the panel.
+    fn recover_previous_session(&mut self) {
+        let deliveries = self.delivery.states();
+        let delivery_problem = self.delivery.problem().is_some();
+        let mut plan = recovery::plan(
+            &self.runtime,
+            self.store.records(),
+            &deliveries,
+            delivery_problem,
+        );
+        if plan.is_empty() {
+            return;
+        }
+        // The current 术语表 is the only term source for a segment whose index entry
+        // was lost; it is resolved at the first poll, after the caller configured its
+        // glossary, and the detail says the capture-time snapshot could not be kept.
+        let mut problems = plan.problems.clone();
+        problems.extend(plan.adopt(&self.runtime, &mut self.store, &[]));
+        let mut recovered = plan.segments;
+        let mut resumed = 0;
+        let mut texts = 0;
+        for segment in &mut recovered {
+            // A version-1 record from before the term snapshot existed cannot prove
+            // which terms this capture used; the current file is used at the first
+            // poll and the detail says so.
+            if segment.resumable && segment.glossary_terms.is_empty() {
+                segment.detail.push_str(" The fixed term snapshot of this segment was not recorded, so the current 术语表 is used when it is processed again.");
+            }
+            if segment.resumable {
+                resumed += 1;
+            } else if segment.text.is_some() {
+                texts += 1;
+            }
+            // The complete text is durably readable, so the production audio is no
+            // longer the only recovery basis. This is the crash window "the result
+            // was saved but the audio was not cleaned yet".
+            if segment.release_audio
+                && let Some(directory) = &segment.directory
+            {
+                match fs::remove_dir_all(directory) {
+                    Ok(()) => {
+                        segment.retained_paths.clear();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        segment.retained_paths = audio_paths(directory);
+                        problems.push(format!(
+                            "Segment {}'s complete text was recovered, but its temporary audio could not be released ({error}); the result is still complete and the remaining audio is kept.",
+                            segment.sequence
+                        ));
+                    }
+                }
+            }
+            let recovered_segment = self.recovered_segment(segment);
+            // The durable record now says what recovery decided, so the next launch
+            // repeats no work and the pending result keeps its own delivery state.
+            if let Some(record) = self.store.record_mut(segment.sequence) {
+                record.state = recovered_segment.state.name().to_owned();
+                record.detail = recovered_segment.detail.clone();
+                if let Some(text) = &recovered_segment.text {
+                    record.text_file = Some(SegmentStore::text_name(segment.sequence));
+                    record.text_chars = text.chars().count();
+                }
+                if let Some(delivery) = recovered_segment.delivery {
+                    record.delivery = Some(delivery_name(delivery).into());
+                }
+                record.updated_utc = segments::now_utc();
+            }
+            self.segments.push(recovered_segment);
+        }
+        if self.store.problem().is_none()
+            && let Err(error) = self.store.persist()
+        {
+            self.note_record_problem(error);
+        }
+        // The newest recovered complete result is the current result, exactly as it
+        // was before the restart. `text` is only the newest one; every older result
+        // keeps its own entry in the panel.
+        self.adopt_recovered_current_result();
+        let problems = {
+            let mut all = problems;
+            if let Some(problem) = self.store.problem() {
+                all.push(problem.to_string());
+            }
+            all
+        };
+        self.recovery.start(recovered, problems);
+        if let Some(summary) = self.recovery.summary() {
+            let detail = recovery::summary_detail(summary);
+            if !detail.is_empty() {
+                if self.snapshot.detail.is_empty() {
+                    self.snapshot.detail = detail;
+                } else {
+                    self.snapshot.detail.push('\n');
+                    self.snapshot.detail.push_str(&detail);
+                }
+            }
+        }
+        if self.control_error.is_none() && self.snapshot.phase != Phase::Failure {
+            if resumed > 0 {
+                self.snapshot.phase = Phase::Processing;
+                self.snapshot.recognition = Some(SessionState::AwaitingFinal);
+            } else if texts > 0 {
+                self.snapshot.phase = Phase::Result;
+                self.snapshot.recognition = Some(SessionState::Complete);
+                self.snapshot.delivery = self.recovered_current_delivery();
+            } else if self
+                .segments
+                .last()
+                .is_some_and(|segment| segment.state == SegmentState::Failed)
+            {
+                // An unfinished capture became a failure before the restart and
+                // there is nothing to process again: the newest segment is still a
+                // failure, and its kept audio must not be hidden behind a calm
+                // "ready".
+                self.snapshot.phase = Phase::Failure;
+                self.snapshot.recognition = Some(SessionState::Failed);
+            }
+        }
+        // Whatever was already durable stays listed even before the first poll.
+        if !self.snapshot.text.is_empty() {
+            self.snapshot.refine = match self.refine_availability() {
+                Ok(()) => Refine::Available,
+                Err(reason) => Refine::Unavailable(reason),
+            };
+        }
+        self.segments_dirty = true;
+        self.refresh_segments();
+        self.refresh_recovery_snapshot();
+        // The first recording starts on the first `poll`, after every builder
+        // (`with_glossary`, `with_targets`) has been applied; a target is still
+        // never bound to a recovered segment.
+    }
+
+    /// Rebuild one application segment from what the previous process left. It has
+    /// no session handle and no usable target: a recovered result is panel-only.
+    fn recovered_segment(&mut self, recovered: &recovery::RecoveredSegment) -> SegmentSession {
+        let session_state = match recovered.state {
+            SegmentState::Processing => SessionState::AwaitingFinal,
+            SegmentState::Failed => SessionState::Failed,
+            SegmentState::NoSpeech | SegmentState::Result => SessionState::Complete,
+            SegmentState::Capturing | SegmentState::WaitingForNetwork => {
+                SessionState::AwaitingFinal
+            }
+        };
+        SegmentSession {
+            id: SessionId(0),
+            sequence: recovered.sequence,
+            directory: recovered.directory.clone().unwrap_or_default(),
+            handle: None,
+            stopped: true,
+            terminal: !recovered.resumable,
+            // A draft read needs a live target; after a restart there is none, so
+            // the delivery record already says the original target is unusable.
+            stop_draft_requested: true,
+            finalizing: false,
+            stop_requested: None,
+            retry_audio: None,
+            glossary: glossary::Glossary::from_canonical_terms(&recovered.glossary_terms),
+            target: Err(recovery::NO_TARGET_AFTER_RESTART.into()),
+            retained: None,
+            retained_paths: recovered.retained_paths.clone(),
+            state: recovered.state,
+            session_state,
+            detail: recovered.detail.clone(),
+            storage_note: None,
+            endpoint: None,
+            progress: CaptureProgress::default(),
+            capture_start_ms: None,
+            text: recovered.text.clone(),
+            delivery: recovered.delivery,
+            usage: recovered.usage.clone(),
+            timing: Timing::default(),
+            recovered: true,
+            recovery_note: recovered.note.clone(),
+        }
+    }
+
+    /// Decide which recovered capture owns the current result.
+    ///
+    /// `current-result.txt` is the durable current result and the index records
+    /// which capture produced it, so a restart keeps the exact order: an older
+    /// recovered segment that finishes later must not take the current result from
+    /// a newer capture that had already delivered. Only when nothing durable was
+    /// current (the process died before the mirror and the index order were
+    /// written) does the newest recovered complete text become current — and the
+    /// text itself is not duplicated on disk, because its own segment file is the
+    /// durable copy.
+    fn adopt_recovered_current_result(&mut self) {
+        let mut current_sequence = self.store.current_sequence();
+        if self.snapshot.text.is_empty() {
+            let newest = self
+                .segments
+                .iter()
+                .filter_map(|segment| {
+                    segment
+                        .text
+                        .as_ref()
+                        .map(|text| (segment.sequence, text.clone()))
+                })
+                .max_by_key(|(sequence, _)| *sequence);
+            if let Some((sequence, text)) = newest {
+                current_sequence = sequence;
+                self.snapshot.text = text;
+            }
+        } else if current_sequence == 0
+            && let Some(sequence) = self
+                .segments
+                .iter()
+                .find(|segment| segment.text.as_deref() == Some(self.snapshot.text.as_str()))
+                .map(|segment| segment.sequence)
+        {
+            // An index written before the order was recorded: the text itself
+            // proves which capture produced it, so a resumed older segment cannot
+            // claim the current result later.
+            current_sequence = sequence;
+            self.store.set_current_sequence(sequence);
+            if self.store.problem().is_none()
+                && let Err(error) = self.store.persist()
+            {
+                self.note_record_problem(error);
+            }
+        }
+        self.current_sequence = current_sequence;
+        self.snapshot.delivery = self.recovered_current_delivery();
+    }
+
+    fn recovered_current_delivery(&self) -> Option<Delivery> {
+        self.segments
+            .iter()
+            .find(|segment| segment.sequence == self.current_sequence)
+            .and_then(|segment| segment.delivery)
+    }
+
+    /// Process the next recovered recording, but only while no capture and no
+    /// current result owns the recognition capacity. Only one old segment runs at
+    /// a time, so a new capture always wins and an old segment's failure cannot
+    /// block it.
+    fn advance_recovery(&mut self) {
+        // A quit must never start a new paid request, and a live capture keeps the
+        // capacity for the user's current work.
+        if self.exiting {
+            return;
+        }
+        let busy = self.refine_job.is_some()
+            || self
+                .segments
+                .iter()
+                .any(|segment| segment.handle.is_some() && !segment.terminal);
+        if busy {
+            return;
+        }
+        let Some(resume) = self.recovery.take_next() else {
+            return;
+        };
+        self.resume_recovered(resume);
+    }
+
+    /// Hand one recovered recording back to the recognition adapter. Its original
+    /// target is recorded as unusable first, so no later delivery can claim a
+    /// write this process cannot prove.
+    fn resume_recovered(&mut self, resume: recovery::Resume) {
+        let sequence = resume.sequence;
+        let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.sequence == sequence)
+        else {
+            return;
+        };
+        self.delivery
+            .record_no_target(sequence, recovery::NO_TARGET_AFTER_RESTART);
+        // A capture-time term snapshot is used when it was recorded. A lost index
+        // entry (or a version-1 record) has none, so the current 术语表 is resolved
+        // now and recorded with the segment for later restarts.
+        let terms: Vec<String> = if resume.glossary_terms.is_empty() {
+            self.glossary_file()
+                .and_then(|path| glossary::Glossary::load(path).ok())
+                .map(|loaded| loaded.canonical_terms().map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            resume.glossary_terms.clone()
+        };
+        let recovered_glossary = glossary::Glossary::from_canonical_terms(&terms);
+        self.segments[index].glossary = recovered_glossary.clone();
+        if let Some(record) = self.store.record_mut(sequence)
+            && record.glossary_terms.is_empty()
+            && !terms.is_empty()
+        {
+            record.glossary_terms = terms;
+            record.updated_utc = segments::now_utc();
+            if self.store.problem().is_none()
+                && let Err(error) = self.store.persist()
+            {
+                self.note_record_problem(error);
+            }
+        }
+        let audio = CapturedAudio {
+            path: resume.audio.path.clone(),
+            description: resume.audio.description.clone(),
+        };
+        let id = self.next_id();
+        let request = SessionRequest {
+            id,
+            directory: self.segments[index].directory.clone(),
+            glossary: recovered_glossary,
+        };
+        let detail = self.segments[index].detail.clone();
+        match self.sessions.retry(request, audio) {
+            Ok(handle) => {
+                let segment = &mut self.segments[index];
+                segment.id = id;
+                segment.handle = Some(handle);
+                segment.state = SegmentState::Processing;
+                segment.session_state = SessionState::AwaitingFinal;
+                // The recovered/incomplete note stays until the adapter's own
+                // status says something more specific.
+                segment.detail = detail;
+                self.persist_segment(index);
+            }
+            Err(error) => {
+                let error = format!(
+                    "The recovered recording could not be processed again automatically: {error}"
+                );
+                self.fail_segment(index, error, Timing::default());
+                self.segments[index]
+                    .detail
+                    .push_str(recovery::KEPT_AFTER_FAILED_RESUME);
+                self.segments[index].retained_paths = resume.audio.retained.clone();
+                self.segments[index].state = SegmentState::Failed;
+                self.segments[index].terminal = true;
+                self.persist_segment(index);
+                self.segments_dirty = true;
+                self.refresh_recovery_snapshot();
+                if index + 1 == self.segments.len() {
+                    self.snapshot.detail = self.segments[index].detail.clone();
+                    if let Some(summary) = self.recovery.summary() {
+                        let line = recovery::summary_detail(summary);
+                        if !line.is_empty() {
+                            self.snapshot.detail.push('\n');
+                            self.snapshot.detail.push_str(&line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Use a specific 术语表 file for this application. The default is the first
     /// existing of `<runtime>/glossary.txt` and `glossary.txt` next to the
     /// executable, unless the process default was set from `--glossary`.
@@ -1459,7 +1841,6 @@ impl Application {
         self.glossary_paths = vec![path.into()];
         self
     }
-
     /// The 术语表 file currently used, if one exists. The runtime copy wins over
     /// the copy next to the executable so a per-user edit still applies.
     pub fn glossary_file(&self) -> Option<&Path> {
@@ -1522,6 +1903,7 @@ impl Application {
     pub fn with_refine(mut self, refine: Arc<dyn RefineText>) -> Self {
         self.refine_port = Some(refine);
         self.snapshot.refine = match self.refine_availability() {
+            Ok(()) if !self.snapshot.text.is_empty() => Refine::Available,
             Ok(()) => Refine::Unavailable("No complete result is available to refine yet.".into()),
             Err(reason) => Refine::Unavailable(reason),
         };
@@ -1843,7 +2225,8 @@ impl Application {
         })();
         match result {
             Ok((id, directory, handle, status, glossary)) => {
-                let (sequence, record_error) = self.store.begin(&directory, &status.detail);
+                let terms: Vec<String> = glossary.canonical_terms().map(str::to_owned).collect();
+                let (sequence, record_error) = self.store.begin(&directory, &status.detail, &terms);
                 let capture_start_ms = Some(elapsed_ms(start_requested));
                 let segment = SegmentSession {
                     id,
@@ -1871,6 +2254,8 @@ impl Application {
                     delivery: None,
                     usage: None,
                     timing: Timing::default(),
+                    recovered: false,
+                    recovery_note: None,
                 };
                 self.snapshot.endpoint = segment.endpoint.clone();
                 self.snapshot.recognition = Some(status.state);
@@ -2137,7 +2522,10 @@ impl Application {
         let pending_payload = segment.state.in_flight()
             || segment.state == SegmentState::Failed
             || (segment.state == SegmentState::Result
-                && segment.delivery == Some(Delivery::Fallback))
+                && matches!(
+                    segment.delivery,
+                    Some(Delivery::Fallback) | Some(Delivery::Uncertain)
+                ))
             || segment.retained.is_some()
             || !segment.retained_paths.is_empty();
         if !pending_payload {
@@ -2192,6 +2580,9 @@ impl Application {
         }
         self.segments.remove(index);
         self.segments_dirty = true;
+        // A deleted segment can never be processed again, so its background
+        // recovery entry must not survive the delete.
+        self.recovery.forget(sequence);
         if let Err(error) = self.store.remove(sequence) {
             self.note_record_problem(error);
         }
@@ -2378,6 +2769,9 @@ impl Application {
         // Cost summaries and per-segment cost are read only once no recognition
         // session is alive, so the ledger's admission lock is never contended.
         self.flush_deferred_usage();
+        // Continue the capture-ordered background recovery now that any finished
+        // session released the capacity; a new capture always wins it first.
+        self.advance_recovery();
         // A degraded delivery record is reported once. It never stops capture or a
         // normal append; it only means a late result cannot be proven safe and stays
         // pending.
@@ -2408,9 +2802,13 @@ impl Application {
         let previous_state = self.segments[index].state;
         // A storage stop's reason is kept beside the adapters' own progress detail,
         // so a later status refresh cannot silently turn it back into a normal
-        // capture message.
+        // capture message. The recovery fact is kept for the same reason (#35).
         let mut detail = status.detail.clone();
         if let Some(note) = &self.segments[index].storage_note {
+            detail.push('\n');
+            detail.push_str(note);
+        }
+        if let Some(note) = &self.segments[index].recovery_note {
             detail.push('\n');
             detail.push_str(note);
         }
@@ -2521,7 +2919,12 @@ impl Application {
                 timing.capture_start_ms = self.segments[index].capture_start_ms;
                 self.segments[index].terminal = true;
                 if let Some(audio) = retry_audio {
-                    self.segments[index].retained = Some(RetainedCapture { audio });
+                    // A recovered segment already keeps its audio on disk and must
+                    // never block a new capture with a stale retry entry (#35); the
+                    // failure detail still lists the retained paths.
+                    if !self.segments[index].recovered {
+                        self.segments[index].retained = Some(RetainedCapture { audio });
+                    }
                 }
                 self.segments[index].timing = timing.clone();
                 if primary {
@@ -2558,6 +2961,11 @@ impl Application {
         // is a storage fault that keeps the audio as the recovery basis.
         self.storage.check_text_budget(&self.runtime, text)?;
         let name = self.store.write_text(sequence, text)?;
+        // The durable index says which capture owns the current result, so a restart
+        // knows it even when an older segment's record is the only one left (#35).
+        if current {
+            self.store.set_current_sequence(sequence);
+        }
         if let Some(record) = self.store.record_mut(sequence) {
             record.text_file = Some(name);
             record.text_chars = text.chars().count();
@@ -2581,7 +2989,10 @@ impl Application {
         let sequence = self.segments[index].sequence;
         let directory = self.segments[index].directory.clone();
         let description = result.description.clone();
-        let recovered = result.recovered;
+        // A result is late when the adapter had to recover it, and a recovered
+        // segment's result is late by definition: its target cannot survive a
+        // restart, so it must never be appended automatically (#35).
+        let recovered = result.recovered || self.segments[index].recovered;
         let text = result.text.clone();
         let retry_audio = self.segments[index].retry_audio.take();
         let target = std::mem::replace(&mut self.segments[index].target, Ok(None));
@@ -2698,6 +3109,10 @@ impl Application {
             segment.detail = format!(
                 "No valid speech detected; nothing was delivered.\nPlayback: {description}"
             );
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
+            }
             segment.timing = timing.clone();
         }
         // A no-speech segment has no result to keep, so its audio and record go.
@@ -2790,6 +3205,12 @@ impl Application {
             segment.delivery = Some(delivery);
             segment.timing = timing.clone();
             segment.detail = detail.clone();
+            // A recovered result keeps saying that it came back after a restart and
+            // that an incomplete recording's text is not a passing transcript.
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
+            }
         }
         let mut cleanup_error = None;
         match fs::remove_dir_all(&delivered.directory) {
@@ -2895,6 +3316,13 @@ impl Application {
                     ". The capture was interrupted, so this text is incomplete and kept with this segment: {}. This is not a completed transcription.",
                     partial.chars().count()
                 ));
+            }
+            // A recovered segment's failure says it came from the previous session
+            // and, when its recording was incomplete, that nothing here was a
+            // complete recording.
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
             }
         }
         self.segments_dirty = true;
@@ -3079,15 +3507,92 @@ impl Application {
         self.segments_dirty = true;
     }
 
+    /// Quit support (#35): stop a live capture and wait, bounded, only until the
+    /// audio the device already received is flushed durably. The cloud request is
+    /// never waited for — whatever it has not confirmed stays an unfinished segment
+    /// and is recovered automatically on the next launch. Returns the sentence the
+    /// caller can show as the final status; nothing is deleted or delivered here.
+    pub fn prepare_exit(&mut self, budget: std::time::Duration) -> String {
+        let started = Instant::now();
+        // Quitting must not start another recovered recording or a new request.
+        self.exiting = true;
+        if self.is_capturing() {
+            self.dispatch(Control::Stop);
+        }
+        loop {
+            self.poll();
+            let live: Vec<usize> = self
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(_, segment)| {
+                    segment.finalizing || (segment.handle.is_some() && !segment.terminal)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                break;
+            }
+            // A local capture has no cloud spool: its windows are closed by the
+            // device stop itself, so only a short grace is needed for the last one.
+            let mut cloud_flushed = true;
+            let mut local_live = false;
+            for index in &live {
+                let directory = &self.segments[*index].directory;
+                if recovery::has_cloud_spool(directory) {
+                    cloud_flushed &= recovery::audio_flushed(directory);
+                } else {
+                    local_live = true;
+                }
+            }
+            if cloud_flushed && (!local_live || elapsed >= LOCAL_EXIT_FLUSH_GRACE) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let unfinished = self
+            .segments
+            .iter()
+            .any(|segment| segment.finalizing || (segment.handle.is_some() && !segment.terminal));
+        let note = if unfinished {
+            "Quitting without waiting for the cloud: the received playback audio is saved on this machine and the unfinished segment is recovered automatically on the next launch. No result is written to any target."
+                .to_string()
+        } else {
+            "The received playback audio was saved before quitting; there is no unfinished segment to recover on the next launch."
+                .to_string()
+        };
+        if !self.snapshot.detail.contains(&note) {
+            if !self.snapshot.detail.is_empty() {
+                self.snapshot.detail.push('\n');
+            }
+            self.snapshot.detail.push_str(&note);
+        }
+        self.segments_dirty = true;
+        self.refresh_segments();
+        note
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
     }
 }
 
+/// How long a quit may wait for the playback device to finish writing the audio it
+/// already received. It is deliberately much shorter than any cloud deadline: the
+/// unfinished result is recovered on the next launch (#35).
+pub const EXIT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// The same bound for a local capture, whose last window is closed by the device.
+const LOCAL_EXIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
         Delivery::Appended => "appended",
         Delivery::Fallback => "fallback",
+        Delivery::Uncertain => "uncertain",
     }
 }
 
@@ -3110,7 +3615,7 @@ fn failure_detail(error: &str, retained_audio: &[PathBuf]) -> String {
 
 /// Every audio file still under one segment's directory, recursively. Used only to
 /// report what is recoverable; nothing here is deleted.
-fn audio_paths(directory: &Path) -> Vec<PathBuf> {
+pub(crate) fn audio_paths(directory: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![directory.to_path_buf()];
     while let Some(directory) = pending.pop() {

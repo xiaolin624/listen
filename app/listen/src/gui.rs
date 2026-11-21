@@ -641,7 +641,10 @@ impl Ui {
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &icon);
             }
             self.last = Some(state.clone());
-            if self.quit_requested && !matches!(state.phase, Phase::Capturing | Phase::Processing) {
+            if self.quit_requested {
+                // `prepare_exit` already stopped the capture and flushed the audio it
+                // received; the rest of the work is recovered on the next launch, so
+                // quitting never waits for a cloud request (#35).
                 let _ = DestroyWindow(self.hwnd);
             }
         }
@@ -734,16 +737,13 @@ impl Ui {
                 9 | ID_COPY_RESULT => self.copy_result(),
                 10 => self.app.dispatch(Control::Refine),
                 5 | ID_EXIT => {
+                    // Quitting never waits for the cloud (#35). The application
+                    // stops a live capture, gives the playback device a bounded
+                    // moment to flush the audio it already received, and leaves the
+                    // unfinished segment for the next launch to recover.
+                    self.app.prepare_exit(listen::EXIT_FLUSH_BUDGET);
                     self.quit_requested = true;
-                    if self.app.snapshot().phase == Phase::Capturing {
-                        self.app.dispatch(Control::Stop);
-                    }
-                    if !matches!(
-                        self.app.snapshot().phase,
-                        Phase::Capturing | Phase::Processing
-                    ) {
-                        let _ = DestroyWindow(self.hwnd);
-                    }
+                    let _ = DestroyWindow(self.hwnd);
                 }
                 // The tray's per-segment cleanup submenu and --control
                 // delete-segment:<n> share this id scheme.
