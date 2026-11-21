@@ -53,7 +53,13 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a pasted value may take to appear in the accessible value before the
 /// slower clipboard read-back is used instead. Every waiting path is bounded.
-const PASTE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(300);
+///
+/// This window includes the time the older code spent in fixed sleeps after the
+/// paste (`KEY_SETTLE` + 220 ms), so the target still has the same total time to
+/// publish the pasted text before the clipboard read-back is used. What changed
+/// (#38) is that a responsive editor is confirmed as soon as its accessible value
+/// matches instead of always waiting out the fixed sleeps.
+const PASTE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(520);
 /// The caller's wait covers the confirmation window plus the fallback paste sequence.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ANCESTORS: usize = 64;

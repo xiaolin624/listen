@@ -294,18 +294,23 @@ pub fn read_draft(guard: &dyn Fn() -> AppResult<()>) -> AppResult<String> {
 }
 
 /// Pastes `text` at the current caret position.
+///
+/// The clipboard write is synchronous, so no fixed wait is needed before the
+/// paste key. The caller confirms the pasted result through the accessible value
+/// (bounded by `PASTE_CONFIRM_TIMEOUT`) before falling back to a clipboard
+/// read-back, so the confirm window — not a fixed sleep — is what proves the
+/// paste landed. A responsive editor therefore confirms immediately instead of
+/// waiting out the settle time, while a slow one still gets the same total window.
 pub fn paste(text: &str, guard: &dyn Fn() -> AppResult<()>) -> AppResult<()> {
     // Do not overwrite the clipboard if the target already lost focus.
     (guard)()?;
     write_text(text)?;
-    thread::sleep(KEY_SETTLE);
     let mut sink = RealKeys;
     let mut keys = Keys {
         sink: &mut sink,
         guard,
     };
     keys.chord(VK_CONTROL, VK_V)?;
-    thread::sleep(Duration::from_millis(220));
     Ok(())
 }
 

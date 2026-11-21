@@ -11,6 +11,7 @@ mod free_only;
 mod transport;
 use crate::{
     AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, UsageSummary, elapsed_ms,
+    millis_between,
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
@@ -707,6 +708,11 @@ fn run(
     // replayed from the retained PCM, never from an in-memory copy.
     let mut next_task = initial_task;
     let mut attempts = 0u32;
+    // The last successful transport connect (#38). The first connection happens
+    // during capture; the final one is the attempt whose confirmation the stop
+    // path waits for.
+    #[allow(unused_assignments)]
+    let mut connect_ms = None;
     loop {
         attempts += 1;
         if let Some(error) = capture.failure() {
@@ -737,8 +743,12 @@ fn run(
             }
         };
         link.connecting();
+        let connect_started = Instant::now();
         let mut socket = match transport.connect(settings, key) {
-            Ok(socket) => socket,
+            Ok(socket) => {
+                connect_ms = Some(elapsed_ms(connect_started));
+                socket
+            }
             Err(error) if retryable(&error) => {
                 // The session is not failed: the capture keeps saving audio
                 // while the connection is retried with a bounded backoff.
@@ -785,6 +795,7 @@ fn run(
             &vocabulary,
             &mut description,
             started_at,
+            connect_ms,
         ) {
             Ok(mut result) => {
                 capture.stop();
@@ -975,6 +986,7 @@ fn stream_attempt(
     vocabulary: &serde_json::Map<String, Value>,
     description: &mut String,
     started_at: Instant,
+    connect_ms: Option<u64>,
 ) -> Result<SessionResult, AttemptError> {
     let max_pcm_bytes = policy.max_pcm_bytes();
     let within_time = || {
@@ -997,17 +1009,34 @@ fn stream_attempt(
     let mut ready = false;
     let mut finish_sent = None;
     let mut sent = 0u64;
+    // #38 stages: the first whole-task handshake and the moment the capture itself
+    // is fully finalised (device joined, spool flushed). The drain and the final
+    // confirmation are timed from these.
+    let mut first_task_started_ms = None;
+    let mut outcome_at: Option<Instant> = None;
+    // How many 100 ms PCM chunks are pushed per loop pass. A recovery replay may
+    // have a whole recording queued; pushing one chunk per 2 ms sleep would make
+    // the old segment's drain (and therefore its stop-to-result) scale with the
+    // recording length instead of with the network.
+    const MAX_CHUNKS_PER_PASS: usize = 64;
     // Text belongs to this attempt only: a rebuilt task regenerates all of it
     // from the replayed audio, so no sentence from an earlier connection is kept.
     let mut sentences = BTreeMap::<u64, String>::new();
     let mut pending = BTreeSet::new();
     loop {
         within_time()?;
+        // Whether this pass moved audio or received an event. The loop only sleeps
+        // when it made no progress, so the final drain of a stopped capture (and a
+        // recovery replay) is limited by the socket, not by a fixed 2 ms per chunk.
+        let mut progressed = false;
         if let Some(error) = capture.failure() {
             capture.stop();
             return Err(AttemptError::Device(capture_failure(&error)));
         }
         let captured = capture.outcome();
+        if captured.is_some() && outcome_at.is_none() {
+            outcome_at = Some(Instant::now());
+        }
         if let Some(audio) = &captured {
             match audio {
                 Ok(audio) => *description = audio.description.clone(),
@@ -1022,6 +1051,7 @@ fn stream_attempt(
             let Some(raw) = socket.poll().map_err(classify)? else {
                 break;
             };
+            progressed = true;
             if raw.len() > 1024 * 1024 {
                 return Err(AttemptError::Blocked(CloudError::Protocol.to_string()));
             }
@@ -1034,7 +1064,12 @@ fn stream_attempt(
                 .as_str()
                 .ok_or_else(|| AttemptError::Blocked(CloudError::Protocol.to_string()))?;
             match kind {
-                "task-started" => ready = true,
+                "task-started" => {
+                    ready = true;
+                    if first_task_started_ms.is_none() {
+                        first_task_started_ms = Some(elapsed_ms(started_at));
+                    }
+                }
                 "result-generated" if ready => {
                     ledger
                         .observe(task, reported_usage(&event["payload"]["usage"]), false)
@@ -1080,6 +1115,7 @@ fn stream_attempt(
                     }
                 }
                 "task-finished" if finish_sent.is_some() => {
+                    let finished_at = Instant::now();
                     ledger
                         .observe(task, reported_usage(&event["payload"]["usage"]), true)
                         .map_err(|error| AttemptError::Blocked(error.to_string()))?;
@@ -1095,6 +1131,21 @@ fn stream_attempt(
                         ),
                         timing: Timing {
                             recognition_ms: Some(elapsed_ms(started_at)),
+                            cloud_connect_ms: connect_ms,
+                            first_task_started_ms,
+                            // Stop finalisation is the device join and spool flush;
+                            // the vendor can only be asked to finish once both are
+                            // complete.
+                            finalize_ms: outcome_at
+                                .zip(capture.stopped_at())
+                                .map(|(outcome, stopped_at)| millis_between(outcome, stopped_at)),
+                            cloud_drain_ms: outcome_at
+                                .zip(finish_sent)
+                                .map(|(outcome, finish_sent)| millis_between(finish_sent, outcome)),
+                            // Whole-task confirmation only: this is the vendor's
+                            // `task-finished`, never an intermediate sentence.
+                            cloud_final_ms: finish_sent
+                                .map(|finish_sent| millis_between(finished_at, finish_sent)),
                             ..Timing::default()
                         },
                         stopped_at: capture.stopped_at(),
@@ -1111,11 +1162,15 @@ fn stream_attempt(
             }
         }
         if ready {
-            if let Some(pcm) = stream.next().map_err(|error| {
-                AttemptError::Blocked(format!(
-                    "Cannot read the retained audio: {error}. Received audio is retained on this machine"
-                ))
-            })? {
+            for _ in 0..MAX_CHUNKS_PER_PASS {
+                let Some(pcm) = stream.next().map_err(|error| {
+                    AttemptError::Blocked(format!(
+                        "Cannot read the retained audio: {error}. Received audio is retained on this machine"
+                    ))
+                })?
+                else {
+                    break;
+                };
                 if sent.saturating_add(pcm.len() as u64) > max_pcm_bytes {
                     return Err(AttemptError::Blocked(
                         "Verified upload allowance reached; no unreserved PCM was sent, received audio is retained".into(),
@@ -1124,6 +1179,7 @@ fn stream_attempt(
                 within_time()?;
                 socket.send_audio(&pcm).map_err(classify)?;
                 sent += pcm.len() as u64;
+                progressed = true;
             }
             if stream.drained() && captured.is_some() && finish_sent.is_none() {
                 within_time()?;
@@ -1131,6 +1187,7 @@ fn stream_attempt(
                     .send_text(&finish_task_text(task))
                     .map_err(classify)?;
                 finish_sent = Some(Instant::now());
+                progressed = true;
             }
         }
         if (!ready && connecting_at.elapsed() > Duration::from_secs(15))
@@ -1142,7 +1199,9 @@ fn stream_attempt(
         {
             return Err(AttemptError::Transient(CloudError::Timeout));
         }
-        thread::sleep(Duration::from_millis(2));
+        if !progressed {
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 

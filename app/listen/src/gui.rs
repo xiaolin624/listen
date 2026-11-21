@@ -7,7 +7,7 @@ use crate::{
 };
 use listen::{
     Application, Control, Delivery, Phase, Refine, Snapshot, UsageSummary, deepseek::DeepSeek,
-    paste, target::NativeTargets,
+    paste, recognition::SessionState, target::NativeTargets,
 };
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
@@ -47,8 +47,14 @@ const ID_COPY_RESULT: usize = 108;
 const DELETE_SEGMENT_ID_BASE: usize = 200;
 /// The highest capture order a 16-bit `WM_COMMAND` id can carry.
 const MAX_DELETABLE_SEQUENCE: u64 = 60_000;
-/// How often the application snapshot is polled and `status.txt` is refreshed.
+/// How often the application snapshot is polled and `status.txt` is refreshed
+/// while idle.
 const POLL_TIMER_MS: u32 = 100;
+/// While a stopped capture is still being finalised or delivered, a 100 ms poll
+/// would add up to a whole tick to every step between "session confirmed" and
+/// "target written". The stop path is short enough that a faster tick costs
+/// almost nothing, and it is only used while `Phase::Processing`.
+const PROCESSING_POLL_TIMER_MS: u32 = 10;
 
 struct Ui {
     app: Application,
@@ -77,6 +83,9 @@ struct Ui {
     /// user-visible surfaces) but suppresses transient tray notifications.
     notify: bool,
     quit_requested: bool,
+    /// The currently installed status-timer interval, so it is only changed when
+    /// the stop path needs the faster tick.
+    poll_ms: u32,
 }
 thread_local! { static UI: RefCell<Option<Ui>> = const { RefCell::new(None) }; }
 
@@ -229,6 +238,7 @@ pub fn run(config: Config) -> Result<(), String> {
             tray: false,
             notify: !config.hidden,
             quit_requested: false,
+            poll_ms: POLL_TIMER_MS,
         };
         let mut icon = state.icon_data();
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
@@ -312,6 +322,23 @@ impl Ui {
         unsafe {
             self.app.poll();
             let state = self.app.snapshot();
+            // The poll is the only consumer of the session's final event and of a
+            // finished delivery. While a stopped capture is being finalised, a
+            // 100 ms tick would add up to a whole tick to each of those steps, so
+            // the stop path uses a 10 ms tick. Waiting for the network is not
+            // shortened: that wait is not on the millisecond scale and must not
+            // turn into a busy poll.
+            let interval = if state.phase == Phase::Processing
+                && state.recognition != Some(SessionState::WaitingForNetwork)
+            {
+                PROCESSING_POLL_TIMER_MS
+            } else {
+                POLL_TIMER_MS
+            };
+            if interval != self.poll_ms {
+                self.poll_ms = interval;
+                SetTimer(Some(self.hwnd), 1, interval, None);
+            }
             let visual = capsule_state(&state);
             // The capsule draws itself; this only pushes a changed visual state.
             self.capsule.set_state(visual);
@@ -528,6 +555,27 @@ impl Ui {
                 ),
                 None => "storage_level=none\n".into(),
             });
+            // #38: the one stop-to-confirmed-backfill number and the stages behind
+            // it are appended. Existing keys keep their exact meaning, so scripts
+            // that read `timing_stop_to_result_ms` are unaffected.
+            let milliseconds =
+                |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+            status.push_str(&format!(
+                "timing_stop_to_confirmed_ms={}\ntiming_cloud_connect_ms={}\ntiming_first_task_started_ms={}\ntiming_cloud_drain_ms={}\ntiming_cloud_final_ms={}\ntiming_event_wait_ms={}\ntiming_delivery_queue_ms={}\ntiming_apply_wait_ms={}\ntiming_schedule_ms={}\ntiming_delivery_lock_ms={}\ntiming_delivery_read_ms={}\ntiming_delivery_write_ms={}\ntiming_delivery_save_ms={}\n",
+                milliseconds(timing.stop_to_confirmed_ms),
+                milliseconds(timing.cloud_connect_ms),
+                milliseconds(timing.first_task_started_ms),
+                milliseconds(timing.cloud_drain_ms),
+                milliseconds(timing.cloud_final_ms),
+                milliseconds(timing.event_wait_ms),
+                milliseconds(timing.delivery_queue_ms),
+                milliseconds(timing.apply_wait_ms),
+                milliseconds(timing.schedule_ms),
+                milliseconds(timing.delivery_lock_ms),
+                milliseconds(timing.delivery_read_ms),
+                milliseconds(timing.delivery_write_ms),
+                milliseconds(timing.delivery_save_ms),
+            ));
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
             // cannot see.
