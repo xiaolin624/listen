@@ -1492,24 +1492,19 @@ impl Application {
             return;
         }
         // The current 术语表 is the only term source for a segment whose index entry
-        // was lost; the detail says the capture-time snapshot could not be kept.
-        let current_terms: Vec<String> = self
-            .glossary_file()
-            .and_then(|path| glossary::Glossary::load(path).ok())
-            .map(|loaded| loaded.canonical_terms().map(str::to_owned).collect())
-            .unwrap_or_default();
+        // was lost; it is resolved at the first poll, after the caller configured its
+        // glossary, and the detail says the capture-time snapshot could not be kept.
         let mut problems = plan.problems.clone();
-        problems.extend(plan.adopt(&mut self.store, &current_terms));
+        problems.extend(plan.adopt(&self.runtime, &mut self.store, &[]));
         let mut recovered = plan.segments;
         let mut resumed = 0;
         let mut texts = 0;
         for segment in &mut recovered {
             // A version-1 record from before the term snapshot existed cannot prove
-            // which terms this capture used; the current file is used and said so.
-            if segment.resumable && segment.glossary_terms.is_empty() && !current_terms.is_empty()
-            {
-                segment.glossary_terms = current_terms.clone();
-                segment.detail.push_str(" The fixed term snapshot of this segment was not recorded by the previous version, so the current 术语表 is used for the recovered processing.");
+            // which terms this capture used; the current file is used at the first
+            // poll and the detail says so.
+            if segment.resumable && segment.glossary_terms.is_empty() {
+                segment.detail.push_str(" The fixed term snapshot of this segment was not recorded, so the current 术语表 is used when it is processed again.");
             }
             if segment.resumable {
                 resumed += 1;
@@ -1601,9 +1596,9 @@ impl Application {
         self.segments_dirty = true;
         self.refresh_segments();
         self.refresh_recovery_snapshot();
-        // Start the oldest recovered recording at once; the rest follow one at a
-        // time from `poll`, so a new capture always wins the capacity first.
-        self.advance_recovery();
+        // The first recording starts on the first `poll`, after every builder
+        // (`with_glossary`, `with_targets`) has been applied; a target is still
+        // never bound to a recovered segment.
     }
 
     /// Rebuild one application segment from what the previous process left. It has
@@ -1652,36 +1647,53 @@ impl Application {
         }
     }
 
-    /// Make the newest recovered complete text the current result, and keep the
-    /// durable `current-result.txt` in step when it lags behind.
+    /// Decide which recovered capture owns the current result.
+    ///
+    /// `current-result.txt` is the durable current result and the index records
+    /// which capture produced it, so a restart keeps the exact order: an older
+    /// recovered segment that finishes later must not take the current result from
+    /// a newer capture that had already delivered. Only when nothing durable was
+    /// current (the process died before the mirror and the index order were
+    /// written) does the newest recovered complete text become current — and the
+    /// text itself is not duplicated on disk, because its own segment file is the
+    /// durable copy.
     fn adopt_recovered_current_result(&mut self) {
-        let newest = self
-            .segments
-            .iter()
-            .filter_map(|segment| {
-                segment
-                    .text
-                    .as_ref()
-                    .map(|text| (segment.sequence, text.clone()))
-            })
-            .max_by_key(|(sequence, _)| *sequence);
-        let Some((sequence, text)) = newest else {
-            return;
-        };
-        self.current_sequence = sequence;
-        self.snapshot.text = text.clone();
-        self.snapshot.delivery = self.recovered_current_delivery();
-        let current_result = self.runtime.join("current-result.txt");
-        let differs = fs::read_to_string(&current_result)
-            .map(|existing| existing != text)
-            .unwrap_or(true);
-        if differs
-            && let Err(error) = cloud::persist_result(&current_result, text.as_bytes())
+        let mut current_sequence = self.store.current_sequence();
+        if self.snapshot.text.is_empty() {
+            let newest = self
+                .segments
+                .iter()
+                .filter_map(|segment| {
+                    segment
+                        .text
+                        .as_ref()
+                        .map(|text| (segment.sequence, text.clone()))
+                })
+                .max_by_key(|(sequence, _)| *sequence);
+            if let Some((sequence, text)) = newest {
+                current_sequence = sequence;
+                self.snapshot.text = text;
+            }
+        } else if current_sequence == 0
+            && let Some(sequence) = self
+                .segments
+                .iter()
+                .find(|segment| segment.text.as_deref() == Some(self.snapshot.text.as_str()))
+                .map(|segment| segment.sequence)
         {
-            self.note_record_problem(format!(
-                "Could not save the recovered current result: {error}"
-            ));
+            // An index written before the order was recorded: the text itself
+            // proves which capture produced it, so a resumed older segment cannot
+            // claim the current result later.
+            current_sequence = sequence;
+            self.store.set_current_sequence(sequence);
+            if self.store.problem().is_none()
+                && let Err(error) = self.store.persist()
+            {
+                self.note_record_problem(error);
+            }
         }
+        self.current_sequence = current_sequence;
+        self.snapshot.delivery = self.recovered_current_delivery();
     }
 
     fn recovered_current_delivery(&self) -> Option<Delivery> {
@@ -1724,6 +1736,31 @@ impl Application {
         };
         self.delivery
             .record_no_target(sequence, recovery::NO_TARGET_AFTER_RESTART);
+        // A capture-time term snapshot is used when it was recorded. A lost index
+        // entry (or a version-1 record) has none, so the current 术语表 is resolved
+        // now and recorded with the segment for later restarts.
+        let terms: Vec<String> = if resume.glossary_terms.is_empty() {
+            self.glossary_file()
+                .and_then(|path| glossary::Glossary::load(path).ok())
+                .map(|loaded| loaded.canonical_terms().map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            resume.glossary_terms.clone()
+        };
+        let recovered_glossary = glossary::Glossary::from_canonical_terms(&terms);
+        self.segments[index].glossary = recovered_glossary.clone();
+        if let Some(record) = self.store.record_mut(sequence)
+            && record.glossary_terms.is_empty()
+            && !terms.is_empty()
+        {
+            record.glossary_terms = terms;
+            record.updated_utc = segments::now_utc();
+            if self.store.problem().is_none()
+                && let Err(error) = self.store.persist()
+            {
+                self.note_record_problem(error);
+            }
+        }
         let audio = CapturedAudio {
             path: resume.audio.path.clone(),
             description: resume.audio.description.clone(),
@@ -1732,7 +1769,7 @@ impl Application {
         let request = SessionRequest {
             id,
             directory: self.segments[index].directory.clone(),
-            glossary: self.segments[index].glossary.clone(),
+            glossary: recovered_glossary,
         };
         let detail = self.segments[index].detail.clone();
         match self.sessions.retry(request, audio) {
@@ -2897,6 +2934,11 @@ impl Application {
         // is a storage fault that keeps the audio as the recovery basis.
         self.storage.check_text_budget(&self.runtime, text)?;
         let name = self.store.write_text(sequence, text)?;
+        // The durable index says which capture owns the current result, so a restart
+        // knows it even when an older segment's record is the only one left (#35).
+        if current {
+            self.store.set_current_sequence(sequence);
+        }
         if let Some(record) = self.store.record_mut(sequence) {
             record.text_file = Some(name);
             record.text_chars = text.chars().count();

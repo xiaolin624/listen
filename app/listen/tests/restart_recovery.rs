@@ -46,7 +46,11 @@ impl Runtime {
         &self.0
     }
     fn app(&self) -> PathBuf {
-        self.0.join("app")
+        let path = self.0.join("app");
+        // A crash window is written before any application exists, so the previous
+        // process's runtime directory must be creatable here.
+        fs::create_dir_all(&path).unwrap();
+        path
     }
     /// Write the glossary the first process captures with and return its path.
     fn glossary(&self, text: &str) -> PathBuf {
@@ -244,6 +248,7 @@ impl Sessions {
         directory: PathBuf,
         writer: Option<PcmSpoolWriter>,
         finalize: bool,
+        stopped: bool,
     ) -> Box<dyn RecognitionSession> {
         let (events, receiver) = mpsc::channel();
         let started = Arc::new(Started {
@@ -252,7 +257,7 @@ impl Sessions {
             writer: Mutex::new(writer),
             events: Mutex::new(Some(events)),
             receiver: Mutex::new(receiver),
-            stopped: AtomicBool::new(false),
+            stopped: AtomicBool::new(stopped),
             finalize,
         });
         registry.entries.lock().unwrap().push(started.clone());
@@ -282,6 +287,7 @@ impl RecognitionSessions for Sessions {
             request.directory,
             Some(writer),
             self.finalize,
+            false,
         ))
     }
     fn retry(
@@ -302,6 +308,7 @@ impl RecognitionSessions for Sessions {
             request.directory,
             None,
             false,
+            true,
         ))
     }
     fn segment_usage(&self, _: &Path) -> Option<SegmentUsage> {
@@ -536,12 +543,17 @@ fn corrupt_state_does_not_hide_saved_results_or_lose_an_unindexed_recording() {
     )
     .unwrap();
     let orphan = clean_capture_directory(&runtime, "session-35-orphan", &audio);
-    runtime.glossary("WASAPI\n");
+    let glossary = runtime.glossary("WASAPI\n");
 
     let mut app = application(&runtime, registry.clone(), Vec::new(), true)
-        .with_targets(Arc::new(Selection(editor.clone())));
+        .with_targets(Arc::new(Selection(editor.clone())))
+        .with_glossary(glossary);
     let recovered = wait_for(&mut app, "the recovered state", |snapshot| {
         snapshot.segments.len() == 2
+            && snapshot
+                .segments
+                .iter()
+                .any(|segment| segment.sequence == 4 && segment.state == SegmentState::Processing)
     });
     // The state is reported degraded, but the saved result is not hidden by it.
     assert!(
@@ -741,6 +753,9 @@ fn a_stopped_capture_is_resumed_after_a_restart_and_its_result_waits_in_the_pane
     fs::remove_file(runtime.path().join("glossary.txt")).unwrap();
     let mut app = application(&runtime, registry.clone(), Vec::new(), true)
         .with_targets(Arc::new(Selection(editor.clone())));
+    // The first poll is the GUI's own first tick: the recovered segments are
+    // already listed, and the oldest recording starts then.
+    app.poll();
     let recovered = app.snapshot();
     assert_eq!(recovered.segments.len(), 1, "{recovered:?}");
     let segment = &recovered.segments[0];
@@ -864,6 +879,9 @@ fn several_recovered_segments_keep_their_identity_and_order_and_a_new_capture_wi
     // ---- second process: both segments come back, in capture order
     let mut app =
         application(&runtime, registry.clone(), Vec::new(), true).with_targets(Arc::new(Selection(editor.clone())));
+    // The first poll starts the oldest recovered recording, exactly like the GUI's
+    // first tick; the recovered list itself is already visible.
+    app.poll();
     let recovered = app.snapshot();
     assert_eq!(recovered.segments.len(), 2, "{recovered:?}");
     assert_eq!(

@@ -121,7 +121,12 @@ impl Plan {
     /// segments with their own durable records, and return the warnings the user
     /// must see. `terms` is the current 术语表: a lost index also lost the
     /// capture-time snapshot, and the detail says so.
-    pub fn adopt(&mut self, store: &mut SegmentStore, terms: &[String]) -> Vec<String> {
+    pub fn adopt(
+        &mut self,
+        runtime: &Path,
+        store: &mut SegmentStore,
+        terms: &[String],
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         for orphan in std::mem::take(&mut self.orphan_texts) {
             let detail = format!(
@@ -179,7 +184,7 @@ impl Plan {
             };
             self.segments.push(RecoveredSegment {
                 sequence,
-                directory: Some(Path::new(&orphan.name).to_path_buf()),
+                directory: Some(runtime.join(&orphan.name)),
                 state,
                 detail: detail.clone(),
                 text: None,

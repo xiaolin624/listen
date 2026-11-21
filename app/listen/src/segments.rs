@@ -68,6 +68,12 @@ pub struct SegmentRecord {
 struct Index {
     version: u32,
     next_sequence: u64,
+    /// The capture order whose complete text is the current result (#35). It is
+    /// persisted with the text file so a restart knows which segment owns
+    /// `current-result.txt`; an older segment completing later must never take it.
+    /// An index written before this field existed loads as `0`.
+    #[serde(default)]
+    current_sequence: u64,
     segments: Vec<SegmentRecord>,
 }
 
@@ -77,6 +83,7 @@ struct Index {
 pub(crate) struct SegmentStore {
     runtime: PathBuf,
     next_sequence: u64,
+    current_sequence: u64,
     segments: Vec<SegmentRecord>,
     /// Why the stored index could not be used, if it could not. The segments are
     /// still captured; only the durable record is degraded and says so.
@@ -87,12 +94,14 @@ impl SegmentStore {
     pub fn open(runtime: &Path) -> Self {
         let mut segments = Vec::new();
         let mut next_sequence = 1;
+        let mut current_sequence = 0;
         let mut problem = None;
         match fs::read(runtime.join(INDEX_FILE)) {
             Ok(bytes) => match serde_json::from_slice::<Index>(&bytes) {
                 Ok(index) if index.version == STORE_VERSION => {
                     segments = index.segments;
                     next_sequence = index.next_sequence.max(1);
+                    current_sequence = index.current_sequence;
                 }
                 Ok(index) => {
                     problem = Some(format!(
@@ -125,6 +134,7 @@ impl SegmentStore {
         Self {
             runtime: runtime.to_path_buf(),
             next_sequence,
+            current_sequence,
             segments,
             problem,
         }
@@ -133,6 +143,18 @@ impl SegmentStore {
     /// Why the durable record is degraded, if it is. Never includes a credential.
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
+    }
+
+    /// The capture order whose complete text is the current result, as recorded
+    /// when that result was saved. `0` means the record does not say.
+    pub fn current_sequence(&self) -> u64 {
+        self.current_sequence
+    }
+
+    /// Record which capture owns the current result. The caller persists separately
+    /// so the text, the current-result copy and this order land together.
+    pub fn set_current_sequence(&mut self, sequence: u64) {
+        self.current_sequence = sequence;
     }
 
     /// Every stored record, oldest capture order first.
@@ -223,6 +245,7 @@ impl SegmentStore {
         let index = Index {
             version: STORE_VERSION,
             next_sequence: self.next_sequence,
+            current_sequence: self.current_sequence,
             segments: self.segments.clone(),
         };
         let bytes = serde_json::to_vec(&index).map_err(|error| error.to_string())?;
