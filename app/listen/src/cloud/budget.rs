@@ -1,4 +1,4 @@
-//! One ledger for the entire two-provider trial, independently of runtime paths.
+//! One ledger for the entire single-vendor trial, independently of runtime paths.
 //! Only verified Token bounds or checked free-only protection admit a task.
 use super::{AliSettings, CloudError, FreeOnlyPolicy, TrialCostPolicy, VerifiedBounds};
 use crate::usage::UsageSummary;

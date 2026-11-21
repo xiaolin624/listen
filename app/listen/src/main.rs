@@ -101,7 +101,7 @@ Only that endpoint is captured; audio routed only to the default communication e
 
 Default recognition: SenseVoice q8 through sherpa-onnx, resident in this process on the CPU (AVX2 required). It is prepared on a background thread; capture can start immediately and is buffered until the model reports ready. Silence, music and notification windows are gated by Silero VAD. Whisper is not a silent fallback.
 
-The explicit Alibaba cloud trial sends this capture's continuous audio and capture-start glossary to the Beijing Message model. It keeps the local daily default unchanged and never substitutes a local result for a failed cloud task. Production trials currently refuse to send because a defensible maximum Message token cost is not yet verified; a key or billing alert does not bypass this protection.
+The explicit Alibaba cloud trial sends this capture's continuous audio and capture-start glossary to the Beijing Message model. It keeps the local daily default unchanged and never substitutes a local result for a failed cloud task. Every start must pass the live default-workspace, exact-model free-only protection check and the shared CNY 50 ledger before any audio is sent; a key or billing alert does not bypass this protection.
 
 Options:
   --cloud-trial <ali>
@@ -109,7 +109,9 @@ Options:
         Configure locally with scripts/configure-cloud-trial.ps1 (hidden key entry;
         current-user Windows Credential Manager). LISTEN_ALI_API_KEY and
         LISTEN_ALI_WORKSPACE_ID are optional process-local test injections.
-        All providers/retries must share the persisted CNY 50 first-trial ledger.
+        Every paid attempt, including retries, shares the one persisted CNY 50
+        first-trial ledger; the panel reports this tool's cumulative and monthly
+        usage, and the CNY 100/month line is a reminder, never a hard stop.
         Cannot be combined with --engine; there is no automatic cloud/local fallback.
   --engine <sensevoice|whisper|whisper-cli.exe>
         sensevoice (default) or whisper select the engine; a path selects whisper.cpp and uses that executable.

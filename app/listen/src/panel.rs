@@ -826,7 +826,7 @@ mod tests {
         let mut state = result("完整结果", Delivery::Appended);
         state.backend = Some(
             "Cloud trial: Alibaba Model Studio; model=qwen-audio-3.1-asr-flash-message; \
-             region=cn-beijing; shared two-provider trial cap=CNY 50"
+             region=cn-beijing; shared single-vendor trial cap=CNY 50"
                 .into(),
         );
         state.usage = Some(listen::UsageSummary {

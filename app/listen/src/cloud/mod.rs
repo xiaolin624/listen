@@ -142,7 +142,7 @@ impl AliSettings {
     }
     pub fn description(&self) -> String {
         format!(
-            "Cloud trial: Alibaba Model Studio; model={}; region={}; shared two-provider trial cap=CNY 50",
+            "Cloud trial: Alibaba Model Studio; model={}; region={}; shared single-vendor trial cap=CNY 50",
             if self.model == ALI_MODEL {
                 ALI_MODEL
             } else {
