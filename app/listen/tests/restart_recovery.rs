@@ -7,8 +7,8 @@
 //! through `Application::dispatch`, `poll` and `snapshot`; no paid network is
 //! contacted and no real playback device is used.
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Delivery, Phase, SegmentState, Snapshot, Target,
-    TargetSelection,
+    AppResult, Application, CapturedAudio, Control, Delivery, Phase, SegmentState, Snapshot,
+    Target, TargetSelection,
     cloud::PcmSpoolWriter,
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
@@ -157,7 +157,12 @@ impl Started {
             .unwrap()
             .take()
             .expect("this controlled session already reported its one event");
-        sender.send(SessionEvent { id: self.id, update }).unwrap();
+        sender
+            .send(SessionEvent {
+                id: self.id,
+                update,
+            })
+            .unwrap();
     }
     /// Close the recording the way a stopped playback device does, including the
     /// durable clean-stop marker.
@@ -286,9 +291,7 @@ impl RecognitionSessions for Sessions {
         fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
         let (mut writer, _stream) = PcmSpoolWriter::new(&request.directory, 2_000_000)?;
         for sample in &self.samples {
-            writer
-                .push(*sample)
-                .map_err(|error| error.to_string())?;
+            writer.push(*sample).map_err(|error| error.to_string())?;
         }
         Ok(Self::session(
             &self.registry,
@@ -308,7 +311,11 @@ impl RecognitionSessions for Sessions {
         // The attempt is what matters, whether or not the adapter could start it.
         self.registry.retries.lock().unwrap().push(Retry {
             directory: request.directory.clone(),
-            terms: request.glossary.canonical_terms().map(str::to_owned).collect(),
+            terms: request
+                .glossary
+                .canonical_terms()
+                .map(str::to_owned)
+                .collect(),
             audio: audio.path.clone(),
             audio_bytes: bytes,
         });
@@ -499,8 +506,16 @@ fn a_started_or_uncertain_delivery_is_never_replayed_after_a_restart() {
     // Two saved results whose target write is not provable: one write started and
     // one is recorded as uncertain. Their audio is already gone, so the complete
     // text is the only recovery basis.
-    fs::write(runtime.app().join("segment-00000001.txt"), "写入已开始的结果。").unwrap();
-    fs::write(runtime.app().join("segment-00000002.txt"), "写入不确定的结果。").unwrap();
+    fs::write(
+        runtime.app().join("segment-00000001.txt"),
+        "写入已开始的结果。",
+    )
+    .unwrap();
+    fs::write(
+        runtime.app().join("segment-00000002.txt"),
+        "写入不确定的结果。",
+    )
+    .unwrap();
     write_index(
         &runtime,
         3,
@@ -527,7 +542,10 @@ fn a_started_or_uncertain_delivery_is_never_replayed_after_a_restart() {
     );
     write_delivery(
         &runtime,
-        &[delivery_record(1, "started"), delivery_record(2, "uncertain")],
+        &[
+            delivery_record(1, "started"),
+            delivery_record(2, "uncertain"),
+        ],
     );
     let delivery_before = fs::read(runtime.app().join("delivery.json")).unwrap();
 
@@ -675,10 +693,7 @@ fn corrupt_state_does_not_hide_saved_results_or_lose_an_unindexed_recording() {
     app.dispatch(Control::Start);
     let capturing = app.snapshot();
     assert_eq!(
-        capturing
-            .segments
-            .last()
-            .map(|segment| segment.sequence),
+        capturing.segments.last().map(|segment| segment.sequence),
         Some(5),
         "{capturing:?}"
     );
@@ -932,8 +947,8 @@ fn several_recovered_segments_keep_their_identity_and_order_and_a_new_capture_wi
     }
 
     // ---- second process: both segments come back, in capture order
-    let mut app =
-        application(&runtime, registry.clone(), Vec::new(), true).with_targets(Arc::new(Selection(editor.clone())));
+    let mut app = application(&runtime, registry.clone(), Vec::new(), true)
+        .with_targets(Arc::new(Selection(editor.clone())));
     // The first poll starts the oldest recovered recording, exactly like the GUI's
     // first tick; the recovered list itself is already visible.
     app.poll();
@@ -964,7 +979,12 @@ fn several_recovered_segments_keep_their_identity_and_order_and_a_new_capture_wi
     // A new capture still wins: it starts immediately while the old segment is
     // being recovered in the background, and its result is delivered normally.
     app.dispatch(Control::Start);
-    assert_eq!(app.snapshot().phase, Phase::Capturing, "{:?}", app.snapshot());
+    assert_eq!(
+        app.snapshot().phase,
+        Phase::Capturing,
+        "{:?}",
+        app.snapshot()
+    );
     app.dispatch(Control::Stop);
     registry.finish(3, "新采集的结果。", false);
     let fresh = wait_for(&mut app, "the new capture's result", |snapshot| {
@@ -1069,8 +1089,24 @@ fn partial_audio_from_an_abnormal_exit_is_repaired_and_clearly_marked_incomplete
         &runtime,
         3,
         &[
-            index_record(1, "session-35-crash-1", "capturing", "capture", None, None, &[]),
-            index_record(2, "session-35-crash-2", "capturing", "capture", None, None, &[]),
+            index_record(
+                1,
+                "session-35-crash-1",
+                "capturing",
+                "capture",
+                None,
+                None,
+                &[],
+            ),
+            index_record(
+                2,
+                "session-35-crash-2",
+                "capturing",
+                "capture",
+                None,
+                None,
+                &[],
+            ),
         ],
     );
 
@@ -1082,7 +1118,9 @@ fn partial_audio_from_an_abnormal_exit_is_repaired_and_clearly_marked_incomplete
     for segment in &recovered.segments {
         assert!(
             segment.detail.to_lowercase().contains("incomplete")
-                && segment.detail.contains("neither a complete recording nor a passing transcript"),
+                && segment
+                    .detail
+                    .contains("neither a complete recording nor a passing transcript"),
             "an unprovable recording is marked clearly: {segment:?}"
         );
     }
@@ -1123,7 +1161,10 @@ fn partial_audio_from_an_abnormal_exit_is_repaired_and_clearly_marked_incomplete
             .text,
         "第一段残缺录音的可读部分。"
     );
-    assert!(!first.exists(), "the audio is released after the text is saved");
+    assert!(
+        !first.exists(),
+        "the audio is released after the text is saved"
+    );
 
     // The second recording keeps only what the marker says was committed.
     let second_retry = wait_for(&mut app, "the second partial recording", |snapshot| {
@@ -1234,7 +1275,12 @@ fn a_failed_automatic_resume_keeps_the_audio_and_never_blocks_a_new_capture() {
     );
     // A failed old segment never blocks the next capture.
     app.dispatch(Control::Start);
-    assert_eq!(app.snapshot().phase, Phase::Capturing, "{:?}", app.snapshot());
+    assert_eq!(
+        app.snapshot().phase,
+        Phase::Capturing,
+        "{:?}",
+        app.snapshot()
+    );
     assert!(directory.join("playback.pcm").is_file());
     app.dispatch(Control::Stop);
     registry.finish_newest("新采集仍然可用。", false);
@@ -1339,4 +1385,3 @@ fn quitting_does_not_wait_for_the_cloud_and_the_next_launch_recovers_the_capture
     assert_eq!(done.delivery, Some(Delivery::Fallback));
     assert_eq!(editor.draft(), "用户草稿");
 }
-

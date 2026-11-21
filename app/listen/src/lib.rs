@@ -1165,6 +1165,9 @@ pub struct Application {
     usage_pending: bool,
     /// Segments whose own cost still needs a safe-point ledger read.
     segment_usage_pending: BTreeSet<u64>,
+    /// A query is exiting: no recovered recording is started any more, because a
+    /// quit must not spend a new request. Set by [`Application::prepare_exit`].
+    exiting: bool,
     /// Startup recovery from the previous process (#35): what was found, and the
     /// capture-ordered queue of recordings that must be processed again. Only one
     /// old segment is processed at a time, and only while no capture or current
@@ -1274,6 +1277,7 @@ impl Application {
             usage_reminder_announced: false,
             usage_pending: false,
             segment_usage_pending: BTreeSet::new(),
+            exiting: false,
             recovery: recovery::Recovery::default(),
         };
         // The durable ledger already exists before the first capture, so the cost
@@ -1618,10 +1622,7 @@ impl Application {
 
     /// Rebuild one application segment from what the previous process left. It has
     /// no session handle and no usable target: a recovered result is panel-only.
-    fn recovered_segment(
-        &mut self,
-        recovered: &recovery::RecoveredSegment,
-    ) -> SegmentSession {
+    fn recovered_segment(&mut self, recovered: &recovery::RecoveredSegment) -> SegmentSession {
         let session_state = match recovered.state {
             SegmentState::Processing => SessionState::AwaitingFinal,
             SegmentState::Failed => SessionState::Failed,
@@ -1724,6 +1725,11 @@ impl Application {
     /// a time, so a new capture always wins and an old segment's failure cannot
     /// block it.
     fn advance_recovery(&mut self) {
+        // A quit must never start a new paid request, and a live capture keeps the
+        // capacity for the user's current work.
+        if self.exiting {
+            return;
+        }
         let busy = self.refine_job.is_some()
             || self
                 .segments
@@ -1805,7 +1811,9 @@ impl Application {
                     "The recovered recording could not be processed again automatically: {error}"
                 );
                 self.fail_segment(index, error, Timing::default());
-                self.segments[index].detail.push_str(recovery::KEPT_AFTER_FAILED_RESUME);
+                self.segments[index]
+                    .detail
+                    .push_str(recovery::KEPT_AFTER_FAILED_RESUME);
                 self.segments[index].retained_paths = resume.audio.retained.clone();
                 self.segments[index].state = SegmentState::Failed;
                 self.segments[index].terminal = true;
@@ -2217,10 +2225,8 @@ impl Application {
         })();
         match result {
             Ok((id, directory, handle, status, glossary)) => {
-                let terms: Vec<String> =
-                    glossary.canonical_terms().map(str::to_owned).collect();
-                let (sequence, record_error) =
-                    self.store.begin(&directory, &status.detail, &terms);
+                let terms: Vec<String> = glossary.canonical_terms().map(str::to_owned).collect();
+                let (sequence, record_error) = self.store.begin(&directory, &status.detail, &terms);
                 let capture_start_ms = Some(elapsed_ms(start_requested));
                 let segment = SegmentSession {
                     id,
@@ -3508,6 +3514,8 @@ impl Application {
     /// caller can show as the final status; nothing is deleted or delivered here.
     pub fn prepare_exit(&mut self, budget: std::time::Duration) -> String {
         let started = Instant::now();
+        // Quitting must not start another recovered recording or a new request.
+        self.exiting = true;
         if self.is_capturing() {
             self.dispatch(Control::Stop);
         }
@@ -3518,8 +3526,7 @@ impl Application {
                 .iter()
                 .enumerate()
                 .filter(|(_, segment)| {
-                    segment.finalizing
-                        || (segment.handle.is_some() && !segment.terminal)
+                    segment.finalizing || (segment.handle.is_some() && !segment.terminal)
                 })
                 .map(|(index, _)| index)
                 .collect();

@@ -103,9 +103,7 @@ fn headline(snapshot: &Snapshot) -> &'static str {
         Phase::Result => match snapshot.delivery {
             Some(Delivery::Appended) => "已完成：结果已追加到目标输入框",
             Some(Delivery::Fallback) => "已完成：结果只在面板中",
-            Some(Delivery::Uncertain) => {
-                "已完成：是否已写入目标无法确认，结果只在面板中"
-            }
+            Some(Delivery::Uncertain) => "已完成：是否已写入目标无法确认，结果只在面板中",
             None => "已完成",
         },
         Phase::NoSpeech => "没有检测到语音",

@@ -493,7 +493,15 @@ pub(crate) fn plan(
                     (SegmentState::Failed, detail, None, false, false)
                 }
                 None => {
-                    let detail = if record.state == "failed" {
+                    let delivered = matches!(delivery, Some(DeliveryState::Appended));
+                    let detail = if delivered {
+                        // The crash landed between deleting this segment's text and
+                        // dropping its index entry. The result was already delivered
+                        // and is not pending; do not resurrect it as a failure.
+                        format!(
+                            "Segment {sequence}'s complete result was already delivered to its target by the previous session, and no pending recording or separate text copy was left. Nothing is pending for this segment."
+                        )
+                    } else if record.state == "failed" {
                         format!(
                             "Segment {sequence} failed in the previous Listen session; {}. No pending recording or complete text was left to recover.",
                             record.detail
@@ -503,7 +511,13 @@ pub(crate) fn plan(
                             "Segment {sequence} has no readable recording and no saved complete text, so nothing could be recovered. Nothing was deleted."
                         )
                     };
-                    (SegmentState::Failed, detail, None, false, false)
+                    let state = if delivered {
+                        SegmentState::Result
+                    } else {
+                        SegmentState::Failed
+                    };
+                    let delivery = delivered.then_some(Delivery::Appended);
+                    (state, detail, delivery, false, false)
                 }
             },
         };
@@ -536,7 +550,8 @@ pub(crate) fn plan(
     // Artifacts the index never described: a complete text saved just before the
     // index write was lost, or a recording whose index entry never landed. They are
     // recovered instead of being treated as orphans on disk.
-    let (orphan_texts, orphan_directories) = scan_orphans(runtime, &known_sequences, &known_directories);
+    let (orphan_texts, orphan_directories) =
+        scan_orphans(runtime, &known_sequences, &known_directories);
     Plan {
         segments,
         orphan_texts,
@@ -706,8 +721,7 @@ fn recovered_audio(directory: &Path) -> Option<RecoveredAudio> {
         }
     };
     if !pcm_format_ok(directory) {
-        problems
-            .push("the recording has no matching 16 kHz mono 16-bit format descriptor".into());
+        problems.push("the recording has no matching 16 kHz mono 16-bit format descriptor".into());
     }
     let usable = (committed / 2) * 2;
     if usable != len {
@@ -842,7 +856,9 @@ fn local_audio(directory: &Path) -> Option<RecoveredAudio> {
     let path = match rejoin_windows(directory, &readable, overlap.unwrap_or(0)) {
         Ok(path) => path,
         Err(error) => {
-            problem.get_or_insert_with(|| format!("the readable windows could not be joined ({error})"));
+            problem.get_or_insert_with(|| {
+                format!("the readable windows could not be joined ({error})")
+            });
             return None;
         }
     };
@@ -906,7 +922,11 @@ fn rejoin_windows(
         .map_err(|error| format!("the rejoined recording could not be created: {error}"))?;
     let mut written = 0usize;
     for (index, (_, samples)) in windows.iter().enumerate() {
-        let skip = if index == 0 { 0 } else { overlap.min(samples.len()) };
+        let skip = if index == 0 {
+            0
+        } else {
+            overlap.min(samples.len())
+        };
         if skip < overlap && index > 0 {
             // A window shorter than the overlap cannot be trimmed exactly; keep it
             // whole rather than dropping its end.
