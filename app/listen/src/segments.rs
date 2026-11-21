@@ -54,6 +54,12 @@ pub struct SegmentRecord {
     pub delivery: Option<String>,
     /// What the engine recorded for this segment's paid requests, if anything.
     pub usage: Option<SegmentUsage>,
+    /// The fixed 术语表 snapshot of this capture, as canonical terms. A segment
+    /// recovered after a restart is processed again with exactly these terms, not
+    /// with whatever the glossary file holds at the next launch (#35). An index
+    /// written before this field existed loads as an empty snapshot.
+    #[serde(default)]
+    pub glossary_terms: Vec<String>,
     pub updated_utc: f64,
 }
 
@@ -129,9 +135,7 @@ impl SegmentStore {
         self.problem.as_deref()
     }
 
-    /// Every stored record, oldest capture order first. Used by the tests now and by
-    /// the restart recovery task (#35).
-    #[allow(dead_code)]
+    /// Every stored record, oldest capture order first.
     pub fn records(&self) -> &[SegmentRecord] {
         &self.segments
     }
@@ -142,12 +146,25 @@ impl SegmentStore {
         format!("{TEXT_PREFIX}{sequence:08}{TEXT_SUFFIX}")
     }
 
+    /// The next capture order that no record and no saved text owns. Recovery
+    /// uses it for a recording whose index entry was lost; a new capture uses it
+    /// through [`SegmentStore::begin`], so neither can reuse a sequence.
+    pub fn allocate(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.saturating_add(1);
+        sequence
+    }
+
     /// Allocate the next capture order and start its durable record. The sequence
     /// is returned even when the record cannot be written, so the in-memory capture
     /// is never lost to a storage problem.
-    pub fn begin(&mut self, directory: &Path, detail: &str) -> (u64, Option<String>) {
-        let sequence = self.next_sequence;
-        self.next_sequence = sequence.saturating_add(1);
+    pub fn begin(
+        &mut self,
+        directory: &Path,
+        detail: &str,
+        glossary_terms: &[String],
+    ) -> (u64, Option<String>) {
+        let sequence = self.allocate();
         self.segments.push(SegmentRecord {
             sequence,
             directory: directory
@@ -161,14 +178,31 @@ impl SegmentStore {
             text_chars: 0,
             delivery: None,
             usage: None,
+            glossary_terms: glossary_terms.to_vec(),
             updated_utc: now_utc(),
         });
         let error = self.persist().err();
         (sequence, error)
     }
 
+    /// Add or replace one record that recovery reconstructed from files on disk.
+    /// A record the index never described (an interrupted index save, a corrupt
+    /// index) keeps its own stable capture order and is never merged into another
+    /// segment. Returns why the index could not be written, if it could not.
+    pub fn upsert(&mut self, record: SegmentRecord) -> Option<String> {
+        self.next_sequence = self.next_sequence.max(record.sequence.saturating_add(1));
+        match self
+            .segments
+            .iter_mut()
+            .find(|stored| stored.sequence == record.sequence)
+        {
+            Some(stored) => *stored = record,
+            None => self.segments.push(record),
+        }
+        self.persist().err()
+    }
+
     /// The record of one capture order, if it is still stored.
-    #[allow(dead_code)]
     pub fn record(&self, sequence: u64) -> Option<&SegmentRecord> {
         self.segments
             .iter()
@@ -280,7 +314,8 @@ mod tests {
     fn a_saved_index_keeps_capture_order_text_files_and_usage() {
         let runtime = Runtime::new();
         let mut store = SegmentStore::open(&runtime.0);
-        let (first, error) = store.begin(&runtime.0.join("session-1"), "capturing");
+        let terms = vec!["DeepSeek Harness".to_string(), "WASAPI".to_string()];
+        let (first, error) = store.begin(&runtime.0.join("session-1"), "capturing", &terms);
         assert!(error.is_none());
         let text = store.write_text(first, "第一段完整结果。").unwrap();
         let record = store.record_mut(first).unwrap();
@@ -297,7 +332,7 @@ mod tests {
             unknown: true,
         });
         store.persist().unwrap();
-        let (second, error) = store.begin(&runtime.0.join("session-2"), "capturing");
+        let (second, error) = store.begin(&runtime.0.join("session-2"), "capturing", &terms);
         assert!(error.is_none());
         assert_eq!((first, second), (1, 2));
 
@@ -312,6 +347,7 @@ mod tests {
             records[0].usage.as_ref().map(|usage| usage.requests),
             Some(2)
         );
+        assert_eq!(records[0].glossary_terms, terms);
         assert_eq!(
             fs::read_to_string(runtime.0.join(&text)).unwrap(),
             "第一段完整结果。"
@@ -325,7 +361,7 @@ mod tests {
         // No index, only a complete text file left by an interrupted run.
         fs::write(runtime.0.join(SegmentStore::text_name(7)), "旧的待取结果").unwrap();
         let mut store = SegmentStore::open(&runtime.0);
-        let (sequence, _) = store.begin(&runtime.0.join("session-new"), "capturing");
+        let (sequence, _) = store.begin(&runtime.0.join("session-new"), "capturing", &[]);
         assert_eq!(
             sequence, 8,
             "an existing text file must never be overwritten"
@@ -343,7 +379,7 @@ mod tests {
         fs::write(&index, r#"{"version":99,"next_sequence":4,"segments":[]}"#).unwrap();
         let mut store = SegmentStore::open(&runtime.0);
         assert!(store.problem().is_some(), "{:?}", store.problem());
-        let (sequence, error) = store.begin(&runtime.0.join("session-new"), "capturing");
+        let (sequence, error) = store.begin(&runtime.0.join("session-new"), "capturing", &[]);
         assert_eq!(sequence, 1);
         assert!(error.is_some(), "the degraded record must be reported");
         assert_eq!(
@@ -351,5 +387,20 @@ mod tests {
             r#"{"version":99,"next_sequence":4,"segments":[]}"#,
             "a future index is not silently downgraded"
         );
+    }
+
+    #[test]
+    fn an_index_from_before_the_term_snapshot_still_loads_with_an_empty_snapshot() {
+        // The additive field must not make the existing version-1 index unusable.
+        let runtime = Runtime::new();
+        fs::write(
+            runtime.0.join(INDEX_FILE),
+            r#"{"version":1,"next_sequence":2,"segments":[{"sequence":1,"directory":"session-1","state":"processing","detail":"stopped","text_file":null,"text_chars":0,"delivery":null,"usage":null,"updated_utc":1.0}]}"#,
+        )
+        .unwrap();
+        let store = SegmentStore::open(&runtime.0);
+        assert!(store.problem().is_none(), "{:?}", store.problem());
+        assert_eq!(store.records().len(), 1);
+        assert!(store.records()[0].glossary_terms.is_empty());
     }
 }

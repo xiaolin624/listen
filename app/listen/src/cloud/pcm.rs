@@ -13,6 +13,13 @@ use std::{
 
 pub const PCM_CHUNK_BYTES: usize = 3_200; // 100 ms, 16 kHz mono i16
 
+/// The small durable descriptor that lets a later process decide whether a
+/// `playback.pcm` was closed normally and how many bytes were committed. It is
+/// written atomically only when the recording ends, so a process that was killed
+/// mid-capture leaves no marker at all and recovery must treat the file as
+/// incomplete instead of presenting it as a complete recording (#35).
+pub const PCM_STATE_FILE: &str = "playback.state";
+
 #[derive(Default)]
 pub(crate) struct PcmProgress {
     committed: AtomicU64,
@@ -37,6 +44,9 @@ pub struct PcmSpoolWriter {
     limit: u64,
     buffer: Vec<u8>,
     progress: Arc<PcmProgress>,
+    /// Whether the end-of-recording marker was already written. `finish` sets it
+    /// so the `Drop` fallback cannot downgrade a clean stop.
+    state_written: bool,
 }
 pub struct PcmStream {
     file: File,
@@ -65,6 +75,7 @@ impl PcmSpoolWriter {
                 limit,
                 buffer: Vec::with_capacity(PCM_CHUNK_BYTES),
                 progress: progress.clone(),
+                state_written: false,
             },
             PcmStream {
                 file: reader,
@@ -115,6 +126,13 @@ impl PcmSpoolWriter {
     pub fn finish(mut self, description: String) -> AppResult<CapturedAudio> {
         self.flush()?;
         self.progress.complete.store(true, Ordering::Release);
+        self.state_written = true;
+        // The marker is written only after every committed chunk was synced, so
+        // its byte count always describes audio that is already readable.
+        let committed = self.progress.committed.load(Ordering::Acquire);
+        let marker = pcm_state(committed, true);
+        crate::cloud::persist_result(&self.path.with_file_name(PCM_STATE_FILE), marker.as_bytes())
+            .map_err(|e| format!("Cannot save the PCM end-of-recording marker: {e}"))?;
         Ok(CapturedAudio {
             path: self.path.clone(),
             description,
@@ -124,7 +142,28 @@ impl PcmSpoolWriter {
 impl Drop for PcmSpoolWriter {
     fn drop(&mut self) {
         let _ = self.flush();
+        if self.state_written {
+            return;
+        }
+        // A recording that ends without `finish` (the device was torn down, or the
+        // process is exiting) still publishes how much audio was committed. It is
+        // explicitly not a clean stop: a later process must mark it incomplete.
+        let committed = self.progress.committed.load(Ordering::Acquire);
+        let marker = pcm_state(committed, false);
+        let _ = crate::cloud::persist_result(
+            &self.path.with_file_name(PCM_STATE_FILE),
+            marker.as_bytes(),
+        );
     }
+}
+
+/// The exact `playback.state` contents. One key per line, so a human can read it
+/// and a later version can add keys without changing this one.
+pub fn pcm_state(committed_bytes: u64, clean_stop: bool) -> String {
+    format!(
+        "committed_bytes={committed_bytes}\nclean_stop={}\n",
+        u8::from(clean_stop)
+    )
 }
 impl PcmStream {
     /// Read an already finished continuous recording again. Used only by the
