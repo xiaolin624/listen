@@ -201,6 +201,12 @@ impl Registry {
     fn retries(&self) -> Vec<Retry> {
         self.retries.lock().unwrap().clone()
     }
+    /// Finish the newest controlled session. Tests that reopened an application
+    /// share the registry, so the index of the segment under test is not assumed.
+    fn finish_newest(&self, text: &str, recovered: bool) {
+        let index = self.entries.lock().unwrap().len() - 1;
+        self.finish(index, text, recovered);
+    }
     fn directory(&self, index: usize) -> PathBuf {
         self.entry(index).directory.clone()
     }
@@ -240,6 +246,9 @@ struct Sessions {
     registry: Arc<Registry>,
     samples: Vec<i16>,
     finalize: bool,
+    /// Why a recovered recording cannot be processed again, if the test wants the
+    /// automatic resume to fail.
+    retry_failure: Option<String>,
 }
 impl Sessions {
     fn session(
@@ -296,12 +305,16 @@ impl RecognitionSessions for Sessions {
         audio: CapturedAudio,
     ) -> AppResult<Box<dyn RecognitionSession>> {
         let bytes = fs::read(&audio.path).map_err(|error| error.to_string())?;
+        // The attempt is what matters, whether or not the adapter could start it.
         self.registry.retries.lock().unwrap().push(Retry {
             directory: request.directory.clone(),
             terms: request.glossary.canonical_terms().map(str::to_owned).collect(),
             audio: audio.path.clone(),
             audio_bytes: bytes,
         });
+        if let Some(reason) = &self.retry_failure {
+            return Err(reason.clone());
+        }
         Ok(Self::session(
             &self.registry,
             request.id,
@@ -322,11 +335,22 @@ fn application(
     samples: Vec<i16>,
     finalize: bool,
 ) -> Application {
+    application_with_failure(runtime, registry, samples, finalize, None)
+}
+
+fn application_with_failure(
+    runtime: &Runtime,
+    registry: Arc<Registry>,
+    samples: Vec<i16>,
+    finalize: bool,
+    retry_failure: Option<&str>,
+) -> Application {
     Application::with_recognition_sessions(
         Box::new(Sessions {
             registry,
             samples,
             finalize,
+            retry_failure: retry_failure.map(str::to_owned),
         }),
         runtime.app(),
         Ok(()),
@@ -1145,5 +1169,174 @@ fn partial_audio_from_an_abnormal_exit_is_repaired_and_clearly_marked_incomplete
         vec![1, 2],
         "recovery keeps its capture order"
     );
+}
+
+#[test]
+fn a_failed_automatic_resume_keeps_the_audio_and_never_blocks_a_new_capture() {
+    let runtime = Runtime::new();
+    let registry = Arc::new(Registry::default());
+    let editor = Editor::new("用户草稿");
+    let audio = samples();
+    let directory = clean_capture_directory(&runtime, "session-35-1", &audio);
+    write_index(
+        &runtime,
+        2,
+        &[index_record(
+            1,
+            "session-35-1",
+            "processing",
+            "stopped",
+            None,
+            None,
+            &[],
+        )],
+    );
+
+    // The adapter refuses the recovered recording (for example the account is not
+    // usable right now). Nothing may be deleted and nothing may be re-recorded.
+    let mut app = application_with_failure(
+        &runtime,
+        registry.clone(),
+        Vec::new(),
+        true,
+        Some("the configured account is not available"),
+    )
+    .with_targets(Arc::new(Selection(editor.clone())));
+    let failed = wait_for(&mut app, "the failed resume", |snapshot| {
+        snapshot
+            .segments
+            .iter()
+            .any(|segment| segment.state == SegmentState::Failed)
+    });
+    assert_eq!(failed.phase, Phase::Failure, "{failed:?}");
+    let segment = &failed.segments[0];
+    assert!(
+        segment
+            .detail
+            .contains("could not be processed again automatically")
+            && segment.detail.contains("not available"),
+        "{segment:?}"
+    );
+    assert!(
+        segment.detail.contains("kept on this machine"),
+        "the recording is explicitly kept: {segment:?}"
+    );
+    assert!(
+        directory.join("playback.pcm").is_file(),
+        "the only recovery basis is never deleted when the resume fails"
+    );
+    assert!(
+        failed
+            .retained_audio
+            .iter()
+            .any(|path| path.ends_with("playback.pcm")),
+        "{failed:?}"
+    );
+    // A failed old segment never blocks the next capture.
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing, "{:?}", app.snapshot());
+    assert!(directory.join("playback.pcm").is_file());
+    app.dispatch(Control::Stop);
+    registry.finish_newest("新采集仍然可用。", false);
+    let fresh = wait_for(&mut app, "the new capture", |snapshot| {
+        snapshot.text == "新采集仍然可用。"
+    });
+    assert_eq!(fresh.delivery, Some(Delivery::Appended), "{fresh:?}");
+
+    // The next launch does not spend another automatic request on the failure: the
+    // segment stays failed with its audio, and the user decides what happens next.
+    drop(app);
+    let mut again = application(&runtime, registry.clone(), Vec::new(), true);
+    let retained = wait_for(&mut again, "the retained failed recording", |snapshot| {
+        !snapshot.segments.is_empty() && snapshot.phase == Phase::Failure
+    });
+    assert_eq!(retained.segments[0].state, SegmentState::Failed);
+    assert_eq!(
+        registry.retries().len(),
+        1,
+        "a failed automatic resume is never retried without the user asking"
+    );
+    assert!(directory.join("playback.pcm").is_file());
+    // An explicit delete is still the way to end it.
+    again.dispatch(Control::DeleteSegment(1));
+    let deleted = again.snapshot();
+    assert!(
+        !directory.exists(),
+        "the explicit per-segment delete removes the kept audio: {deleted:?}"
+    );
+    assert!(
+        deleted
+            .detail
+            .contains("Segment 1 was deleted at your request"),
+        "{deleted:?}"
+    );
+}
+
+#[test]
+fn quitting_does_not_wait_for_the_cloud_and_the_next_launch_recovers_the_capture() {
+    let runtime = Runtime::new();
+    let registry = Arc::new(Registry::default());
+    let editor = Editor::new("用户草稿");
+    let audio = samples();
+    let glossary = runtime.glossary("WASAPI\n");
+    let mut app = application(&runtime, registry.clone(), audio.clone(), true)
+        .with_targets(Arc::new(Selection(editor.clone())))
+        .with_glossary(glossary);
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let stopped = wait_for(&mut app, "the stopped capture", |snapshot| {
+        snapshot.phase == Phase::Processing
+    });
+    assert_eq!(stopped.segments[0].state, SegmentState::Processing);
+
+    // The cloud never answers. Quitting waits only for the received audio to be
+    // flushed, never for the network request.
+    let started = Instant::now();
+    let note = app.prepare_exit(Duration::from_millis(300));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "quitting must not wait for the pending cloud request"
+    );
+    assert!(
+        note.to_lowercase().contains("next launch") || note.to_lowercase().contains("recover"),
+        "quitting says what happens to the unfinished work: {note}"
+    );
+    let quit = app.snapshot();
+    assert_eq!(
+        quit.segments[0].state,
+        SegmentState::Processing,
+        "the unfinished segment stays an unfinished segment, not a failure"
+    );
+    let retained = runtime.session_directories();
+    assert_eq!(retained.len(), 1, "{retained:?}");
+    assert!(
+        retained[0].join("playback.state").is_file(),
+        "the received audio was closed durably before the process went away"
+    );
+    assert_eq!(editor.draft(), "用户草稿");
+    drop(app);
+
+    // The next launch recovers exactly what was left and continues automatically.
+    let mut again = application(&runtime, registry.clone(), Vec::new(), true)
+        .with_targets(Arc::new(Selection(editor.clone())));
+    let recovered = again.snapshot();
+    assert_eq!(recovered.segments.len(), 1, "{recovered:?}");
+    assert_eq!(recovered.segments[0].sequence, 1);
+    assert_eq!(recovered.segments[0].state, SegmentState::Processing);
+    let resumed = wait_for(&mut again, "the resumed recording", |_| {
+        !registry.retries().is_empty()
+    });
+    assert_eq!(registry.retries().len(), 1, "{resumed:?}");
+    assert_eq!(registry.retries()[0].audio_bytes, sample_bytes(&audio));
+    registry.finish_newest("退出后重新打开恢复了这一段。", true);
+    let done = wait_for(&mut again, "the recovered result", |snapshot| {
+        snapshot
+            .segments
+            .first()
+            .is_some_and(|segment| segment.state == SegmentState::Result)
+    });
+    assert_eq!(done.text, "退出后重新打开恢复了这一段。");
+    assert_eq!(done.delivery, Some(Delivery::Fallback));
+    assert_eq!(editor.draft(), "用户草稿");
 }
 

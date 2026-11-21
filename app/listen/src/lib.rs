@@ -1588,6 +1588,17 @@ impl Application {
                 self.snapshot.phase = Phase::Result;
                 self.snapshot.recognition = Some(SessionState::Complete);
                 self.snapshot.delivery = self.recovered_current_delivery();
+            } else if self
+                .segments
+                .last()
+                .is_some_and(|segment| segment.state == SegmentState::Failed)
+            {
+                // An unfinished capture became a failure before the restart and
+                // there is nothing to process again: the newest segment is still a
+                // failure, and its kept audio must not be hidden behind a calm
+                // "ready".
+                self.snapshot.phase = Phase::Failure;
+                self.snapshot.recognition = Some(SessionState::Failed);
             }
         }
         // Whatever was already durable stays listed even before the first poll.
@@ -3490,10 +3501,85 @@ impl Application {
         self.segments_dirty = true;
     }
 
+    /// Quit support (#35): stop a live capture and wait, bounded, only until the
+    /// audio the device already received is flushed durably. The cloud request is
+    /// never waited for — whatever it has not confirmed stays an unfinished segment
+    /// and is recovered automatically on the next launch. Returns the sentence the
+    /// caller can show as the final status; nothing is deleted or delivered here.
+    pub fn prepare_exit(&mut self, budget: std::time::Duration) -> String {
+        let started = Instant::now();
+        if self.is_capturing() {
+            self.dispatch(Control::Stop);
+        }
+        loop {
+            self.poll();
+            let live: Vec<usize> = self
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(_, segment)| {
+                    segment.finalizing
+                        || (segment.handle.is_some() && !segment.terminal)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                break;
+            }
+            // A local capture has no cloud spool: its windows are closed by the
+            // device stop itself, so only a short grace is needed for the last one.
+            let mut cloud_flushed = true;
+            let mut local_live = false;
+            for index in &live {
+                let directory = &self.segments[*index].directory;
+                if recovery::has_cloud_spool(directory) {
+                    cloud_flushed &= recovery::audio_flushed(directory);
+                } else {
+                    local_live = true;
+                }
+            }
+            if cloud_flushed && (!local_live || elapsed >= LOCAL_EXIT_FLUSH_GRACE) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let unfinished = self
+            .segments
+            .iter()
+            .any(|segment| segment.finalizing || (segment.handle.is_some() && !segment.terminal));
+        let note = if unfinished {
+            "Quitting without waiting for the cloud: the received playback audio is saved on this machine and the unfinished segment is recovered automatically on the next launch. No result is written to any target."
+                .to_string()
+        } else {
+            "The received playback audio was saved before quitting; there is no unfinished segment to recover on the next launch."
+                .to_string()
+        };
+        if !self.snapshot.detail.contains(&note) {
+            if !self.snapshot.detail.is_empty() {
+                self.snapshot.detail.push('\n');
+            }
+            self.snapshot.detail.push_str(&note);
+        }
+        self.segments_dirty = true;
+        self.refresh_segments();
+        note
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
     }
 }
+
+/// How long a quit may wait for the playback device to finish writing the audio it
+/// already received. It is deliberately much shorter than any cloud deadline: the
+/// unfinished result is recovered on the next launch (#35).
+pub const EXIT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// The same bound for a local capture, whose last window is closed by the device.
+const LOCAL_EXIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {

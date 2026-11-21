@@ -100,6 +100,19 @@ pub(crate) fn recovery_note(problem: Option<&str>) -> String {
     note
 }
 
+/// Whether this segment holds a continuous cloud recording, so quitting has to
+/// wait for its writer to publish the end-of-recording marker.
+pub(crate) fn has_cloud_spool(directory: &Path) -> bool {
+    directory.join(PCM_FILE).is_file()
+}
+
+/// Whether the received audio of this segment was already closed durably. A
+/// recording that was not closed by a normal stop still publishes what it
+/// committed when its writer is dropped, so the marker is the signal either way.
+pub(crate) fn audio_flushed(directory: &Path) -> bool {
+    !has_cloud_spool(directory) || directory.join(PCM_STATE_FILE).is_file()
+}
+
 /// A complete text file the index does not describe: the previous process saved
 /// the result and then stopped before its index entry was durable, or the index
 /// itself was lost. Its sequence comes from the file name, so its identity is kept.
