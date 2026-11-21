@@ -309,17 +309,25 @@ fn usage_lines(usage: &UsageSummary) -> Vec<String> {
         ));
     }
     let month = format!(
-        "本月（UTC）合计 {} 元，未达每月 {} 元提醒线；首轮 {} 元试用上限独立生效，提醒不会停用功能或增加额度。",
+        "本月（UTC）合计 {} 元，未接近每月 {} 元提醒线（达到 90% 即提醒）；首轮 {} 元试用上限独立生效，提醒不会停用功能或增加额度。",
         cny(usage.month_nanoyuan()),
         whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN),
         whole_cny(usage.trial_cap_nanoyuan)
     );
     let month = if usage.reminder_reached() {
-        format!(
-            "本月（UTC）合计 {} 元，已达到每月 {} 元提醒线；提醒不会改变采集、额度或套餐。",
-            cny(usage.month_nanoyuan()),
-            whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN)
-        )
+        if usage.month_nanoyuan() >= UsageSummary::MONTH_REMINDER_NANOYUAN {
+            format!(
+                "本月（UTC）合计 {} 元，已达到每月 {} 元提醒线；提醒不会改变采集、额度或套餐。",
+                cny(usage.month_nanoyuan()),
+                whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN)
+            )
+        } else {
+            format!(
+                "本月（UTC）合计 {} 元，已接近每月 {} 元提醒线（达到 90% 即提醒）；提醒不会改变采集、额度或套餐。",
+                cny(usage.month_nanoyuan()),
+                whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN)
+            )
+        }
     } else {
         month
     };
@@ -859,9 +867,35 @@ mod tests {
         // The 50 CNY trial cap and the 100 CNY reminder line are separate facts.
         assert!(shown.contains("首轮 50 元试用上限独立生效"), "{shown}");
         assert!(shown.contains("每月 100 元提醒线"), "{shown}");
-        assert!(!shown.contains("已达每月 100 元提醒线"), "{shown}");
+        assert!(shown.contains("达到 90% 即提醒"), "{shown}");
+        assert!(!shown.contains("已达到每月 100 元提醒线"), "{shown}");
         // The complete result is still rendered after the status block.
         assert!(text(&state).ends_with("完整结果"));
+    }
+
+    #[test]
+    fn approaching_the_monthly_reminder_line_is_rendered_as_a_reminder() {
+        let mut state = snapshot(Phase::Result, Preparation::Ready);
+        state.backend = Some("Cloud trial: Alibaba Model Studio".into());
+        state.usage = Some(listen::UsageSummary {
+            requests: 2,
+            settled_requests: 2,
+            confirmed_nanoyuan: 95_000_000_000,
+            estimated_nanoyuan: 0,
+            month_confirmed_nanoyuan: 95_000_000_000,
+            trial_cap_nanoyuan: 50_000_000_000,
+            unreadable: false,
+            ..listen::UsageSummary::default()
+        });
+        let shown = status_text(&state);
+        assert!(shown.contains("已接近每月 100 元提醒线"), "{shown}");
+        assert!(shown.contains("达到 90% 即提醒"), "{shown}");
+        assert!(
+            !shown.contains("已达到每月 100 元提醒线"),
+            "95 元 is below the line, not at it: {shown}"
+        );
+        // Approaching the line still never changes the trial cap or the feature.
+        assert!(shown.contains("提醒不会改变采集、额度或套餐"), "{shown}");
     }
 
     #[test]

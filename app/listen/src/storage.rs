@@ -22,7 +22,7 @@
 //! This module never deletes anything. An explicit per-segment delete is the
 //! application's decision (see `Application::dispatch(Control::DeleteSegment)`).
 
-use crate::AppResult;
+use crate::{AppResult, segments::SegmentStore};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -42,8 +42,6 @@ const DEFAULT_WARNING_DENOMINATOR: u64 = 5;
 pub const DEFAULT_TEXT_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 
 const SESSION_PREFIX: &str = "session-";
-const SEGMENT_TEXT_PREFIX: &str = "segment-";
-const SEGMENT_TEXT_SUFFIX: &str = ".txt";
 const CURRENT_RESULT: &str = "current-result.txt";
 /// Root-level capture files that an adapter might publish outside a session
 /// directory. The runtime directory's own text/state files are never part of the
@@ -430,8 +428,7 @@ pub(crate) fn text_bytes(runtime: &Path) -> u64 {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name == CURRENT_RESULT
-                || (name.starts_with(SEGMENT_TEXT_PREFIX) && name.ends_with(SEGMENT_TEXT_SUFFIX))
+            name == CURRENT_RESULT || SegmentStore::is_text_name(&name)
         })
         .map(|entry| file_bytes(&entry.path()))
         .fold(0u64, u64::saturating_add)

@@ -19,12 +19,16 @@
 //! interrupted save can lose the index entry but never the complete text file it
 //! already wrote.
 
-use crate::{AppResult, cloud::persist_result, recognition::SegmentUsage};
+use crate::{
+    AppResult,
+    cloud::persist_result,
+    durable::{VersionedRecord, now_utc, open_versioned},
+    recognition::SegmentUsage,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Bumping this is a compatibility decision: an index with any other version is
@@ -50,7 +54,9 @@ pub struct SegmentRecord {
     /// The complete text file name inside the runtime directory, once saved.
     pub text_file: Option<String>,
     pub text_chars: usize,
-    /// `appended` or `fallback` once a delivery was decided; never a guess.
+    /// A delivery decision, once one exists: `appended`, `fallback` or `uncertain`.
+    /// Never a guess; the durable delivery record remains the authority for
+    /// `pending`/`started` writes.
     pub delivery: Option<String>,
     /// What the engine recorded for this segment's paid requests, if anything.
     pub usage: Option<SegmentUsage>,
@@ -77,6 +83,14 @@ struct Index {
     segments: Vec<SegmentRecord>,
 }
 
+impl VersionedRecord for Index {
+    const VERSION: u32 = STORE_VERSION;
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
 /// The runtime-directory segment store. It is used from the application thread
 /// only, so index writes are naturally serialized; workers only touch their own
 /// text file through [`SegmentStore::write_text`].
@@ -92,36 +106,19 @@ pub(crate) struct SegmentStore {
 
 impl SegmentStore {
     pub fn open(runtime: &Path) -> Self {
-        let mut segments = Vec::new();
-        let mut next_sequence = 1;
-        let mut current_sequence = 0;
-        let mut problem = None;
-        match fs::read(runtime.join(INDEX_FILE)) {
-            Ok(bytes) => match serde_json::from_slice::<Index>(&bytes) {
-                Ok(index) if index.version == STORE_VERSION => {
-                    segments = index.segments;
-                    next_sequence = index.next_sequence.max(1);
-                    current_sequence = index.current_sequence;
-                }
-                Ok(index) => {
-                    problem = Some(format!(
-                        "the multi-segment record uses an unsupported version ({}); new segments are still captured but their recovery record is not updated",
-                        index.version
-                    ));
-                }
-                Err(error) => {
-                    problem = Some(format!(
-                        "the multi-segment record could not be read ({error}); new segments are still captured but their recovery record is not updated"
-                    ));
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                problem = Some(format!(
-                    "the multi-segment record could not be read ({error}); new segments are still captured but their recovery record is not updated"
-                ));
-            }
-        }
+        let (index, problem) = open_versioned::<Index>(
+            &runtime.join(INDEX_FILE),
+            "the multi-segment record",
+            "; new segments are still captured but their recovery record is not updated",
+        );
+        let (segments, next_sequence, current_sequence) = match index {
+            Some(index) => (
+                index.segments,
+                index.next_sequence.max(1),
+                index.current_sequence,
+            ),
+            None => (Vec::new(), 1, 0),
+        };
         // Never reuse a sequence that already owns a text file, even when the index
         // itself was lost or unusable.
         let highest = segments
@@ -166,6 +163,20 @@ impl SegmentStore {
     /// directory. Stable, sortable and independent of every other segment.
     pub fn text_name(sequence: u64) -> String {
         format!("{TEXT_PREFIX}{sequence:08}{TEXT_SUFFIX}")
+    }
+
+    /// The capture order encoded in a `segment-NNNNNNNN.txt` name, if the name is
+    /// one. This is the one place that knows the naming convention.
+    pub(crate) fn text_sequence(name: &str) -> Option<u64> {
+        name.strip_prefix(TEXT_PREFIX)?
+            .strip_suffix(TEXT_SUFFIX)?
+            .parse()
+            .ok()
+    }
+
+    /// Whether a runtime-directory entry is one segment's complete-text file.
+    pub(crate) fn is_text_name(name: &str) -> bool {
+        Self::text_sequence(name).is_some()
     }
 
     /// The next capture order that no record and no saved text owns. Recovery
@@ -225,12 +236,6 @@ impl SegmentStore {
     }
 
     /// The record of one capture order, if it is still stored.
-    pub fn record(&self, sequence: u64) -> Option<&SegmentRecord> {
-        self.segments
-            .iter()
-            .find(|record| record.sequence == sequence)
-    }
-
     pub fn record_mut(&mut self, sequence: u64) -> Option<&mut SegmentRecord> {
         self.segments
             .iter_mut()
@@ -286,29 +291,18 @@ fn highest_saved_sequence(runtime: &Path) -> u64 {
     entries
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| {
-            name.strip_prefix(TEXT_PREFIX)?
-                .strip_suffix(TEXT_SUFFIX)?
-                .parse::<u64>()
-                .ok()
-        })
+        .filter_map(|name| SegmentStore::text_sequence(&name))
         .max()
         .unwrap_or(0)
-}
-
-/// The wall-clock time a record was last updated, for diagnostics and recovery
-/// ordering. The capture sequence stays the authority for order.
-pub(crate) fn now_utc() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     struct Runtime(PathBuf);
     impl Runtime {

@@ -753,6 +753,38 @@ fn the_monthly_total_rolls_over_but_the_lifetime_total_does_not() {
 }
 
 #[test]
+fn approaching_the_monthly_line_notifies_without_touching_the_trial_cap() {
+    let runtime = Runtime::new();
+    // 90% of the CNY 100 reminder line: the reminder must already fire here so the
+    // user is warned before crossing the line.
+    let near_the_line = summary(90_000_000_000, 0);
+    assert!(near_the_line.reminder_reached());
+    assert!(near_the_line.month_nanoyuan() < listen::UsageSummary::MONTH_REMINDER_NANOYUAN);
+    let (mut app, _, control) = application(&runtime, near_the_line);
+
+    let ready = app.snapshot();
+    assert_eq!(ready.notice, Some(listen::Notice::UsageReminder));
+    assert_eq!(
+        ready.usage.as_ref().map(|usage| usage.trial_cap_nanoyuan),
+        Some(50_000_000_000),
+        "the trial cap is unchanged by the reminder"
+    );
+
+    // The reminder never blocks capture or delivery.
+    app.dispatch(Control::Start);
+    assert_eq!(app.snapshot().phase, Phase::Capturing);
+    app.dispatch(Control::Stop);
+    control.finish("接近提醒线也照常完成");
+    let result = wait(&mut app, Phase::Result);
+    assert_eq!(result.text, "接近提醒线也照常完成");
+    assert_eq!(result.notice, Some(listen::Notice::UsageReminder));
+    let usage = result.usage.expect("the summary stays visible");
+    assert_eq!(usage.month_nanoyuan(), 90_000_000_000);
+    assert!(usage.reminder_reached());
+    assert_eq!(usage.trial_cap_nanoyuan, 50_000_000_000);
+}
+
+#[test]
 fn the_monthly_reminder_does_not_interrupt_a_capture_or_its_delivery() {
     let runtime = Runtime::new();
     // This month's own usage already reached the 100 CNY reminder line.

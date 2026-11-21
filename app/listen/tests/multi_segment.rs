@@ -54,6 +54,11 @@ impl Drop for Runtime {
 
 struct Editor {
     draft: Mutex<String>,
+    /// When set, a target write waits until the test releases it. Only the backlog
+    /// ordering test uses this, so a save can be observed before its delivery
+    /// removes the durable record.
+    blocked: Mutex<bool>,
+    released: std::sync::Condvar,
 }
 struct Bound(Arc<Editor>);
 struct FocusedEditors {
@@ -68,15 +73,38 @@ impl TargetSelection for FocusedEditors {
 }
 impl Target for Bound {
     fn content(&mut self) -> AppResult<String> {
+        self.0.wait_for_test_release();
         Ok(self.0.draft.lock().unwrap().clone())
     }
     fn replace(&mut self, expected: &str, replacement: &str) -> AppResult<()> {
+        self.0.wait_for_test_release();
         let mut draft = self.0.draft.lock().unwrap();
         if *draft != expected {
             return Err("the draft changed while writing".into());
         }
         *draft = replacement.into();
         Ok(())
+    }
+}
+impl Editor {
+    fn new(draft: &str) -> Self {
+        Self {
+            draft: Mutex::new(draft.into()),
+            blocked: Mutex::new(false),
+            released: std::sync::Condvar::new(),
+        }
+    }
+    fn set_writes_blocked(&self, blocked: bool) {
+        *self.blocked.lock().unwrap() = blocked;
+        if !blocked {
+            self.released.notify_all();
+        }
+    }
+    fn wait_for_test_release(&self) {
+        let mut blocked = self.blocked.lock().unwrap();
+        while *blocked {
+            blocked = self.released.wait(blocked).unwrap();
+        }
     }
 }
 
@@ -241,11 +269,7 @@ impl Harness {
         let runtime = Runtime::new();
         let editors: Vec<Arc<Editor>> = drafts
             .iter()
-            .map(|draft| {
-                Arc::new(Editor {
-                    draft: Mutex::new((*draft).into()),
-                })
-            })
+            .map(|draft| Arc::new(Editor::new(draft)))
             .collect();
         let focus = Arc::new(FocusedEditors {
             editors: editors.clone(),
@@ -295,6 +319,12 @@ impl Harness {
     }
     fn draft(&self, editor: usize) -> String {
         self.editors[editor].draft.lock().unwrap().clone()
+    }
+    /// Hold every test target's read/write at the delivery boundary until released.
+    fn set_writes_blocked(&self, blocked: bool) {
+        for editor in &self.editors {
+            editor.set_writes_blocked(blocked);
+        }
     }
     fn poll_until(&mut self, what: &str, matches: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -796,6 +826,29 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
     );
 }
 
+/// The capture orders whose complete text is durably saved, read from the versioned
+/// index. A confirmed target append deletes both the text file and the index entry,
+/// so this is only stable while delivery is deliberately blocked; it is not a file
+/// existence check.
+fn saved_texts(runtime: &Path) -> Vec<u64> {
+    let Ok(bytes) = fs::read(runtime.join("segments.json")) else {
+        return Vec::new();
+    };
+    let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    index["segments"]
+        .as_array()
+        .map(|records| {
+            records
+                .iter()
+                .filter(|record| record["text_file"].is_string())
+                .filter_map(|record| record["sequence"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn a_finished_backlog_is_recovered_one_segment_at_a_time_in_capture_order() {
     let mut h = Harness::new(&["草稿一", "草稿二", "草稿三"]);
@@ -808,32 +861,41 @@ fn a_finished_backlog_is_recovered_one_segment_at_a_time_in_capture_order() {
     assert_eq!(h.snapshot().phase, Phase::Processing);
 
     // All three segments become complete at once, delivered newest first. The
-    // application must not start three recoveries at the same time: the oldest
-    // capture is handled first, then the next, so the backlog cannot occupy the
-    // workers or the target delivery that the current capture needs.
+    // application must not start three recoveries at the same time: the current
+    // segment is handled first, then one older backlog segment per poll, oldest
+    // first. Delivery is held at the target boundary so the ordering is observed on
+    // the durable save (the text file a confirmed append deletes is not an oracle).
+    h.set_writes_blocked(true);
     h.finish(third, "第三段完整结果。", true);
     h.finish(second, "第二段完整结果。", true);
     h.finish(first, "第一段完整结果。", true);
     let runtime = h.runtime().to_path_buf();
     h.poll_once();
+    let saved = saved_texts(&runtime);
     assert!(
-        runtime.join("segment-00000001.txt").is_file(),
-        "the oldest complete segment is saved first"
+        saved.contains(&3),
+        "the current segment is saved first: {saved:?}"
     );
     assert!(
-        !runtime.join("segment-00000002.txt").exists(),
-        "a later segment must not overtake the older backlog"
+        saved.contains(&1),
+        "the oldest backlog segment follows the current one: {saved:?}"
+    );
+    assert!(
+        !saved.contains(&2),
+        "a later segment must not overtake the older backlog: {saved:?}"
     );
     h.poll_once();
+    let saved = saved_texts(&runtime);
     assert!(
-        runtime.join("segment-00000002.txt").is_file(),
-        "the second segment follows in capture order"
+        saved.contains(&2),
+        "the second backlog segment follows in capture order: {saved:?}"
     );
     assert!(
-        !runtime.join("segment-00000003.txt").exists(),
-        "still one at a time"
+        saved.iter().all(|sequence| (1..=3).contains(sequence)),
+        "still one backlog segment at a time: {saved:?}"
     );
 
+    h.set_writes_blocked(false);
     let settled = h.poll_until("the whole backlog", |snapshot| {
         snapshot
             .segments
@@ -847,6 +909,13 @@ fn a_finished_backlog_is_recovered_one_segment_at_a_time_in_capture_order() {
         settled.text, "第三段完整结果。",
         "the newest capture order is still the current result"
     );
+    assert_eq!(
+        h.draft(0),
+        "草稿一\n第一段完整结果。",
+        "the oldest result is appended exactly once"
+    );
+    assert_eq!(h.draft(1), "草稿二\n第二段完整结果。");
+    assert_eq!(h.draft(2), "草稿三\n第三段完整结果。");
 }
 
 #[test]

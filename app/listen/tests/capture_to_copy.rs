@@ -394,6 +394,63 @@ fn a_retry_that_fails_again_keeps_the_same_audio_retryable_until_it_succeeds() {
 }
 
 #[test]
+fn a_new_capture_starts_while_an_older_failed_segment_keeps_its_audio_retryable() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::with_drafts("第一段草稿", "第二段草稿")));
+    let model = Arc::new(RepairableModel::new(1));
+    let mut app = Application::new(Arc::new(Playback), model.clone(), runtime.0.clone(), Ok(()))
+        .with_targets(Arc::new(Desktop(editors.clone())));
+
+    // Segment 1 fails and keeps its audio for an explicit retry.
+    app.dispatch(Control::Start);
+    app.dispatch(Control::Stop);
+    let failure = await_phase(&mut app, Phase::Failure);
+    let retained = failure.retained_audio[0].clone();
+    assert!(failure.retry_available, "{failure:?}");
+
+    // The failed older segment must not refuse the next sentence.
+    editors.lock().unwrap().focused = Some(1);
+    app.dispatch(Control::Start);
+    assert_eq!(
+        app.snapshot().phase,
+        Phase::Capturing,
+        "a new capture must start while an older failure keeps audio: {:?}",
+        app.snapshot()
+    );
+    app.dispatch(Control::Stop);
+    let result = await_phase(&mut app, Phase::Result);
+    assert_eq!(result.text, TRANSCRIPT);
+    assert!(
+        retained.is_file(),
+        "starting a new capture must not consume or delete the older failed segment's audio"
+    );
+    assert!(app.snapshot().retry_available, "{:?}", app.snapshot());
+
+    // The older failure is still retryable, and its retry writes to the target
+    // bound when that segment started, not to the newer focus.
+    editors.lock().unwrap().focused = Some(0);
+    app.dispatch(Control::Retry);
+    // The retry is not the newest segment, so the global phase stays Result; wait for
+    // the retried segment itself to reach its result.
+    let retried = await_state(&mut app, "the older segment's retry", |state| {
+        state
+            .segments
+            .iter()
+            .all(|segment| segment.state == listen::SegmentState::Result)
+    });
+    assert_eq!(retried.text, TRANSCRIPT);
+    assert!(!retried.retry_available, "{retried:?}");
+    assert!(!retained.exists(), "a successful retry releases its audio");
+    let desktop = editors.lock().unwrap();
+    assert_eq!(
+        desktop.drafts[0],
+        format!("第一段草稿\n{TRANSCRIPT}"),
+        "the retry must append only to the target bound at that segment's start"
+    );
+    assert_eq!(desktop.drafts[1], format!("第二段草稿\n{TRANSCRIPT}"));
+}
+
+#[test]
 fn retry_delivers_to_the_target_bound_at_capture_start_not_to_later_focus() {
     let runtime = Runtime::new();
     let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "另一个输入框")));
@@ -407,18 +464,8 @@ fn retry_delivers_to_the_target_bound_at_capture_start_not_to_later_focus() {
     let failure = await_phase(&mut app, Phase::Failure);
     assert!(failure.retry_available);
 
-    // The failed capture stays the only pending capture: starting another one
-    // cannot mix its target, result, or audio with the retry.
-    app.dispatch(Control::Start);
-    assert_eq!(app.snapshot().phase, Phase::Failure);
-    assert!(
-        app.snapshot()
-            .detail
-            .contains("before starting a new capture"),
-        "{:?}",
-        app.snapshot()
-    );
-
+    // The failed capture's retained audio stays retryable beside any later
+    // capture; the dedicated new-capture test covers starting while it is kept.
     app.dispatch(Control::Retry);
     let result = await_phase(&mut app, Phase::Result);
     assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
@@ -509,7 +556,7 @@ fn cleaning_failed_audio_updates_the_state_and_prevents_invalid_retries() {
 }
 
 #[test]
-fn unconfirmed_retry_write_keeps_one_fallback_and_later_controls_never_append_it_again() {
+fn unconfirmed_retry_write_keeps_one_uncertain_result_and_later_controls_never_append_it_again() {
     let runtime = Runtime::new();
     let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
     editors.lock().unwrap().unconfirmed = true;
@@ -524,7 +571,11 @@ fn unconfirmed_retry_write_keeps_one_fallback_and_later_controls_never_append_it
 
     app.dispatch(Control::Retry);
     let result = await_phase(&mut app, Phase::Result);
-    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert_eq!(
+        result.delivery,
+        Some(Delivery::Uncertain),
+        "the target holds the complete text but the write was not confirmed: {result:?}"
+    );
     assert!(
         result.detail.contains("could not be confirmed"),
         "{result:?}"
@@ -1001,7 +1052,7 @@ fn destroyed_original_target_keeps_the_full_result_and_never_uses_a_replacement(
 }
 
 #[test]
-fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_the_append() {
+fn unconfirmed_output_keeps_one_uncertain_result_and_repeated_controls_never_retry_the_append() {
     let runtime = Runtime::new();
     let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
     editors.lock().unwrap().unconfirmed = true;
@@ -1024,7 +1075,11 @@ fn unconfirmed_output_keeps_the_full_fallback_and_repeated_controls_never_retry_
     let result = await_phase(&mut app, Phase::Result);
     app.dispatch(Control::Stop);
     app.poll();
-    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    assert_eq!(
+        result.delivery,
+        Some(Delivery::Uncertain),
+        "the target may hold the complete write, so the outcome is uncertain"
+    );
     assert!(result.detail.contains("could not be confirmed"));
     assert!(result.detail.contains("Check the original target"));
     assert!(result.detail.contains("not retried automatically"));
@@ -1170,7 +1225,7 @@ fn disabled_target_at_start_is_reported_without_writing_any_control() {
 }
 
 #[test]
-fn capacity_limited_target_is_reported_as_truncated_and_keeps_the_complete_fallback() {
+fn capacity_limited_target_is_reported_as_truncated_and_keeps_the_complete_text() {
     let runtime = Runtime::new();
     let editors = Arc::new(Mutex::new(Editors::with_drafts("原有草稿", "旁边输入框")));
     let mut app = Application::new(
@@ -1191,7 +1246,11 @@ fn capacity_limited_target_is_reported_as_truncated_and_keeps_the_complete_fallb
     app.dispatch(Control::Toggle);
     let result = await_phase(&mut app, Phase::Result);
     let intended = format!("原有草稿\n{TRANSCRIPT}");
-    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert_eq!(
+        result.delivery,
+        Some(Delivery::Uncertain),
+        "the target holds a truncated write, so nothing can be proven about it: {result:?}"
+    );
     assert!(
         !result.detail.contains("The complete result was appended"),
         "a truncated write must never be reported as complete success: {result:?}"
@@ -1251,7 +1310,11 @@ fn concurrent_target_edit_during_output_is_reported_unconfirmed_and_never_revert
     }
     app.dispatch(Control::Toggle);
     let result = await_phase(&mut app, Phase::Result);
-    assert_eq!(result.delivery, Some(Delivery::Fallback), "{result:?}");
+    assert_eq!(
+        result.delivery,
+        Some(Delivery::Uncertain),
+        "the target changed during the write, so a partial write cannot be ruled out: {result:?}"
+    );
     assert!(
         result.detail.contains("could not be confirmed"),
         "{result:?}"

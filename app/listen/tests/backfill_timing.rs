@@ -416,6 +416,60 @@ fn a_fallback_never_reports_a_confirmed_target_read_back() {
 }
 
 #[test]
+fn two_results_that_confirm_together_are_appended_in_capture_order() {
+    // Both segments target the same editor and confirm close together. The newest
+    // segment is still processed and saved first (#38), but the target append order
+    // is capture order: the older sentence must never land after the newer one.
+    let mut harness = Harness::new(2, "合并草稿", 0, 20);
+    let first = harness.start();
+    harness.stop();
+    let second = harness.start();
+    harness.stop();
+    harness.finish(1, second, "第二段完整结果。", Timing::default());
+    harness.finish(0, first, "第一段完整结果。", Timing::default());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        harness.app.poll();
+        let draft = harness.draft();
+        if draft.matches("第一段完整结果。").count() == 1
+            && draft.matches("第二段完整结果。").count() == 1
+        {
+            assert_eq!(
+                draft, "合并草稿\n第一段完整结果。\n第二段完整结果。",
+                "target appends must preserve capture order, oldest first"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both results were not appended: {draft:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        harness.app.poll();
+        let state = harness.app.snapshot();
+        if state
+            .segments
+            .iter()
+            .all(|segment| segment.state == SegmentState::Result)
+        {
+            break state;
+        }
+        assert!(Instant::now() < deadline, "{state:?}");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(settled.segments.len(), 2, "{settled:?}");
+    assert_eq!(
+        harness.draft(),
+        "合并草稿\n第一段完整结果。\n第二段完整结果。",
+        "target appends must preserve capture order, oldest first"
+    );
+}
+
+#[test]
 fn an_older_segment_never_delays_a_newer_segments_save_or_delivery() {
     // A 50 ms write keeps both deliveries in flight while the first poll applies the
     // two session events, so the saves can be observed before the deliveries.
