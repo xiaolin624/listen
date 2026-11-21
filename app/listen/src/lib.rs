@@ -16,6 +16,8 @@ pub(crate) mod delivery;
 pub(crate) mod durable;
 pub mod glossary;
 #[cfg(windows)]
+pub mod launch;
+#[cfg(windows)]
 pub mod paste;
 pub mod recognition;
 pub(crate) mod recovery;

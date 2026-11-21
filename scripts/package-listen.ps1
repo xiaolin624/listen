@@ -8,10 +8,11 @@ param(
 )
 # Build a directly runnable Listen directory. The output is self-contained except for
 # Windows itself: listen.exe + libunwind.dll, the local whisper.cpp engine and its
-# actual adjacent DLLs, an optional copy of the two models, the local default
-# launcher, the explicit cloud-trial launcher, its local configuration helper and
-# guide, and the user README. No unrelated engine examples or server binaries are
-# copied, and no credential, recording or test-environment path is ever packaged.
+# actual adjacent DLLs, an optional copy of the two models, the cloud daily-default
+# launcher, the explicitly labelled local fallback launcher, the local cloud
+# configuration helper and guide, and the user README. No unrelated engine examples
+# or server binaries are copied, and no credential, recording or test-environment
+# path is ever packaged.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -151,17 +152,24 @@ Copy-Item -LiteralPath (Join-Path $packagingRoot 'CLOUD-TRIAL.md') -Destination 
 Copy-Item -LiteralPath (Join-Path $packagingRoot 'glossary.txt') -Destination (Join-Path $OutputDirectory 'glossary.txt')
 New-Item -ItemType Directory -Force -Path (Join-Path $OutputDirectory 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'configure-cloud-trial.ps1') -Destination (Join-Path $OutputDirectory 'scripts\configure-cloud-trial.ps1')
-# Exactly two launchers: the local daily default and the explicit cloud trial. They
-# are classified by their arguments so this script itself stays ASCII-only.
+# Exactly two launchers: the daily cloud default and the explicitly labelled local
+# fallback. They are classified by their arguments so this script itself stays
+# ASCII-only.
 $launchers = @(Get-ChildItem -LiteralPath $packagingRoot -Filter '*.cmd' -File)
-if ($launchers.Count -ne 2) { throw ('packaging must contain exactly two launchers (.cmd: local default and explicit cloud trial); found ' + $launchers.Count) }
+if ($launchers.Count -ne 2) { throw ('packaging must contain exactly two launchers (.cmd: daily cloud default and explicit local fallback); found ' + $launchers.Count) }
 $launcherInfo = @($launchers | ForEach-Object {
         [pscustomobject]@{ File = $_; Text = [IO.File]::ReadAllText($_.FullName) }
     })
 $localLaunchers = @($launcherInfo | Where-Object { $_.Text -match '--engine' -and $_.Text -notmatch '--cloud-trial' })
-$cloudLaunchers = @($launcherInfo | Where-Object { $_.Text -match '--cloud-trial\s+ali' -and $_.Text -notmatch '--engine' })
-if ($localLaunchers.Count -ne 1 -or $cloudLaunchers.Count -ne 1) {
-    throw 'packaging must contain exactly one local launcher (--engine, no --cloud-trial) and exactly one cloud launcher (--cloud-trial ali, no --engine).'
+$defaultLaunchers = @($launcherInfo | Where-Object { $_.Text -notmatch '--engine' })
+if ($localLaunchers.Count -ne 1 -or $defaultLaunchers.Count -ne 1) {
+    throw 'packaging must contain exactly one local fallback launcher (--engine, no --cloud-trial) and exactly one default launcher (no --engine).'
+}
+if ($localLaunchers[0].Text -notmatch '--runtime\s+"%~dp0runtime"') {
+    throw 'The local fallback launcher must use the packaged local runtime directory.'
+}
+if ($defaultLaunchers[0].Text -notmatch '--runtime\s+"%~dp0runtime-cloud"') {
+    throw 'The daily default launcher must use the cloud runtime directory.'
 }
 foreach ($launcher in $launcherInfo) {
     Copy-Item -LiteralPath $launcher.File.FullName -Destination (Join-Path $OutputDirectory $launcher.File.Name)
@@ -176,8 +184,9 @@ $versionText = @(
     'Built (UTC): ' + $builtUtc,
     'Source commit: ' + $gitCommit,
     'Models included: ' + $(if ($IncludeModels) { 'yes' } else { 'no' }),
-    'Daily default: local',
-    'Cloud trial (explicit only): Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing',
+    'Daily default: cloud (Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing; free-only protection verified before every request)',
+    'Local fallback (explicit only): whisper.cpp v1.8.2 CPU; start it with the explicitly labelled local launcher',
+    'Cloud trial: single vendor, shared CNY 50 ledger; CNY 100/month is a reminder, never an automatic stop',
     'Engine: whisper.cpp v1.8.2 CPU',
     ''
 ) -join [Environment]::NewLine
@@ -203,16 +212,22 @@ $manifest = [ordered]@{
     git_branch = [string]$gitBranch
     git_dirty_at_package_time = $gitDirty
     included_models = [bool]$IncludeModels
-    # Not a build-time cloud default: the local launcher remains the daily path and
-    # the cloud trial is an explicit, separately configured choice.
-    default_mode = 'local'
+    # The daily default is the accepted cloud path (#40); local recognition is an
+    # explicit fallback selected by its own labelled launcher.
+    default_mode = 'cloud'
     cloud_trial = [ordered]@{
-        selected_by_default = $false
+        selected_by_default = $true
         provider = 'Alibaba Model Studio'
         model = 'qwen-audio-3.1-asr-flash-message'
         region = 'cn-beijing'
         configure = 'scripts/configure-cloud-trial.ps1'
         guide = 'CLOUD-TRIAL.md'
+    }
+    local_fallback = [ordered]@{
+        explicit_only = $true
+        launcher = $localLaunchers[0].File.Name
+        runtime = 'runtime'
+        engine = 'whisper.cpp v1.8.2 CPU'
     }
     engine_source = 'whisper.cpp v1.8.2 CPU'
     engine_files = @($engineFiles + $vcRuntime)

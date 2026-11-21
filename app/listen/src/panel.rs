@@ -437,6 +437,12 @@ pub fn status_text(snapshot: &Snapshot) -> String {
         if let Some(backend) = &snapshot.backend {
             lines.push(backend.clone());
         }
+    } else if let Some(backend) = &snapshot.backend {
+        // The explicit local fallback names itself; a cloud failure never reaches
+        // this branch, so a local result cannot be mistaken for the cloud result.
+        lines.push(format!("识别方式：本机识别（{backend}）"));
+    } else {
+        lines.push("识别方式：本机识别（本地引擎；不发送音频）".into());
     }
     // The cumulative cloud cost is a fact about this tool's own usage, so it is
     // shown wherever a cloud adapter reports it — before the long detail, and

@@ -1,5 +1,4 @@
 use crate::{
-    Config,
     capsule::{CapsuleState, capsule_state, preparation_name},
     capsule_window::{self, Capsule},
     panel,
@@ -7,7 +6,7 @@ use crate::{
 };
 use listen::{
     Application, Control, Delivery, Phase, Refine, Snapshot, UsageSummary, deepseek::DeepSeek,
-    paste, recognition::SessionState, target::NativeTargets,
+    launch::Config, paste, recognition::SessionState, target::NativeTargets,
 };
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
@@ -167,10 +166,10 @@ pub fn run(config: Config) -> Result<(), String> {
                     .into(),
             );
         }
-        fs::create_dir_all(&config.runtime).map_err(|e| {
+        fs::create_dir_all(config.runtime()).map_err(|e| {
             format!(
                 "Cannot create runtime directory {}: {e}",
-                config.runtime.display()
+                config.runtime().display()
             )
         })?;
         let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
@@ -208,7 +207,7 @@ pub fn run(config: Config) -> Result<(), String> {
         // The capsule exists before the model starts preparing, so the measured
         // startup budget only covers window creation and the first frame. Its first
         // state is deliberately "not ready yet" rather than a false "ready".
-        let capsule = capsule_window::create(&config.runtime, CapsuleState::Preparing)?;
+        let capsule = capsule_window::create(config.runtime(), CapsuleState::Preparing)?;
 
         let mut app = config
             .application(registration)?
@@ -229,14 +228,14 @@ pub fn run(config: Config) -> Result<(), String> {
             hwnd,
             capsule,
             panel: None,
-            runtime: config.runtime,
+            runtime: config.runtime().to_path_buf(),
             last: None,
             last_status: String::new(),
             last_panel_text: String::new(),
             last_auto_open: None,
             panel_error: None,
             tray: false,
-            notify: !config.hidden,
+            notify: !config.hidden(),
             quit_requested: false,
             poll_ms: POLL_TIMER_MS,
         };
@@ -417,7 +416,7 @@ impl Ui {
             // machine-readable contract and existing keys stay exactly as they are.
             // The multi-segment counts are appended for the same reason.
             let mut status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
+                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
                 state.phase,
                 state.detail,
                 state
@@ -444,6 +443,14 @@ impl Ui {
                     .join(" | "),
                 state.retry_available,
                 state.backend.as_deref().unwrap_or(""),
+                // The selected path is a fact, not an inference from the backend
+                // wording: `local` is the explicit fallback, `cloud-trial` the daily
+                // default. Existing keys keep their exact meaning.
+                if state.cloud_trial() {
+                    "cloud-trial"
+                } else {
+                    "local"
+                },
                 self.app.glossary_status(),
                 preparation_name(state.preparation),
                 state.refine.name(),

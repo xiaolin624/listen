@@ -5,13 +5,14 @@ param(
     [int]$TimeoutSeconds = 90,
     [switch]$SkipHash
 )
-# Check a packaged Listen directory, then start it with the packaged local engine/model
-# paths and with the explicit cloud-trial path.
+# Check a packaged Listen directory, then start it through the daily cloud default
+# and through the explicitly labelled local fallback.
 #
-# The local launch expects Ready when models are included and an explicit model error
-# when they are not. The cloud launch proves only the offline surface: a missing local
-# configuration is refused with the fixed vendor/model/region visible, and a synthetic
-# local credential makes the packaged build Ready without starting a capture. No real
+# The default launch must select the cloud path without any --engine/--cloud-trial
+# argument: a missing local configuration is refused with the fixed vendor/model/
+# region visible, and a synthetic local credential makes the packaged build Ready
+# without starting a capture. The local fallback launch must report a local backend
+# when models are included and an explicit model error when they are not. No real
 # key is read, no paid request is sent, and the ledger must stay empty.
 #
 # The guard checks fail the package if it contains key material, test audio/private
@@ -40,12 +41,16 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
 if ($manifest.product -ne 'Listen') { throw 'The manifest is not a Listen package manifest.' }
 
-# The delivered default must stay local and the cloud trial must remain explicit.
-if ([string]$manifest.default_mode -ne 'local') {
-    throw ('The packaged default mode is not local: ' + [string]$manifest.default_mode)
+# The delivered daily default must be the accepted cloud path; local recognition is
+# an explicit fallback and may not become the default by accident.
+if ([string]$manifest.default_mode -ne 'cloud') {
+    throw ('The packaged default mode is not cloud: ' + [string]$manifest.default_mode)
 }
-if ([bool]$manifest.cloud_trial.selected_by_default) {
-    throw 'The packaged cloud trial is selected by default; #40 must not switch the daily default.'
+if (-not [bool]$manifest.cloud_trial.selected_by_default) {
+    throw 'The packaged cloud trial is not selected by default; #40 requires the accepted cloud path as the daily default.'
+}
+if (-not [bool]$manifest.local_fallback.explicit_only) {
+    throw 'The packaged local fallback is missing or is not marked explicit-only.'
 }
 if ([string]$manifest.cloud_trial.provider -ne 'Alibaba Model Studio' -or
     [string]$manifest.cloud_trial.model -ne 'qwen-audio-3.1-asr-flash-message' -or
@@ -83,36 +88,51 @@ if ($missing.Count -gt 0) {
     throw ('Package files are missing: ' + ($missing -join ', '))
 }
 
-# Exactly two launchers: the local daily default and the explicit cloud trial.
+# Exactly two launchers: the daily cloud default and the explicitly labelled local
+# fallback.
 $launchers = @(Get-ChildItem -LiteralPath $PackageRoot -Filter '*.cmd' -File)
 if ($launchers.Count -ne 2) {
-    throw ('The package must contain exactly two launchers (.cmd: local default and explicit cloud trial), found ' + $launchers.Count + '.')
+    throw ('The package must contain exactly two launchers (.cmd: daily cloud default and explicit local fallback), found ' + $launchers.Count + '.')
 }
 $launcherInfo = @($launchers | ForEach-Object {
         [pscustomobject]@{ File = $_; Text = [IO.File]::ReadAllText($_.FullName) }
     })
 $localLaunchers = @($launcherInfo | Where-Object { $_.Text -match '--engine' -and $_.Text -notmatch '--cloud-trial' })
-$cloudLaunchers = @($launcherInfo | Where-Object { $_.Text -match '--cloud-trial\s+ali' -and $_.Text -notmatch '--engine' })
-if ($localLaunchers.Count -ne 1 -or $cloudLaunchers.Count -ne 1) {
-    throw 'The package must contain exactly one local launcher (--engine, no --cloud-trial) and exactly one cloud launcher (--cloud-trial ali, no --engine).'
+$defaultLaunchers = @($launcherInfo | Where-Object { $_.Text -notmatch '--engine' })
+if ($localLaunchers.Count -ne 1 -or $defaultLaunchers.Count -ne 1) {
+    throw 'The package must contain exactly one default launcher (no --engine) and exactly one explicit local fallback launcher (--engine, no --cloud-trial).'
 }
+$defaultLauncher = $defaultLaunchers[0]
 $localLauncher = $localLaunchers[0]
-$cloudLauncher = $cloudLaunchers[0]
+foreach ($phrase in @('listen.exe', '--runtime', 'runtime-cloud', '--glossary', 'scripts\configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
+    if ($defaultLauncher.Text.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        throw ('The default launcher does not contain: ' + $phrase)
+    }
+}
+if ($defaultLauncher.Text -match '--engine') {
+    throw 'The default launcher must not pass --engine; the daily default is the cloud path, not a local fallback.'
+}
+if ($defaultLauncher.Text -match '--cloud-trial') {
+    throw 'The default launcher must not pass --cloud-trial; the packaged binary default itself must select the accepted cloud path.'
+}
 foreach ($phrase in @('listen.exe', '--engine', '--model', '--vad-model', '--runtime', '--glossary')) {
     if ($localLauncher.Text.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        throw ('The local launcher does not pass: ' + $phrase)
+        throw ('The local fallback launcher does not pass: ' + $phrase)
     }
 }
 if ($localLauncher.Text -notmatch '--runtime\s+"%~dp0runtime"') {
-    throw 'The local launcher does not use the packaged local runtime directory.'
+    throw 'The local fallback launcher does not use the packaged local runtime directory.'
 }
-foreach ($phrase in @('listen.exe', '--cloud-trial', 'ali', '--runtime', '--glossary', 'scripts\configure-cloud-trial.ps1', 'runtime-cloud')) {
-    if ($cloudLauncher.Text.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        throw ('The cloud launcher does not contain: ' + $phrase)
+if ($localLauncher.Text -match '--cloud-trial') {
+    throw 'The local fallback launcher must not pass --cloud-trial; local recognition is an explicit fallback.'
+}
+if ([string]$manifest.local_fallback.launcher -ne $localLauncher.File.Name) {
+    throw 'The manifest local fallback launcher does not name the packaged local launcher.'
+}
+foreach ($phrase in @('whisper')) {
+    if ([string]$manifest.local_fallback.engine -notmatch $phrase -or [string]$manifest.local_fallback.runtime -ne 'runtime') {
+        throw 'The manifest local fallback engine/runtime is missing or inconsistent.'
     }
-}
-if ($cloudLauncher.Text -match '--engine') {
-    throw 'The cloud launcher must not pass --engine; the explicit cloud mode has no local fallback inside the task.'
 }
 
 # The machine-local configuration surface is a real helper, not a stub.
@@ -124,20 +144,20 @@ foreach ($phrase in @('Listen/CloudTrial/Alibaba/cn-beijing', 'SecureString', 'L
 }
 
 $readme = [IO.File]::ReadAllText((Join-Path $PackageRoot 'README.md'))
-foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'whisper.cpp', '--cloud-trial', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
+foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'runtime-cloud', 'whisper.cpp', '--engine', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
     if ($readme.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The packaged README does not explain: ' + $phrase)
     }
 }
 $cloudGuide = [IO.File]::ReadAllText((Join-Path $PackageRoot 'CLOUD-TRIAL.md'))
-foreach ($phrase in @('qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'runtime-cloud', 'CNY 50', 'CNY 100')) {
+foreach ($phrase in @('qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'runtime-cloud', 'runtime', 'CNY 50', 'CNY 100')) {
     if ($cloudGuide.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        throw ('The packaged cloud-trial guide does not explain: ' + $phrase)
+        throw ('The packaged cloud guide does not explain: ' + $phrase)
     }
 }
 
 $versionText = [IO.File]::ReadAllText((Join-Path $PackageRoot 'VERSION.txt'))
-foreach ($phrase in @('Daily default: local', 'Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
+foreach ($phrase in @('Daily default: cloud', 'Local fallback (explicit only)', 'Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
     if ($versionText.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The packaged VERSION.txt does not record: ' + $phrase)
     }
@@ -397,16 +417,20 @@ $localArguments = @(
     '--runtime', (ConvertTo-QuotedWindowsPath $Runtime),
     '--hidden'
 )
-$local = Invoke-ListenLaunch -Label 'local package launch' -Arguments $localArguments -Environment @{} -RunDirectory $Runtime
+$local = Invoke-ListenLaunch -Label 'explicit local fallback package launch' -Arguments $localArguments -Environment @{} -RunDirectory $Runtime
 $localPhase = Get-StatusField $local.status 'phase'
 $localBackend = Get-StatusField $local.status 'backend'
 $localDetail = Get-StatusField $local.status 'detail'
+$localMode = Get-StatusField $local.status 'recognition_mode'
+if ($localMode -ne 'local') {
+    throw ('The explicit local fallback did not report recognition_mode=local:' + [Environment]::NewLine + $local.status)
+}
 if ($manifest.included_models) {
     if ($localPhase -ne 'Ready') {
         throw ('The package with models did not become Ready:' + [Environment]::NewLine + $local.status)
     }
-    if (-not $localBackend) { throw 'Ready did not report a recognition backend.' }
-    if ($localBackend -match '(?i)Cloud trial') { throw 'The local launch reported a cloud backend.' }
+    if (-not $localBackend) { throw 'The local fallback did not report a recognition backend.' }
+    if ($localBackend -match '(?i)Cloud trial') { throw 'The local fallback launch reported a cloud backend.' }
 }
 else {
     if ($localPhase -ne 'Failure') {
@@ -417,9 +441,11 @@ else {
     }
 }
 
-# Explicit cloud mode: no local configuration must be refused with the fixed source
-# displayed, and a synthetic valid local configuration must become Ready. Neither
-# launch starts a capture, so no free-only check, connection or paid request happens.
+# Daily cloud default: the packaged binary is started with no --engine and no
+# --cloud-trial, exactly like the default launcher. No local configuration must be
+# refused with the fixed source displayed, and a synthetic valid local configuration
+# must become Ready. Neither launch starts a capture, so no free-only check,
+# connection or paid request happens.
 $fakeKey = 'package-verification-fake-key-0000'
 $cloudRoot = Join-Path $Runtime 'cloud'
 $invalidHome = Join-Path $cloudRoot 'invalid-home'
@@ -440,40 +466,50 @@ $readyEnvironment['LOCALAPPDATA'] = $readyHome
 $readyEnvironment['LISTEN_ALI_API_KEY'] = $fakeKey
 $readyEnvironment['LISTEN_ALI_WORKSPACE_ID'] = 'package-verification-workspace'
 $glossaryPath = Join-Path $PackageRoot 'glossary.txt'
-$cloudArguments = @(
-    '--cloud-trial', 'ali',
+# Deliberately no --engine and no --cloud-trial: this is the packaged default.
+$defaultArguments = @(
     '--runtime', (ConvertTo-QuotedWindowsPath $invalidRuntime),
     '--glossary', (ConvertTo-QuotedWindowsPath $glossaryPath),
     '--hidden'
 )
-$cloudInvalid = Invoke-ListenLaunch -Label 'cloud package launch without local configuration' -Arguments $cloudArguments -Environment $invalidEnvironment -RunDirectory $invalidRuntime
+$cloudInvalid = Invoke-ListenLaunch -Label 'daily cloud default launch without local configuration' -Arguments $defaultArguments -Environment $invalidEnvironment -RunDirectory $invalidRuntime
 $invalidPhase = Get-StatusField $cloudInvalid.status 'phase'
 $invalidBackend = Get-StatusField $cloudInvalid.status 'backend'
 $invalidDetail = Get-StatusField $cloudInvalid.status 'detail'
+$invalidMode = Get-StatusField $cloudInvalid.status 'recognition_mode'
+if ($invalidMode -ne 'cloud-trial') {
+    throw ('The unconfigured default launch did not select the cloud path:' + [Environment]::NewLine + $cloudInvalid.status)
+}
 if ($invalidPhase -ne 'Failure') {
-    throw ('The unconfigured cloud launch did not report the expected failure:' + [Environment]::NewLine + $cloudInvalid.status)
+    throw ('The unconfigured cloud default did not report the expected failure:' + [Environment]::NewLine + $cloudInvalid.status)
 }
 foreach ($expected in @('Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
     if ($invalidBackend.IndexOf($expected, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        throw ('The refused cloud launch did not show the actual source: ' + $expected)
+        throw ('The refused cloud default did not show the actual source: ' + $expected)
     }
 }
 if ($invalidDetail -notmatch 'valid Alibaba workspace') {
-    throw ('The unconfigured cloud launch did not explain the local configuration:' + [Environment]::NewLine + $cloudInvalid.status)
+    throw ('The unconfigured cloud default did not explain the local configuration:' + [Environment]::NewLine + $cloudInvalid.status)
+}
+if ((Get-StatusField $cloudInvalid.status 'recognition') -match '(?i)capturing') {
+    throw 'The refused cloud default started a capture.'
 }
 
 $readyArguments = @(
-    '--cloud-trial', 'ali',
     '--runtime', (ConvertTo-QuotedWindowsPath $readyRuntime),
     '--glossary', (ConvertTo-QuotedWindowsPath $glossaryPath),
     '--hidden'
 )
-$cloudReady = Invoke-ListenLaunch -Label 'cloud package launch with synthetic local configuration' -Arguments $readyArguments -Environment $readyEnvironment -RunDirectory $readyRuntime
+$cloudReady = Invoke-ListenLaunch -Label 'daily cloud default launch with synthetic local configuration' -Arguments $readyArguments -Environment $readyEnvironment -RunDirectory $readyRuntime
 $readyPhase = Get-StatusField $cloudReady.status 'phase'
 $readyBackend = Get-StatusField $cloudReady.status 'backend'
 $readyDetail = Get-StatusField $cloudReady.status 'detail'
+$readyMode = Get-StatusField $cloudReady.status 'recognition_mode'
+if ($readyMode -ne 'cloud-trial') {
+    throw ('The configured default launch did not select the cloud path:' + [Environment]::NewLine + $cloudReady.status)
+}
 if ($readyPhase -ne 'Ready') {
-    throw ('The packaged cloud trial did not become Ready with a valid local configuration:' + [Environment]::NewLine + $cloudReady.status)
+    throw ('The packaged cloud default did not become Ready with a valid local configuration:' + [Environment]::NewLine + $cloudReady.status)
 }
 foreach ($expected in @('Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
     if ($readyBackend.IndexOf($expected, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
@@ -500,36 +536,40 @@ if ($cloudPaidRequests -ne 0) {
 }
 
 $summary = [ordered]@{
-    checked_utc            = [DateTime]::UtcNow.ToString('o')
-    package_root           = $PackageRoot
-    version                = [string]$manifest.version
-    git_commit             = [string]$manifest.git_commit
-    included_models        = [bool]$manifest.included_models
-    default_mode           = [string]$manifest.default_mode
-    cloud_trial_by_default = [bool]$manifest.cloud_trial.selected_by_default
-    cloud_trial_model      = [string]$manifest.cloud_trial.model
-    cloud_trial_region     = [string]$manifest.cloud_trial.region
-    files_checked          = $required.Count
-    hashes_verified        = $hashesVerified
-    launchers_checked      = $launcherInfo.Count
-    scanned_files          = $scannedFiles
-    secret_guard_self_test = $true
-    observed_phases        = @($local.phases)
-    final_phase            = $localPhase
-    final_detail           = $localDetail
-    backend                = $localBackend
-    cloud_invalid_phase    = $invalidPhase
-    cloud_invalid_detail   = $invalidDetail
-    cloud_invalid_backend  = $invalidBackend
-    cloud_ready_phase      = $readyPhase
-    cloud_ready_detail     = $readyDetail
-    cloud_ready_backend    = $readyBackend
-    cloud_paid_requests    = $cloudPaidRequests
-    cloud_ready_phases     = @($cloudReady.phases)
-    process_id             = $local.process_id
-    runtime                = $local.runtime
-    start_to_state_ms      = $local.start_to_state
-    control_quit_ok        = $true
+    checked_utc              = [DateTime]::UtcNow.ToString('o')
+    package_root             = $PackageRoot
+    version                  = [string]$manifest.version
+    git_commit               = [string]$manifest.git_commit
+    included_models          = [bool]$manifest.included_models
+    default_mode             = [string]$manifest.default_mode
+    cloud_trial_by_default   = [bool]$manifest.cloud_trial.selected_by_default
+    cloud_trial_model        = [string]$manifest.cloud_trial.model
+    cloud_trial_region       = [string]$manifest.cloud_trial.region
+    local_fallback_launcher  = [string]$manifest.local_fallback.launcher
+    files_checked            = $required.Count
+    hashes_verified          = $hashesVerified
+    launchers_checked        = $launcherInfo.Count
+    scanned_files            = $scannedFiles
+    secret_guard_self_test   = $true
+    local_fallback_phase     = $localPhase
+    local_fallback_detail    = $localDetail
+    local_fallback_backend   = $localBackend
+    local_fallback_mode      = $localMode
+    local_fallback_phases    = @($local.phases)
+    cloud_invalid_phase      = $invalidPhase
+    cloud_invalid_detail     = $invalidDetail
+    cloud_invalid_backend    = $invalidBackend
+    cloud_invalid_mode       = $invalidMode
+    cloud_ready_phase        = $readyPhase
+    cloud_ready_detail       = $readyDetail
+    cloud_ready_backend      = $readyBackend
+    cloud_ready_mode         = $readyMode
+    cloud_paid_requests      = $cloudPaidRequests
+    cloud_ready_phases       = @($cloudReady.phases)
+    process_id               = $local.process_id
+    runtime                  = $local.runtime
+    start_to_state_ms        = $local.start_to_state
+    control_quit_ok          = $true
 }
 if ($Evidence) {
     if (-not [IO.Path]::IsPathRooted($Evidence)) { $Evidence = Join-Path $PWD $Evidence }
