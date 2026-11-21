@@ -12,6 +12,7 @@ pub mod audio;
 pub mod cloud;
 #[cfg(windows)]
 pub mod deepseek;
+pub(crate) mod delivery;
 pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
@@ -30,6 +31,7 @@ pub mod whisper;
 pub mod whisper_host;
 #[cfg(windows)]
 pub mod whisper_timing;
+use delivery::{DeliveryLedger, LatePlan};
 use recognition::{
     LocalSessions, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
     SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
@@ -305,7 +307,7 @@ impl Notice {
 
 /// Line endings are not part of a target's meaning: editors may report the same
 /// content with CRLF or LF, so every refine comparison uses this form.
-fn normalize_newlines(value: &str) -> String {
+pub(crate) fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
 }
 
@@ -495,13 +497,18 @@ struct SegmentSession {
     handle: Option<Box<dyn RecognitionSession>>,
     stopped: bool,
     terminal: bool,
+    /// The one stop-time draft read has been started for this segment (or was
+    /// already recorded). It runs off the UI thread and may still be in flight.
+    stop_draft_requested: bool,
     /// A saved result's target delivery is still running.
     finalizing: bool,
     stop_requested: Option<Instant>,
     retry_audio: Option<CapturedAudio>,
     glossary: glossary::Glossary,
-    /// The target bound at this segment's start; used exactly once.
-    target: AppResult<Option<Box<dyn Target>>>,
+    /// The target bound at this segment's start; used exactly once. It is shared
+    /// with the stop-time draft reader so a late result can still reach the same
+    /// editor after the application thread moved on (#34).
+    target: AppResult<Option<Arc<Mutex<Box<dyn Target>>>>>,
     retained: Option<RetainedCapture>,
     /// Audio paths kept on disk from a failed attempt, shown to the user.
     retained_paths: Vec<PathBuf>,
@@ -523,7 +530,7 @@ struct SegmentSession {
 /// the transcript itself. A refine may only replace the appended transcript when the
 /// target still holds exactly `after`.
 struct DeliveryMemory {
-    target: Box<dyn Target>,
+    target: Arc<Mutex<Box<dyn Target>>>,
     before: String,
     after: String,
     appended: String,
@@ -556,46 +563,173 @@ impl DeliveryOutcome {
 /// editor can never block a new capture.
 static TARGET_WRITER: Mutex<()> = Mutex::new(());
 
-fn deliver(target: AppResult<Option<Box<dyn Target>>>, text: &str) -> DeliveryOutcome {
-    let mut target = match target {
+/// Which delivery rule produced this append. A normal result appends to the latest
+/// draft; a late one may only append to a draft proven unchanged since its Stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppendKind {
+    Normal,
+    Late,
+}
+
+/// A normal result append. The latest draft is read at delivery time and kept, so
+/// edits made during the capture stay in place (#33 keeps this per segment).
+fn deliver(
+    target: AppResult<Option<Arc<Mutex<Box<dyn Target>>>>>,
+    text: &str,
+    sequence: u64,
+    ledger: &DeliveryLedger,
+) -> DeliveryOutcome {
+    let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => {
-            return DeliveryOutcome::fallback(not_delivered(
-                "No supported editable target was selected at capture start".into(),
-            ));
+            let detail =
+                not_delivered("No supported editable target was selected at capture start".into());
+            ledger.keep_pending(sequence, &detail);
+            return DeliveryOutcome::fallback(detail);
         }
-        Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
+        Err(error) => {
+            let detail = not_delivered(error);
+            ledger.keep_pending(sequence, &detail);
+            return DeliveryOutcome::fallback(detail);
+        }
     };
     let _writer = TARGET_WRITER
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let latest = match target.content() {
+    let latest = match target
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .content()
+    {
         Ok(latest) => latest,
-        Err(error) => return DeliveryOutcome::fallback(not_delivered(error)),
+        Err(error) => {
+            let detail = not_delivered(error);
+            ledger.keep_pending(sequence, &detail);
+            return DeliveryOutcome::fallback(detail);
+        }
     };
-    let replacement = if latest.is_empty() {
+    append_to_target(target, sequence, ledger, latest, text, AppendKind::Normal)
+}
+
+/// A late result (it waited for the network or was recovered from retained audio).
+/// The only proof that appending is safe is the draft read when this segment
+/// stopped plus the tool's own confirmed appends since then. Everything else keeps
+/// the complete result pending; the target is never retargeted, overwritten or
+/// rolled back.
+fn deliver_late(
+    target: AppResult<Option<Arc<Mutex<Box<dyn Target>>>>>,
+    text: &str,
+    sequence: u64,
+    ledger: &DeliveryLedger,
+) -> DeliveryOutcome {
+    let target = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return keep_late(
+                ledger,
+                sequence,
+                "no supported editable target was selected at capture start",
+            );
+        }
+        Err(error) => return keep_late(ledger, sequence, &error),
+    };
+    if let Err(reason) = ledger.wait_baseline(sequence) {
+        return keep_late(ledger, sequence, &reason);
+    }
+    let _writer = TARGET_WRITER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let current = match target
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .content()
+    {
+        Ok(current) => current,
+        Err(error) => {
+            return keep_late(
+                ledger,
+                sequence,
+                &format!("the original target could not be read ({error})"),
+            );
+        }
+    };
+    match ledger.plan_late_append(sequence, &current) {
+        LatePlan::Keep { reason } => keep_late(ledger, sequence, &reason),
+        LatePlan::Append => {
+            append_to_target(target, sequence, ledger, current, text, AppendKind::Late)
+        }
+    }
+}
+
+/// The complete result is kept as this segment's own pending result. Never a write.
+fn keep_late(ledger: &DeliveryLedger, sequence: u64, reason: &str) -> DeliveryOutcome {
+    ledger.keep_pending(sequence, reason);
+    DeliveryOutcome::fallback(late_kept(reason))
+}
+
+/// One append attempt, shared by both delivery rules. The write is never repeated:
+/// a failed or unconfirmed write is diagnosed by exactly one read-back and the
+/// complete text stays available. `begin_append` records the started state first;
+/// a late append is refused when that durable marker cannot be written, because
+/// then the single write could never be proven after a lost response.
+fn append_to_target(
+    target: Arc<Mutex<Box<dyn Target>>>,
+    sequence: u64,
+    ledger: &DeliveryLedger,
+    before: String,
+    text: &str,
+    kind: AppendKind,
+) -> DeliveryOutcome {
+    let replacement = if before.is_empty() {
         text.to_string()
     } else {
-        format!("{latest}\n{text}")
+        format!("{before}\n{text}")
     };
-    match target.replace(&latest, &replacement) {
-        Ok(()) => DeliveryOutcome {
-            delivery: Delivery::Appended,
-            detail: "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
-            memory: Some(DeliveryMemory {
-                target,
-                before: latest,
-                after: replacement,
-                appended: text.to_string(),
-            }),
-        },
+    if let Err(reason) = ledger.begin_append(sequence, &before) {
+        if kind == AppendKind::Late {
+            return keep_late(ledger, sequence, &reason);
+        }
+    }
+    let write = target
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace(&before, &replacement);
+    match write {
+        Ok(()) => {
+            ledger.confirm_append(sequence, &before, &replacement);
+            DeliveryOutcome {
+                delivery: Delivery::Appended,
+                detail: match kind {
+                    AppendKind::Normal => "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
+                    AppendKind::Late => late_appended(),
+                },
+                memory: Some(DeliveryMemory {
+                    target,
+                    before,
+                    after: replacement,
+                    appended: text.to_string(),
+                }),
+            }
+        }
         Err(error) => {
             // Diagnose the failed write by reading the target again. Reading is not a
             // retry: the write is never repeated and the previous text is never restored.
-            let observed = target.content();
-            let (delivery, detail) = failed_write(&latest, &replacement, &error, observed);
+            let observed = target
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .content();
+            let failed = failed_write(&before, &replacement, &error, observed);
+            if failed.uncertain {
+                ledger.mark_uncertain(sequence, &failed.detail);
+            } else {
+                ledger.keep_pending(sequence, &failed.detail);
+            }
+            let detail = match kind {
+                AppendKind::Normal => failed.detail,
+                AppendKind::Late => late_failed(failed.detail),
+            };
             DeliveryOutcome {
-                delivery,
+                delivery: failed.delivery,
                 detail,
                 memory: None,
             }
@@ -641,7 +775,7 @@ fn refine_delivery(
                     .into(),
         };
     }
-    let Some(mut memory) = memory else {
+    let Some(memory) = memory else {
         // Nothing was ever appended (the result was a fallback), so there is no
         // target to protect: the refined text simply becomes the current result.
         return match fs::write(&current_result, &refined) {
@@ -669,7 +803,14 @@ fn refine_delivery(
     let _writer = TARGET_WRITER
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let observed = match memory.target.content() {
+    let observed = {
+        let mut target = memory
+            .target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        target.content()
+    };
+    let observed = match observed {
         Ok(observed) => observed,
         Err(error) => {
             return RefineOutcome::NotApplied {
@@ -693,7 +834,12 @@ fn refine_delivery(
     } else {
         format!("{}\n{}", memory.before, refined)
     };
-    if let Err(error) = memory.target.replace(&observed, &replacement) {
+    if let Err(error) = memory
+        .target
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace(&observed, &replacement)
+    {
         return RefineOutcome::NotApplied {
             refined,
             reason: format!(
@@ -701,7 +847,14 @@ fn refine_delivery(
             ),
         };
     }
-    match memory.target.content() {
+    let readback = {
+        let mut target = memory
+            .target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        target.content()
+    };
+    match readback {
         Ok(readback) if normalize_newlines(&readback) == normalize_newlines(&replacement) => {
             let mut note = "The refined text replaced the appended transcript in the original target and was read back in full; review and send it manually.".to_string();
             if let Err(error) = fs::write(&current_result, &refined) {
@@ -733,12 +886,34 @@ fn not_delivered(reason: String) -> String {
     )
 }
 
-/// A result that only exists because the session waited for the network and later
-/// recovered is a late result. Until the late-backfill safety checks can prove the
-/// original draft is unchanged (#34), it is never written to the target
-/// automatically; the complete text is saved and shown in the panel instead.
-fn recovered_not_delivered() -> String {
-    "The complete result was recovered after waiting for the network, so it was not written to the original target automatically. The complete text is saved on this machine and shown in the expanded result panel; review and copy it to the intended input. Nothing is sent automatically.".into()
+/// A late result was appended because the original draft was proven unchanged
+/// since the segment stopped.
+fn late_appended() -> String {
+    "The complete result was recovered after waiting for the network. The original target still held the draft recorded when this segment stopped, including Listen's own confirmed appends, so the complete result was appended once to its end and confirmed by reading it back. Review and send it manually; a copy remains in Listen.".into()
+}
+
+/// A late result keeps its complete text pending because appending could not be
+/// proven safe. Nothing was written to any control.
+fn late_kept(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.').trim_end();
+    format!(
+        "The complete result was recovered after waiting for the network. It was not appended automatically: {reason}. The complete text is saved on this machine and shown in the expanded result panel; review and copy it to the intended input. Nothing is sent automatically."
+    )
+}
+
+/// The write itself was attempted for a late result and its outcome is not
+/// confirmed. The failed-write diagnosis already says what the target holds.
+fn late_failed(detail: String) -> String {
+    format!("This complete result was recovered after waiting for the network. {detail}")
+}
+
+/// One failed write's honest report, including whether anything about it is still
+/// uncertain. `uncertain` is true whenever the target may hold a complete or partial
+/// write: the segment is then never appended again automatically.
+struct FailedWrite {
+    delivery: Delivery,
+    detail: String,
+    uncertain: bool,
 }
 
 /// Reports what the target actually holds after a failed write, without ever claiming
@@ -749,18 +924,19 @@ fn failed_write(
     intended: &str,
     error: &str,
     observed: AppResult<String>,
-) -> (Delivery, String) {
+) -> FailedWrite {
     let advice = "Check the original target before copying; output is not retried automatically and the original text is not reverted.";
     let fallback = "The complete result is in the expanded result panel.";
     let observed = match observed {
         Ok(observed) => observed,
         Err(read_error) => {
-            return (
-                Delivery::Fallback,
-                format!(
+            return FailedWrite {
+                delivery: Delivery::Fallback,
+                detail: format!(
                     "The write to the original target could not be confirmed ({error}); the target could not be read back ({read_error}). {advice} {fallback}"
                 ),
-            );
+                uncertain: true,
+            };
         }
     };
     // Line endings are not part of the delivered text's meaning.
@@ -768,35 +944,39 @@ fn failed_write(
     let previous = previous.replace("\r\n", "\n");
     let intended = intended.replace("\r\n", "\n");
     if observed == previous {
-        (
-            Delivery::Fallback,
-            format!(
+        FailedWrite {
+            delivery: Delivery::Fallback,
+            detail: format!(
                 "The original target still holds its previous content, so nothing was written to it ({error}). {fallback} Review and copy it to the intended input."
             ),
-        )
+            uncertain: false,
+        }
     } else if observed == intended {
-        (
-            Delivery::Fallback,
-            format!(
+        FailedWrite {
+            delivery: Delivery::Fallback,
+            detail: format!(
                 "The write to the original target could not be confirmed ({error}), but it now contains the complete appended text. {advice} A copy remains in Listen."
             ),
-        )
+            uncertain: true,
+        }
     } else if !observed.is_empty() && intended.starts_with(&observed) {
-        (
-            Delivery::Fallback,
-            format!(
+        FailedWrite {
+            delivery: Delivery::Fallback,
+            detail: format!(
                 "The original target holds only {} of {} characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. {advice} {fallback}",
                 observed.chars().count(),
                 intended.chars().count()
             ),
-        )
+            uncertain: true,
+        }
     } else {
-        (
-            Delivery::Fallback,
-            format!(
+        FailedWrite {
+            delivery: Delivery::Fallback,
+            detail: format!(
                 "The write to the original target could not be confirmed ({error}); the target content changed and may be partially written. {advice} {fallback}"
             ),
-        )
+            uncertain: true,
+        }
     }
 }
 
@@ -811,6 +991,10 @@ pub struct Application {
     /// The durable per-segment record (#33). Only the application thread writes it,
     /// so no two workers can corrupt the index.
     store: SegmentStore,
+    /// The durable delivery record and the late-backfill safety check (#34). It is
+    /// shared with the delivery workers, which record the stopped draft, the
+    /// started write and its confirmed outcome off the UI thread.
+    delivery: Arc<DeliveryLedger>,
     record_problem: Option<String>,
     next_session_id: u64,
     /// The highest capture order whose complete text is the current result. An older
@@ -891,6 +1075,11 @@ impl Application {
         if let Some(problem) = store.problem() {
             detail.push_str(&format!("\n{problem}"));
         }
+        let delivery = Arc::new(DeliveryLedger::open(&runtime));
+        let delivery_problem = delivery.problem();
+        if let Some(problem) = &delivery_problem {
+            detail.push_str(&format!("\n{problem}"));
+        }
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut application = Self {
             snapshot: Snapshot {
@@ -919,7 +1108,8 @@ impl Application {
             runtime,
             segments: Vec::new(),
             store,
-            record_problem: None,
+            delivery,
+            record_problem: delivery_problem,
             next_session_id: 0,
             current_sequence: 0,
             completion_tx,
@@ -1428,11 +1618,13 @@ impl Application {
             return;
         }
         // Bind once before any UI feedback. Recognition receives neither the target
-        // draft nor an editor identity.
+        // draft nor an editor identity. The handle is shared so the draft read at
+        // Stop and a later late delivery still address this same bound editor (#34).
         let bound_target = self
             .targets
             .as_ref()
-            .map_or(Ok(None), |targets| targets.focused_target());
+            .map_or(Ok(None), |targets| targets.focused_target())
+            .map(|target| target.map(|target| Arc::new(Mutex::new(target))));
         self.snapshot.endpoint = None;
         let mut started_directory = None;
         let result = (|| {
@@ -1473,6 +1665,7 @@ impl Application {
                     handle: Some(handle),
                     stopped: false,
                     terminal: false,
+                    stop_draft_requested: false,
                     finalizing: false,
                     stop_requested: None,
                     retry_audio: None,
@@ -1554,10 +1747,47 @@ impl Application {
             self.snapshot.phase = Phase::Processing;
             self.snapshot.detail = detail;
         }
+        self.capture_stop_draft(index);
         self.persist_segment(index);
         // A retry may have reserved its paid request before it spawned a worker; the
         // summary becomes visible once no recognition session is active.
         self.mark_usage_pending();
+    }
+
+    /// Read the target draft once, when a segment stops, without blocking Stop.
+    ///
+    /// This read is the only reference a late result is judged against: it is what
+    /// the user had written when the segment ended. It runs on its own thread
+    /// because a slow or hung editor must never delay the Stop control or the next
+    /// capture; a late delivery waits for it off the UI thread with a bounded
+    /// timeout and keeps the result pending when the draft cannot be read (#34).
+    fn capture_stop_draft(&mut self, index: usize) {
+        let Some(segment) = self.segments.get_mut(index) else {
+            return;
+        };
+        if segment.stop_draft_requested {
+            return;
+        }
+        segment.stop_draft_requested = true;
+        let sequence = segment.sequence;
+        match &segment.target {
+            Ok(Some(target)) => {
+                let target = target.clone();
+                let ledger = self.delivery.clone();
+                thread::spawn(move || {
+                    let observed = {
+                        let mut target = target.lock().unwrap_or_else(|error| error.into_inner());
+                        target.content()
+                    };
+                    ledger.record_baseline(sequence, observed);
+                });
+            }
+            Ok(None) => self.delivery.record_no_target(
+                sequence,
+                "no supported editable target was selected at capture start",
+            ),
+            Err(error) => self.delivery.record_no_target(sequence, error),
+        }
     }
 
     /// Reprocess the exact audio kept from the newest failed segment. This never
@@ -1589,6 +1819,13 @@ impl Application {
             directory: self.segments[index].directory.clone(),
             glossary,
         };
+        // A capture that failed before Stop never read its draft. The first retry
+        // records it now, once, before the retried result can be delivered: a later
+        // read would describe a draft the user may already have edited.
+        let sequence = self.segments[index].sequence;
+        if !self.delivery.has_baseline_attempt(sequence) {
+            self.capture_stop_draft(index);
+        }
         match self.sessions.retry(request, audio.clone()) {
             Ok(handle) => {
                 let segment = &mut self.segments[index];
@@ -1641,6 +1878,7 @@ impl Application {
                 self.segments[index].retained = None;
                 self.segments[index].retained_paths.clear();
                 self.segments[index].detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+                self.delivery.forget(self.segments[index].sequence);
                 self.remove_segment_record(index);
                 self.refresh_recovery_snapshot();
                 if index + 1 == self.segments.len() {
@@ -1757,6 +1995,12 @@ impl Application {
         // Cost summaries and per-segment cost are read only once no recognition
         // session is alive, so the ledger's admission lock is never contended.
         self.flush_deferred_usage();
+        // A degraded delivery record is reported once. It never stops capture or a
+        // normal append; it only means a late result cannot be proven safe and stays
+        // pending.
+        if let Some(problem) = self.delivery.problem() {
+            self.note_record_problem(problem);
+        }
         self.refresh_segments();
     }
 
@@ -1804,6 +2048,12 @@ impl Application {
                     self.snapshot.phase = Phase::Processing;
                 }
             }
+        }
+        // A session that reports its own stop must still get the one stop-time draft
+        // read a late result is judged against (#34); without it the result can only
+        // stay pending.
+        if self.segments[index].stopped && !self.segments[index].stop_draft_requested {
+            self.capture_stop_draft(index);
         }
         let changed = self.segments[index].state != previous_state;
         if changed {
@@ -1969,15 +2219,16 @@ impl Application {
         self.segments[index].timing = timing.clone();
         self.segments[index].finalizing = true;
         let tx = self.completion_tx.clone();
+        let ledger = self.delivery.clone();
         let worker_text = text.clone();
         let worker_timing = timing.clone();
         let worker_directory = directory.clone();
         thread::spawn(move || {
             let delivery_started = Instant::now();
             let outcome = if recovered {
-                DeliveryOutcome::fallback(recovered_not_delivered())
+                deliver_late(target, &worker_text, sequence, ledger.as_ref())
             } else {
-                deliver(target, &worker_text)
+                deliver(target, &worker_text, sequence, ledger.as_ref())
             };
             let mut timing = worker_timing;
             timing.delivery_ms = Some(elapsed_ms(delivery_started));

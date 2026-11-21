@@ -368,6 +368,39 @@ impl Harness {
     fn runtime(&self) -> &Path {
         &self.runtime.0
     }
+    /// Wait until the draft read taken when this segment stopped is recorded, so a
+    /// test can rewrite the draft afterwards without racing that reader.
+    fn wait_for_stop_draft(&mut self, sequence: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.app.poll();
+            let recorded = fs::read(self.runtime.0.join("delivery.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|index| {
+                    index["segments"].as_array().and_then(|records| {
+                        records
+                            .iter()
+                            .find(|record| record["sequence"] == sequence)
+                            .cloned()
+                    })
+                })
+                .is_some_and(|record| {
+                    record["baseline"].is_string() || record["baseline_problem"].is_string()
+                });
+            if recorded {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for segment {sequence}'s stop-time draft"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn set_draft(&self, editor: usize, draft: &str) {
+        *self.editors[editor].draft.lock().unwrap() = draft.into();
+    }
 }
 
 #[test]
@@ -389,26 +422,31 @@ fn a_new_capture_starts_while_the_previous_segment_waits_and_each_segment_keeps_
     let second = h.start(1);
     assert_eq!(h.snapshot().phase, Phase::Capturing);
 
-    // The first segment's late result arrives while the second is capturing. It is
-    // a recovered (late) result, so it must never be written to its target, and it
-    // must not change the live capture's phase. It is the newest complete result, so
-    // it is shown as the current result until the live segment finishes.
+    // The first segment's late result arrives while the second is capturing. Its
+    // own target still holds the draft recorded at its stop, so it is appended once
+    // to that target and must not change the live capture's phase. It is the newest
+    // complete result, so it is shown as the current result until the live segment
+    // finishes.
     h.finish(first, "第一段完整结果。", true);
-    let waiting = h.poll_until("the first segment's pending result", |snapshot| {
+    let waiting = h.poll_until("the first segment's late result", |snapshot| {
         snapshot
             .segments
             .iter()
             .any(|segment| segment.sequence == 1 && segment.text == "第一段完整结果。")
     });
     assert_eq!(waiting.phase, Phase::Capturing, "{waiting:?}");
-    assert_eq!(h.draft(0), "第一段草稿", "a late result is never appended");
+    assert_eq!(
+        h.draft(0),
+        "第一段草稿\n第一段完整结果。",
+        "a late result with an intact draft is appended to its own target"
+    );
     assert_eq!(waiting.text, "第一段完整结果。");
-    assert_eq!(waiting.delivery, Some(Delivery::Fallback), "{waiting:?}");
+    assert_eq!(waiting.delivery, Some(Delivery::Appended), "{waiting:?}");
     assert!(
         waiting
             .segments
             .iter()
-            .any(|segment| segment.sequence == 1 && segment.delivery == Some(Delivery::Fallback)),
+            .any(|segment| segment.sequence == 1 && segment.delivery == Some(Delivery::Appended)),
         "{waiting:?}"
     );
 
@@ -423,7 +461,7 @@ fn a_new_capture_starts_while_the_previous_segment_waits_and_each_segment_keeps_
     assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
     assert_eq!(
         h.draft(0),
-        "第一段草稿",
+        "第一段草稿\n第一段完整结果。",
         "no segment writes another's target"
     );
     assert_eq!(h.draft(1), "第二段草稿\n第二段完整结果。");
@@ -515,20 +553,21 @@ fn three_interleaved_captures_keep_their_own_state_and_the_newest_result_is_curr
         settled.text, "第三段完整结果。",
         "the newest capture order is the current result: {settled:?}"
     );
-    assert_eq!(settled.delivery, Some(Delivery::Fallback), "{settled:?}");
-    // Every recovered result stays conservative: no target is written at all.
-    assert_eq!(h.draft(0), "一段草稿");
-    assert_eq!(h.draft(1), "二段草稿");
-    assert_eq!(h.draft(2), "三段草稿");
+    assert_eq!(settled.delivery, Some(Delivery::Appended), "{settled:?}");
+    // Every recovered result had its own intact stop-time draft, so each was
+    // appended once to its own target — never to another segment's.
+    assert_eq!(h.draft(0), "一段草稿\n第一段完整结果。");
+    assert_eq!(h.draft(1), "二段草稿\n第二段完整结果。");
+    assert_eq!(h.draft(2), "三段草稿\n第三段完整结果。");
 }
 
 #[test]
 fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_results() {
     let mut h = Harness::new(&["一段草稿", "二段草稿", "三段草稿"]);
-    // Segment 1 produces a pending (recovered) result that must survive everything.
+    // Segment 1 produces a recovered result that must survive everything.
     let first = h.start(0);
     h.stop();
-    h.finish(first, "第一段待取结果。", true);
+    h.finish(first, "第一段结果。", true);
     h.poll_until("segment 1 result", |snapshot| {
         snapshot
             .segments
@@ -565,8 +604,8 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
         "{isolated:?}"
     );
     assert_eq!(
-        isolated.segments[0].text, "第一段待取结果。",
-        "another segment's pending result must not be cleared: {isolated:?}"
+        isolated.segments[0].text, "第一段结果。",
+        "another segment's delivered result must not be cleared: {isolated:?}"
     );
     assert!(isolated.retry_available, "{isolated:?}");
     assert!(
@@ -574,7 +613,7 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
         "the failed segment's audio is retained: {isolated:?}"
     );
 
-    // Segment 3 completes normally; the pending result and the failed audio stay.
+    // Segment 3 completes normally; the earlier result and the failed audio stay.
     h.stop();
     h.finish(third, "第三段完整结果。", false);
     let settled = h.poll_until("segment 3 result", |snapshot| {
@@ -582,7 +621,7 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
     });
     assert_eq!(settled.text, "第三段完整结果。");
     assert_eq!(settled.delivery, Some(Delivery::Appended), "{settled:?}");
-    assert_eq!(settled.segments[0].text, "第一段待取结果。");
+    assert_eq!(settled.segments[0].text, "第一段结果。");
     assert_eq!(settled.segments[1].state, SegmentState::Failed);
     assert!(
         settled.segments[1].text.is_empty(),
@@ -592,7 +631,7 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
         settled.retained_audio.iter().all(|path| path.is_file()),
         "the old failure's audio must survive the new result: {settled:?}"
     );
-    assert_eq!(h.draft(0), "一段草稿");
+    assert_eq!(h.draft(0), "一段草稿\n第一段结果。");
     assert_eq!(h.draft(1), "二段草稿");
     assert_eq!(h.draft(2), "三段草稿\n第三段完整结果。");
 }
@@ -614,6 +653,10 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
         },
     );
     h.stop();
+    h.wait_for_stop_draft(1);
+    // Both older drafts are rewritten after their own stop, so their late results
+    // cannot be proven safe and must stay independent pending results.
+    h.set_draft(0, "草稿一\n用户改写");
     let second = h.start(1);
     let (_, second_directory, _) = h.entry(second);
     h.registry.set_usage(
@@ -628,6 +671,8 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
         },
     );
     h.stop();
+    h.wait_for_stop_draft(2);
+    h.set_draft(1, "草稿二\n用户改写");
     let third = h.start(2);
     h.stop();
 
@@ -831,6 +876,20 @@ fn duplicate_and_foreign_events_cannot_change_another_segments_result() {
         "a late failure of a completed segment is ignored: {after_old_events:?}"
     );
     assert_eq!(after_old_events.phase, Phase::Processing);
+    assert_eq!(
+        after_old_events
+            .segments
+            .iter()
+            .filter(|segment| segment.sequence == 1)
+            .count(),
+        1,
+        "{after_old_events:?}"
+    );
+    assert_eq!(
+        h.draft(0),
+        "草稿甲\n第一段完整结果。",
+        "a duplicate confirmation never appends the same segment twice"
+    );
 
     // An event carrying segment 1's identity through segment 2's channel is foreign
     // and must be ignored; then segment 2's own confirmation applies once.
@@ -862,7 +921,11 @@ fn duplicate_and_foreign_events_cannot_change_another_segments_result() {
     assert_eq!(settled.text, "第二段完整结果。");
     assert_eq!(settled.segments[1].text, "第二段完整结果。");
     assert_eq!(settled.segments[0].text, "第一段完整结果。");
-    assert_eq!(h.draft(0), "草稿甲", "the recovered result wrote no target");
+    assert_eq!(
+        h.draft(0),
+        "草稿甲\n第一段完整结果。",
+        "the recovered result is appended once, and its duplicate is never appended"
+    );
     assert_eq!(h.draft(1), "草稿乙\n第二段完整结果。");
     // The duplicate text never appeared anywhere.
     assert_ne!(settled.text, "第一段重复结果。");
