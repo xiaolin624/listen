@@ -39,8 +39,6 @@ const REPAIRED_PCM_FILE: &str = "recovered.pcm";
 /// The rejoined copy of a local capture whose windows could not all be read.
 const REPAIRED_WAV_FILE: &str = "recovered.wav";
 const SESSION_PREFIX: &str = "session-";
-const SEGMENT_TEXT_PREFIX: &str = "segment-";
-const SEGMENT_TEXT_SUFFIX: &str = ".txt";
 
 /// Why a recovered segment is being shown exactly as it is. These are user-facing
 /// sentences; none of them contains a credential or a vendor error body.
@@ -191,10 +189,10 @@ impl Plan {
                 detail,
                 text_file: Some(orphan.name),
                 text_chars: orphan.text.chars().count(),
-                delivery: Some("uncertain".into()),
+                delivery: Some(DeliveryState::Uncertain.name().into()),
                 usage: None,
                 glossary_terms: terms.to_vec(),
-                updated_utc: crate::segments::now_utc(),
+                updated_utc: crate::durable::now_utc(),
             };
             if let Some(error) = store.upsert(record) {
                 warnings.push(error);
@@ -248,7 +246,7 @@ impl Plan {
                 delivery: None,
                 usage: None,
                 glossary_terms: terms.to_vec(),
-                updated_utc: crate::segments::now_utc(),
+                updated_utc: crate::durable::now_utc(),
             };
             if let Some(error) = store.upsert(record) {
                 warnings.push(error);
@@ -390,16 +388,14 @@ fn plural(count: usize) -> &'static str {
 /// Scan the runtime directory together with the stored segment records and the
 /// durable delivery states, and decide what each leftover segment is.
 ///
-/// `delivery_problem` says the durable delivery record could not be read at all.
-/// Every recovered text is then `Uncertain`: a write may have happened and this
-/// process cannot prove it, so it is never appended automatically. A delivery
-/// record that was pruned away is treated exactly like a missing one — panel-only,
-/// fail-closed.
+/// A delivery record that is missing, unreadable or pruned proves nothing about the
+/// original target, so every recovered text in that position is `Uncertain` and is
+/// never appended automatically. Only an explicit `fallback` record proves that
+/// nothing was written.
 pub(crate) fn plan(
     runtime: &Path,
     records: &[SegmentRecord],
     deliveries: &BTreeMap<u64, DeliveryState>,
-    delivery_problem: bool,
 ) -> Plan {
     let mut sorted: Vec<&SegmentRecord> = records.iter().collect();
     sorted.sort_by_key(|record| record.sequence);
@@ -434,7 +430,10 @@ pub(crate) fn plan(
                 .unwrap_or_default(),
         };
         let delivery_state = deliveries.get(&sequence).copied();
-        let recorded_delivery = parse_delivery(record.delivery.as_deref());
+        let recorded_delivery = record
+            .delivery
+            .as_deref()
+            .and_then(DeliveryState::from_name);
         let delivery = delivery_state.or(recorded_delivery);
         let text_is_some = text.is_some();
         let audio_problem = audio.as_ref().and_then(|audio| audio.problem.clone());
@@ -444,7 +443,7 @@ pub(crate) fn plan(
         );
         let (state, detail, delivery, resumable, release_audio) = match text.as_ref() {
             Some(_) => {
-                let delivery = recovered_delivery(delivery, delivery_problem);
+                let delivery = recovered_delivery(delivery);
                 let mut detail = RECOVERED_TEXT_DETAIL.to_string();
                 if delivery == Delivery::Appended {
                     detail.push_str(RECOVERED_APPENDED_NOTE);
@@ -560,16 +559,19 @@ pub(crate) fn plan(
     }
 }
 
-/// A recovered result's delivery state. A missing record (never written, pruned, or
-/// an unreadable ledger) can never prove that nothing was written, so it is
-/// reported as uncertain instead of claiming a panel-only fallback.
-fn recovered_delivery(state: Option<DeliveryState>, ledger_problem: bool) -> Delivery {
+/// A recovered result's delivery state. Only an explicit `fallback` record proves
+/// that nothing was written. A `pending` record can hide a write whose `started`
+/// marker could not be saved, and a missing record (never written, pruned, or an
+/// unreadable ledger) proves nothing at all, so both are reported as uncertain
+/// instead of claiming a panel-only fallback.
+fn recovered_delivery(state: Option<DeliveryState>) -> Delivery {
     match state {
         Some(DeliveryState::Appended) => Delivery::Appended,
-        Some(DeliveryState::Started) | Some(DeliveryState::Uncertain) => Delivery::Uncertain,
-        Some(DeliveryState::Pending) | Some(DeliveryState::Fallback) => Delivery::Fallback,
-        None if ledger_problem => Delivery::Uncertain,
-        None => Delivery::Fallback,
+        Some(DeliveryState::Fallback) => Delivery::Fallback,
+        Some(DeliveryState::Pending)
+        | Some(DeliveryState::Started)
+        | Some(DeliveryState::Uncertain)
+        | None => Delivery::Uncertain,
     }
 }
 
@@ -599,11 +601,7 @@ fn scan_orphans(
             });
             continue;
         }
-        let Some(sequence) = name
-            .strip_prefix(SEGMENT_TEXT_PREFIX)
-            .and_then(|rest| rest.strip_suffix(SEGMENT_TEXT_SUFFIX))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(sequence) = SegmentStore::text_sequence(&name) else {
             continue;
         };
         if known_sequences.contains(&sequence) {
@@ -671,16 +669,6 @@ fn safe_directory(runtime: &Path, name: &str) -> Option<PathBuf> {
     }
     let path = runtime.join(name);
     path.is_dir().then_some(path)
-}
-
-fn parse_delivery(recorded: Option<&str>) -> Option<DeliveryState> {
-    match recorded {
-        Some("appended") => Some(DeliveryState::Appended),
-        Some("fallback") => Some(DeliveryState::Fallback),
-        Some("started") => Some(DeliveryState::Started),
-        Some("uncertain") => Some(DeliveryState::Uncertain),
-        Some(_) | None => None,
-    }
 }
 
 /// The continuous recording of one cloud capture, validated against the

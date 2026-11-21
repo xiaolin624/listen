@@ -763,8 +763,9 @@ fn a_lost_write_response_is_recorded_uncertain_and_never_appended_twice() {
     });
 
     // The target actually holds the complete append, but Listen cannot claim a
-    // confirmed delivery, so the result stays available as a fallback.
-    assert_eq!(settled.delivery, Some(Delivery::Fallback), "{settled:?}");
+    // confirmed delivery, so the result is reported as uncertain and stays
+    // available in the panel.
+    assert_eq!(settled.delivery, Some(Delivery::Uncertain), "{settled:?}");
     assert_eq!(h.draft(0), "会议草稿\n迟到但完整的转写。");
     assert_eq!(
         occurrences(&h.draft(0), "迟到但完整的转写。"),
@@ -808,7 +809,11 @@ fn a_truncated_late_write_is_not_a_complete_delivery_and_keeps_the_full_text() {
     });
 
     let draft = h.draft(0);
-    assert_eq!(settled.delivery, Some(Delivery::Fallback), "{settled:?}");
+    assert_eq!(
+        settled.delivery,
+        Some(Delivery::Uncertain),
+        "a possibly truncated write is an uncertain outcome, not a proven empty target: {settled:?}"
+    );
     assert!(draft.starts_with("会议草稿\n迟"), "{draft:?}");
     assert!(
         draft.chars().count() < "会议草稿\n迟到但完整的转写。".chars().count(),

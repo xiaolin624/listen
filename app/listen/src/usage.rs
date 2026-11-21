@@ -20,9 +20,13 @@
 //! # Two independent limits
 //!
 //! [`UsageSummary::trial_cap_nanoyuan`] is the trial's hard spending cap (CNY 50);
-//! it is enforced by the ledger before a request is admitted. [`MONTH_REMINDER_NANOYUAN`]
-//! (CNY 100) is a *reminder line only*: nothing here can grant, extend or raise
-//! budget, and reaching it never stops a capture. The two must never be confused.
+//! it is enforced by the ledger before a request is admitted.
+//! [`UsageSummary::MONTH_REMINDER_NANOYUAN`] (CNY 100) is a *reminder line only*:
+//! nothing here can grant, extend or raise budget, and approaching or reaching it
+//! never stops a capture. The reminder fires at
+//! [`UsageSummary::REMINDER_THRESHOLD_NANOYUAN`] (90% of the line, CNY 90) so the
+//! user is warned while approaching it, not only after crossing it. The two limits
+//! must never be confused.
 //!
 //! # Months
 //!
@@ -32,10 +36,6 @@
 //! bill would not, which is why this is never presented as one.
 
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// The daily reminder line: CNY 100 per month. A reminder only — it never admits,
-/// stops or extends a paid request, and it is never written to the ledger.
-pub const MONTH_REMINDER_NANOYUAN: u64 = UsageSummary::MONTH_REMINDER_NANOYUAN;
 
 /// Cumulative usage and cost of this tool's own cloud recognition requests.
 ///
@@ -85,6 +85,11 @@ impl UsageSummary {
     /// The CNY 100 monthly reminder line. It is a reminder, never a budget.
     pub const MONTH_REMINDER_NANOYUAN: u64 = 100 * 1_000_000_000;
 
+    /// The point at which the monthly reminder fires: 90% of the line (CNY 90).
+    /// Warning while approaching the line is the point; the line itself changes
+    /// nothing.
+    pub const REMINDER_THRESHOLD_NANOYUAN: u64 = Self::MONTH_REMINDER_NANOYUAN * 9 / 10;
+
     /// The summary for a ledger that could not be read. The trial cap is still
     /// known from the code, but no spend can be claimed.
     pub fn unreadable(trial_cap_nanoyuan: u64) -> Self {
@@ -107,10 +112,11 @@ impl UsageSummary {
             .saturating_add(self.month_estimated_nanoyuan)
     }
 
-    /// Whether the current month reached the CNY 100 reminder line. This is a
-    /// statement about recorded estimates, never a budget decision.
+    /// Whether the current month is approaching the CNY 100 reminder line. The
+    /// threshold is 90% of the line; this is a statement about recorded estimates,
+    /// never a budget decision.
     pub fn reminder_reached(&self) -> bool {
-        !self.unreadable && self.month_nanoyuan() >= MONTH_REMINDER_NANOYUAN
+        !self.unreadable && self.month_nanoyuan() >= Self::REMINDER_THRESHOLD_NANOYUAN
     }
 }
 
@@ -159,4 +165,36 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month as u32,
         day as u32,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_monthly_reminder_fires_while_approaching_the_line() {
+        let mut usage = UsageSummary::default();
+        usage.month_confirmed_nanoyuan = UsageSummary::REMINDER_THRESHOLD_NANOYUAN - 1;
+        assert!(
+            !usage.reminder_reached(),
+            "just below 90% of the line must not remind yet"
+        );
+        // 90% of CNY 100 is CNY 90: warned before the line, not only at it.
+        assert_eq!(UsageSummary::REMINDER_THRESHOLD_NANOYUAN, 90_000_000_000);
+        usage.month_confirmed_nanoyuan = UsageSummary::REMINDER_THRESHOLD_NANOYUAN;
+        assert!(usage.reminder_reached());
+        usage.month_confirmed_nanoyuan = UsageSummary::MONTH_REMINDER_NANOYUAN;
+        assert!(usage.reminder_reached());
+        usage.month_estimated_nanoyuan = 1;
+        usage.month_confirmed_nanoyuan = UsageSummary::REMINDER_THRESHOLD_NANOYUAN - 1;
+        assert!(
+            usage.reminder_reached(),
+            "confirmed plus conservative estimate is the monthly figure"
+        );
+        usage.unreadable = true;
+        assert!(
+            !usage.reminder_reached(),
+            "an unreadable ledger can never claim a reached reminder"
+        );
+    }
 }

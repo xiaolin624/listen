@@ -772,6 +772,92 @@ impl TrialClock for AdvancedClock {
 }
 
 #[test]
+fn a_connection_dropped_long_after_capture_start_gets_its_own_retry_window() {
+    // The retry budget is anchored at the failure, not at capture start. A drop
+    // more than twenty seconds after Start is still a transient outage and must
+    // recover automatically instead of failing with zero retries.
+    let clock = Arc::new(AdvancedClock::new());
+    let mut scenario = Scenario::with_clock("protected draft", clock.clone());
+    scenario.start();
+    let first = scenario.transport.accept();
+    let run = scenario.receive_text("run-task");
+    let first_task = run["header"]["task_id"].as_str().unwrap().to_string();
+    scenario.event(&first, &first_task, "task-started", json!({}));
+    scenario.speak(1600);
+    assert_eq!(scenario.receive_audio(1600), vec![7, 0].repeat(1600));
+
+    // The capture has been running well past the old 20-second window.
+    clock.advance(Duration::from_secs(45));
+    first.send(Err(CloudError::Network)).unwrap();
+    let waiting = scenario.waiting_for_network();
+    assert_eq!(waiting.phase, Phase::Capturing);
+    assert!(scenario.playback.is_recording());
+
+    // The retry connects and the complete retained recording is replayed once.
+    let second = scenario.transport.accept();
+    let run = scenario.receive_text("run-task");
+    let second_task = run["header"]["task_id"].as_str().unwrap().to_string();
+    assert_ne!(second_task, first_task, "a rebuild is a new remote request");
+    scenario.event(&second, &second_task, "task-started", json!({}));
+    assert_eq!(scenario.receive_audio(1600), vec![7, 0].repeat(1600));
+    scenario.event(
+        &second,
+        &second_task,
+        "result-generated",
+        json!({"output":{"sentence":{
+            "sentence_id":1,"text":"迟到断线也自动恢复。","sentence_end":true
+        }}}),
+    );
+    scenario.stop();
+    scenario.receive_text("finish-task");
+    scenario.event(&second, &second_task, "task-finished", json!({}));
+
+    let result = scenario.wait_phase(Phase::Result);
+    assert_eq!(result.text, "迟到断线也自动恢复。");
+    assert_eq!(result.delivery, Some(Delivery::Appended));
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n迟到断线也自动恢复。", scenario.original_draft())
+    );
+}
+
+#[test]
+fn an_endless_failure_still_stops_after_the_bounded_attempts() {
+    // Every attempt fails immediately and the injected clock never advances, so
+    // only the attempt bound can stop the retry loop. The recording must stay
+    // retryable instead of reconnecting forever.
+    let clock = Arc::new(AdvancedClock::new());
+    let mut scenario = Scenario::with_clock("protected draft", clock);
+    scenario.start();
+    scenario.speak(1600);
+    scenario.waiting_for_network();
+    scenario.stop();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let failure = loop {
+        scenario.app.poll();
+        let snapshot = scenario.app.snapshot();
+        if snapshot.phase == Phase::Failure {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an endless failure never stopped: {snapshot:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert!(failure.text.is_empty());
+    assert!(failure.retry_available, "{failure:?}");
+    assert!(!failure.retained_audio.is_empty());
+    assert_eq!(
+        scenario.transport.connect_count(),
+        8,
+        "the attempt budget must be bounded, not reset by every failure"
+    );
+    assert_eq!(scenario.draft(), scenario.original_draft());
+}
+
+#[test]
 fn bounded_automatic_retries_then_an_explicit_retry_replays_the_retained_recording() {
     let clock = Arc::new(AdvancedClock::new());
     let mut scenario = Scenario::with_clock("protected draft", clock.clone());

@@ -40,21 +40,26 @@
 //! Resolved records are therefore pruned to a byte budget and a record count,
 //! oldest first. Pruning is fail-closed: the late-append proof walks a chain of
 //! `appended` records, so a missing link can only make [`LatePlan::Keep`] more
-//! likely; it can never make an append look safe. `pending`, `started` and
-//! `uncertain` records are never pruned — they are the safety markers that prevent
-//! a second automatic write.
+//! likely; it can never make an append look safe. When pruning is why a still-waiting
+//! result is kept in the panel, the recorded reason says so instead of claiming the
+//! user edited the target. `pending`, `started` and `uncertain` records are never
+//! pruned — they are the safety markers that prevent a second automatic write.
 
-use crate::{AppResult, cloud::persist_result, normalize_newlines};
+use crate::{
+    AppResult, Delivery,
+    cloud::persist_result,
+    durable::{VersionedRecord, now_utc, open_versioned},
+    normalize_newlines,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
     sync::{
         Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Bumping this is a compatibility decision: any other version is read as
@@ -114,6 +119,14 @@ struct Stored {
     segments: Vec<Record>,
 }
 
+impl VersionedRecord for Stored {
+    const VERSION: u32 = STORE_VERSION;
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
 /// What a late result may do, decided against the durable record.
 pub(crate) enum LatePlan {
     /// The original target still holds exactly the stop-time draft plus the tool's
@@ -142,7 +155,20 @@ pub(crate) enum DeliveryState {
 }
 
 impl DeliveryState {
-    fn parse(state: &str) -> Option<Self> {
+    /// The one on-disk spelling, shared by `segments.json` and `delivery.json`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Pending => PENDING,
+            Self::Started => STARTED,
+            Self::Appended => APPENDED,
+            Self::Fallback => FALLBACK,
+            Self::Uncertain => UNCERTAIN,
+        }
+    }
+
+    /// Parse the one on-disk spelling. An unknown value is reported as `None` and
+    /// never guessed into a safer-looking state.
+    pub(crate) fn from_name(state: &str) -> Option<Self> {
         match state {
             PENDING => Some(Self::Pending),
             STARTED => Some(Self::Started),
@@ -150,6 +176,16 @@ impl DeliveryState {
             FALLBACK => Some(Self::Fallback),
             UNCERTAIN => Some(Self::Uncertain),
             _ => None,
+        }
+    }
+}
+
+impl From<Delivery> for DeliveryState {
+    fn from(delivery: Delivery) -> Self {
+        match delivery {
+            Delivery::Appended => Self::Appended,
+            Delivery::Fallback => Self::Fallback,
+            Delivery::Uncertain => Self::Uncertain,
         }
     }
 }
@@ -172,44 +208,32 @@ struct Data {
     /// First durable-record problem. It is reported once and refuses automatic late
     /// appends: without the record, safety cannot be proven.
     problem: Option<String>,
+    /// Whether a finished append was ever pruned from the history. A later late
+    /// append whose chain stops can then say that the proof was pruned instead of
+    /// claiming the user edited the target.
+    pruned_history: bool,
 }
 
 impl DeliveryLedger {
     pub fn open(runtime: &Path) -> Self {
+        let (stored, mut problem) =
+            open_versioned::<Stored>(&runtime.join(FILE), "the delivery record", PROBLEM_SUFFIX);
         let mut segments = BTreeMap::new();
-        let mut problem = None;
-        match fs::read(runtime.join(FILE)) {
-            Ok(bytes) => match serde_json::from_slice::<Stored>(&bytes) {
-                Ok(stored) if stored.version == STORE_VERSION => {
-                    for record in stored.segments {
-                        if segments.insert(record.sequence, record).is_some() {
-                            problem = Some(format!("{PROBLEM_PREFIX}{PROBLEM_SUFFIX}"));
-                        }
-                    }
+        if let Some(stored) = stored {
+            for record in stored.segments {
+                if segments.insert(record.sequence, record).is_some() {
+                    problem = Some(format!("{PROBLEM_PREFIX}{PROBLEM_SUFFIX}"));
                 }
-                Ok(stored) => {
-                    problem = Some(format!(
-                        "the delivery record uses an unsupported version ({}){PROBLEM_SUFFIX}",
-                        stored.version
-                    ));
-                }
-                Err(error) => {
-                    problem = Some(format!(
-                        "the delivery record could not be read ({error}){PROBLEM_SUFFIX}"
-                    ));
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                problem = Some(format!(
-                    "the delivery record could not be read ({error}){PROBLEM_SUFFIX}"
-                ));
             }
         }
         let degraded = problem.is_some();
         Self {
             runtime: runtime.to_path_buf(),
-            data: Mutex::new(Data { segments, problem }),
+            data: Mutex::new(Data {
+                segments,
+                problem,
+                pruned_history: false,
+            }),
             changed: Condvar::new(),
             degraded: AtomicBool::new(degraded),
         }
@@ -231,7 +255,7 @@ impl DeliveryLedger {
             .segments
             .iter()
             .filter_map(|(sequence, record)| {
-                DeliveryState::parse(&record.state).map(|state| (*sequence, state))
+                DeliveryState::from_name(&record.state).map(|state| (*sequence, state))
             })
             .collect()
     }
@@ -276,7 +300,7 @@ impl DeliveryLedger {
                 if let Some(problem) = &record.baseline_problem {
                     return Err(problem.clone());
                 }
-                if record.state != PENDING {
+                if record.state != DeliveryState::Pending.name() {
                     return Err(format!(
                         "the durable delivery record already reports '{}'",
                         record.state
@@ -377,6 +401,10 @@ impl DeliveryLedger {
         }
         if chain == normalize_newlines(current) {
             LatePlan::Append
+        } else if data.pruned_history {
+            LatePlan::Keep {
+                reason: "the original target differs from the draft recorded when this segment stopped, and older delivery history has been pruned, so Listen cannot prove whether the difference is a user edit or one of its own pruned appends".into(),
+            }
         } else {
             LatePlan::Keep {
                 reason: "the original target was changed after this segment stopped".into(),
@@ -400,7 +428,7 @@ impl DeliveryLedger {
                     .into();
             record.updated_utc = now_utc();
         }
-        let bytes = serialize_pruned(&mut data.segments);
+        let bytes = serialize_pruned(&mut data);
         match persist_result(&self.runtime.join(FILE), &bytes) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -477,7 +505,7 @@ impl DeliveryLedger {
         if data.problem.is_some() {
             return;
         }
-        let bytes = serialize_pruned(&mut data.segments);
+        let bytes = serialize_pruned(data);
         if let Err(error) = persist_result(&self.runtime.join(FILE), &bytes) {
             self.note(
                 data,
@@ -526,17 +554,19 @@ fn serialize(segments: &BTreeMap<u64, Record>) -> Vec<u8> {
 
 /// Serialize while keeping the resolved history bounded. The common small case is
 /// one serialization; pruning starts only when the count or the byte budget is
-/// exceeded.
-fn serialize_pruned(segments: &mut BTreeMap<u64, Record>) -> Vec<u8> {
-    let resolved = resolved_sequences(segments);
+/// exceeded. Removing a link is remembered so a later late append can explain the
+/// downgrade instead of blaming a user edit.
+fn serialize_pruned(data: &mut Data) -> Vec<u8> {
+    let resolved = resolved_sequences(&data.segments);
     if resolved.len() <= MAX_RESOLVED_RECORDS {
-        let bytes = serialize(segments);
+        let bytes = serialize(&data.segments);
         if bytes.len() <= MAX_BYTES {
             return bytes;
         }
     }
-    prune(segments, &resolved);
-    serialize(segments)
+    let pruned = prune(&mut data.segments, &resolved);
+    data.pruned_history |= pruned;
+    serialize(&data.segments)
 }
 
 /// The capture orders of resolved records, oldest first (a `BTreeMap` iterates in
@@ -561,10 +591,14 @@ fn is_resolved(state: &str) -> bool {
 /// immediately preceding append is still available to prove a draft even when the
 /// drafts are large. A file that is still over budget because of non-terminal
 /// records is left that way: those records are the duplicate-append guards.
-fn prune(segments: &mut BTreeMap<u64, Record>, resolved: &[u64]) {
+///
+/// Returns whether any link was removed, so the caller can report a later proof gap
+/// as pruning rather than as a user edit.
+fn prune(segments: &mut BTreeMap<u64, Record>, resolved: &[u64]) -> bool {
+    let mut pruned = false;
     let excess = resolved.len().saturating_sub(MAX_RESOLVED_RECORDS);
     for sequence in &resolved[..excess] {
-        segments.remove(sequence);
+        pruned |= segments.remove(sequence).is_some();
     }
     // Drop the oldest resolved records in halves rather than one at a time: a
     // serialization per removal would itself become the stop-path cost. At least
@@ -581,14 +615,74 @@ fn prune(segments: &mut BTreeMap<u64, Record>, resolved: &[u64]) {
         let droppable = remaining.len() - MIN_RESOLVED_RECORDS;
         let count = (droppable / 2).max(1).min(droppable);
         for sequence in &remaining[..count] {
-            segments.remove(sequence);
+            pruned |= segments.remove(sequence).is_some();
         }
     }
+    pruned
 }
 
-fn now_utc() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Runtime(PathBuf);
+    impl Runtime {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "listen-delivery-unit-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Runtime {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_pruned_history_makes_a_late_append_downgrade_explicit() {
+        let runtime = Runtime::new();
+        let ledger = DeliveryLedger::open(&runtime.0);
+        // An older segment stopped on this draft and is still waiting for its
+        // network-delayed result.
+        ledger.record_baseline(1, Ok("旧草稿".into()));
+        let mut chain = "旧草稿".to_string();
+        // Many confirmed appends with large drafts exceed the record budget, so the
+        // oldest chain links are pruned while the segment above is still pending.
+        for sequence in 2..=10u64 {
+            let before = chain.clone();
+            let padding = "x".repeat(16 * 1024);
+            let after = format!("{chain}\n第 {sequence} 段 {padding}");
+            ledger
+                .begin_append(sequence, &before)
+                .expect("a resolved delivery can be recorded");
+            ledger.confirm_append(sequence, &before, &after);
+            chain = after;
+        }
+        assert!(
+            DeliveryLedger::open(&runtime.0).states().contains_key(&1),
+            "a pending result is never pruned"
+        );
+
+        // The target still holds exactly Listen's own appends, but the chain that
+        // would prove that is no longer complete. This must read as a pruned-proof
+        // downgrade, not as a claim that the user edited the target.
+        match ledger.plan_late_append(1, &chain) {
+            LatePlan::Keep { reason } => assert!(
+                reason.contains("pruned"),
+                "the downgrade must state why it is panel-only: {reason}"
+            ),
+            LatePlan::Append => panic!("a pruned proof must never append"),
+        }
+    }
 }

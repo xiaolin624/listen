@@ -601,6 +601,68 @@ fn a_started_or_uncertain_delivery_is_never_replayed_after_a_restart() {
 }
 
 #[test]
+fn a_stale_pending_delivery_record_is_uncertain_not_reported_as_nothing_written() {
+    let runtime = Runtime::new();
+    let registry = Arc::new(Registry::default());
+    let editor = Editor::new("原目标里的文字");
+    fs::write(
+        runtime.app().join("segment-00000001.txt"),
+        "写入可能已发生的结果。",
+    )
+    .unwrap();
+    write_index(
+        &runtime,
+        2,
+        &[index_record(
+            1,
+            "session-35-1",
+            "result",
+            "stopped; delivery pending",
+            Some("segment-00000001.txt"),
+            None,
+            &[],
+        )],
+    );
+    // The stop-time draft was read and `delivery.json` still says `pending`: the
+    // `started` marker could not be saved before a write whose outcome is therefore
+    // unknown. Nothing in this record proves the target was left untouched.
+    write_delivery(&runtime, &[delivery_record(1, "pending")]);
+    let delivery_before = fs::read(runtime.app().join("delivery.json")).unwrap();
+
+    let mut app = application(&runtime, registry.clone(), Vec::new(), true)
+        .with_targets(Arc::new(Selection(editor.clone())));
+    let recovered = wait_for(&mut app, "the recovered pending result", |snapshot| {
+        snapshot.segments.len() == 1
+    });
+    assert_eq!(
+        recovered.segments[0].delivery,
+        Some(Delivery::Uncertain),
+        "a stale pending record cannot prove that nothing was written"
+    );
+    assert_eq!(recovered.delivery, Some(Delivery::Uncertain));
+    assert!(
+        recovered.segments[0]
+            .detail
+            .contains("not written again automatically"),
+        "{:?}",
+        recovered.segments[0]
+    );
+    assert!(
+        recovered.segments[0]
+            .detail
+            .contains("may already be there once"),
+        "the uncertain outcome must be stated: {:?}",
+        recovered.segments[0]
+    );
+    assert_eq!(editor.draft(), "原目标里的文字");
+    assert_eq!(
+        fs::read(runtime.app().join("delivery.json")).unwrap(),
+        delivery_before,
+        "recovery never rewrites the pending record into a safer-looking state"
+    );
+}
+
+#[test]
 fn corrupt_state_does_not_hide_saved_results_or_lose_an_unindexed_recording() {
     let runtime = Runtime::new();
     let registry = Arc::new(Registry::default());
@@ -734,7 +796,7 @@ fn a_result_saved_before_the_audio_was_cleaned_is_kept_pending_and_never_re_reco
         )],
     );
 
-    let mut app = application(&runtime, registry.clone(), Vec::new(), true)
+    let app = application(&runtime, registry.clone(), Vec::new(), true)
         .with_targets(Arc::new(Selection(editor.clone())));
     let recovered = app.snapshot();
     assert_eq!(recovered.segments.len(), 1, "{recovered:?}");
@@ -743,8 +805,8 @@ fn a_result_saved_before_the_audio_was_cleaned_is_kept_pending_and_never_re_reco
     assert_eq!(recovered.segments[0].text, "保存后崩溃的完整结果。");
     assert_eq!(
         recovered.segments[0].delivery,
-        Some(Delivery::Fallback),
-        "a recovered result is a panel result"
+        Some(Delivery::Uncertain),
+        "with no delivery record, a write that may have landed cannot be ruled out"
     );
     assert_eq!(recovered.text, "保存后崩溃的完整结果。");
     assert_eq!(recovered.phase, Phase::Result, "{recovered:?}");
@@ -763,7 +825,7 @@ fn a_result_saved_before_the_audio_was_cleaned_is_kept_pending_and_never_re_reco
     // work and the pending result keeps its own delivery state.
     let index = stored_index(&runtime);
     assert_eq!(index["segments"][0]["state"], "result", "{index}");
-    assert_eq!(index["segments"][0]["delivery"], "fallback", "{index}");
+    assert_eq!(index["segments"][0]["delivery"], "uncertain", "{index}");
     assert_eq!(
         index["segments"][0]["text_file"], "segment-00000001.txt",
         "{index}"
@@ -778,7 +840,11 @@ fn a_result_saved_before_the_audio_was_cleaned_is_kept_pending_and_never_re_reco
     });
     assert_eq!(again.segments[0].sequence, 1);
     assert_eq!(again.segments[0].text, "保存后崩溃的完整结果。");
-    assert_eq!(again.segments[0].delivery, Some(Delivery::Fallback));
+    assert_eq!(
+        again.segments[0].delivery,
+        Some(Delivery::Uncertain),
+        "the missing delivery record stays uncertain on every later launch"
+    );
     assert!(again.segments[0].detail.contains("Recovered"));
     assert!(
         registry.retries().is_empty(),

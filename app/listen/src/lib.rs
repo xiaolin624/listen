@@ -13,6 +13,7 @@ pub mod cloud;
 #[cfg(windows)]
 pub mod deepseek;
 pub(crate) mod delivery;
+pub(crate) mod durable;
 pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
@@ -33,7 +34,8 @@ pub mod whisper;
 pub mod whisper_host;
 #[cfg(windows)]
 pub mod whisper_timing;
-use delivery::{DeliveryLedger, LatePlan};
+use delivery::{DeliveryLedger, DeliveryState, LatePlan};
+use durable::now_utc;
 use recognition::{
     LocalSessions, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
     SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
@@ -238,8 +240,9 @@ pub struct Timing {
     pub apply_wait_ms: Option<u64>,
     /// The sum of the three application scheduling gaps above.
     pub schedule_ms: Option<u64>,
-    /// Time spent waiting for the one-target-writer gate (an older segment's
-    /// delivery). A backlog must never make the new segment's write wait.
+    /// Time spent waiting for the one-target-writer gate. Target writes preserve
+    /// capture order, so a newer result may wait here for an older ready delivery;
+    /// this is measured instead of being hidden.
     pub delivery_lock_ms: Option<u64>,
     /// The target draft read immediately before the write.
     pub delivery_read_ms: Option<u64>,
@@ -343,9 +346,9 @@ pub enum Notice {
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed, so the resident
     /// status capsule is visible to screen sharing and recordings.
     CaptureExcluded(String),
-    /// This month's own cloud-recognition cost reached the CNY 100 reminder line.
-    /// It is a reminder only: nothing was stopped, cancelled, purchased or raised,
-    /// and the capture flow is unaffected.
+    /// This month's own cloud-recognition cost is approaching the CNY 100 reminder
+    /// line (the reminder fires at 90%, CNY 90). It is a reminder only: nothing was
+    /// stopped, cancelled, purchased or raised, and the capture flow is unaffected.
     UsageReminder,
     /// Pending capture audio is approaching the configured budget (#36). Capture
     /// still works; the reminder names the consequence so the user can clean up or
@@ -364,8 +367,8 @@ impl Notice {
             Notice::CaptureExcluded(reason) => format!(
                 "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
             ),
-            Notice::UsageReminder => "本月云端识别费用估计已达每月 100 元提醒线。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
-            Notice::StorageWarning => "待处理录音已接近缓存上限。达到上限或磁盘余量低于底线时，Listen 会停止开始新的采集并保留已经收到的声音和旧段；可清理不再需要的段，或调整待处理音频预算。".into(),
+            Notice::UsageReminder => "本月云端识别费用估计已达到每月 100 元提醒线的 90%（即 90 元）或更多。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
+            Notice::StorageWarning => "待处理音频已接近缓存上限。达到上限或磁盘余量低于底线时，Listen 会停止开始新的采集并保留已经收到的声音和旧段；可清理不再需要的段，或调整待处理音频预算。".into(),
         }
     }
 }
@@ -564,6 +567,110 @@ struct Delivered {
     /// When the delivery worker returned: the append was confirmed by a target
     /// read-back (or the fallback decision was made). The next poll only applies it.
     delivery_finished_at: Instant,
+}
+
+/// One saved result waiting for its target delivery. It is created on the
+/// application thread and handed to the one delivery worker, which runs the target
+/// read/write off the UI thread.
+struct DeliveryJob {
+    sequence: u64,
+    text: String,
+    description: String,
+    target: AppResult<Option<Arc<Mutex<Box<dyn Target>>>>>,
+    /// The result is late (it waited for the network or came back from retained
+    /// audio), so only a proven-unchanged draft may be appended.
+    recovered: bool,
+    timing: Timing,
+    directory: PathBuf,
+    stopped_at: Option<Instant>,
+    save_finished_at: Instant,
+}
+
+/// The single ordered delivery pipeline. One worker at a time takes the lowest
+/// capture order, so two results that are ready together reach the target oldest
+/// first (#38 made processing newest-first; the target must stay in speech order).
+/// Recognition and the durable save keep their own newest-first scheduling.
+#[derive(Default)]
+struct DeliveryQueue {
+    state: Mutex<DeliveryQueueState>,
+}
+
+#[derive(Default)]
+struct DeliveryQueueState {
+    jobs: Vec<DeliveryJob>,
+    running: bool,
+}
+
+impl DeliveryQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeliveryQueueState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Add one poll's ready jobs and say whether a worker must be spawned.
+    fn enqueue(&self, mut jobs: Vec<DeliveryJob>) -> bool {
+        if jobs.is_empty() {
+            return false;
+        }
+        jobs.sort_by_key(|job| job.sequence);
+        let mut state = self.lock();
+        state.jobs.extend(jobs);
+        state.jobs.sort_by_key(|job| job.sequence);
+        if state.running {
+            false
+        } else {
+            state.running = true;
+            true
+        }
+    }
+
+    /// The next job in capture order, or `None` after marking the worker idle.
+    fn next(&self) -> Option<DeliveryJob> {
+        let mut state = self.lock();
+        if state.jobs.is_empty() {
+            state.running = false;
+            return None;
+        }
+        state.jobs.sort_by_key(|job| job.sequence);
+        Some(state.jobs.remove(0))
+    }
+}
+
+/// Run every queued delivery in capture order until the queue is empty. Later jobs
+/// may be enqueued while this worker runs; the application starts a new worker only
+/// when the queue was idle.
+fn delivery_worker(
+    queue: Arc<DeliveryQueue>,
+    completion: mpsc::Sender<Delivered>,
+    ledger: Arc<DeliveryLedger>,
+) {
+    while let Some(job) = queue.next() {
+        let delivery_started_at = Instant::now();
+        let outcome = if job.recovered {
+            deliver_late(job.target, &job.text, job.sequence, ledger.as_ref())
+        } else {
+            deliver(job.target, &job.text, job.sequence, ledger.as_ref())
+        };
+        let delivery_finished_at = Instant::now();
+        let mut timing = job.timing;
+        timing.delivery_ms = Some(millis_between(delivery_finished_at, delivery_started_at));
+        timing.delivery_queue_ms = Some(millis_between(delivery_started_at, job.save_finished_at));
+        // The target read and the write/read-back are part of `delivery_ms`;
+        // keeping them separate says where a slow editor spent the time.
+        timing.delivery_lock_ms = outcome.lock_ms;
+        timing.delivery_read_ms = outcome.read_ms;
+        timing.delivery_write_ms = outcome.write_ms;
+        timing.delivery_save_ms = outcome.save_ms;
+        let _ = completion.send(Delivered {
+            sequence: job.sequence,
+            text: job.text,
+            description: job.description,
+            outcome,
+            timing,
+            directory: job.directory,
+            stopped_at: job.stopped_at,
+            delivery_finished_at,
+        });
+    }
 }
 
 /// One start/stop segment. It owns its capture directory, its bound target and its
@@ -1055,7 +1162,9 @@ struct FailedWrite {
 
 /// Reports what the target actually holds after a failed write, without ever claiming
 /// a complete delivery. The read-back distinguishes a refused write from a truncated
-/// one, a late complete write, and a possibly partial one.
+/// one, a late complete write, and a possibly partial one. A write that may have
+/// landed is reported as [`Delivery::Uncertain`]; only a read-back proving the target
+/// still holds its previous content may claim [`Delivery::Fallback`].
 fn failed_write(
     previous: &str,
     intended: &str,
@@ -1064,56 +1173,59 @@ fn failed_write(
 ) -> FailedWrite {
     let advice = "Check the original target before copying; output is not retried automatically and the original text is not reverted.";
     let fallback = "The complete result is in the expanded result panel.";
-    let observed = match observed {
-        Ok(observed) => observed,
-        Err(read_error) => {
-            return FailedWrite {
-                delivery: Delivery::Fallback,
-                detail: format!(
-                    "The write to the original target could not be confirmed ({error}); the target could not be read back ({read_error}). {advice} {fallback}"
-                ),
-                uncertain: true,
-            };
+    let (detail, uncertain) = match observed {
+        Err(read_error) => (
+            format!(
+                "The write to the original target could not be confirmed ({error}); the target could not be read back ({read_error}). {advice} {fallback}"
+            ),
+            true,
+        ),
+        Ok(observed) => {
+            // Line endings are not part of the delivered text's meaning.
+            let observed = observed.replace("\r\n", "\n");
+            let previous = previous.replace("\r\n", "\n");
+            let intended = intended.replace("\r\n", "\n");
+            if observed == previous {
+                (
+                    format!(
+                        "The original target still holds its previous content, so nothing was written to it ({error}). {fallback} Review and copy it to the intended input."
+                    ),
+                    false,
+                )
+            } else if observed == intended {
+                (
+                    format!(
+                        "The write to the original target could not be confirmed ({error}), but it now contains the complete appended text. {advice} A copy remains in Listen."
+                    ),
+                    true,
+                )
+            } else if !observed.is_empty() && intended.starts_with(&observed) {
+                (
+                    format!(
+                        "The original target holds only {} of {} characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. {advice} {fallback}",
+                        observed.chars().count(),
+                        intended.chars().count()
+                    ),
+                    true,
+                )
+            } else {
+                (
+                    format!(
+                        "The write to the original target could not be confirmed ({error}); the target content changed and may be partially written. {advice} {fallback}"
+                    ),
+                    true,
+                )
+            }
         }
     };
-    // Line endings are not part of the delivered text's meaning.
-    let observed = observed.replace("\r\n", "\n");
-    let previous = previous.replace("\r\n", "\n");
-    let intended = intended.replace("\r\n", "\n");
-    if observed == previous {
-        FailedWrite {
-            delivery: Delivery::Fallback,
-            detail: format!(
-                "The original target still holds its previous content, so nothing was written to it ({error}). {fallback} Review and copy it to the intended input."
-            ),
-            uncertain: false,
-        }
-    } else if observed == intended {
-        FailedWrite {
-            delivery: Delivery::Fallback,
-            detail: format!(
-                "The write to the original target could not be confirmed ({error}), but it now contains the complete appended text. {advice} A copy remains in Listen."
-            ),
-            uncertain: true,
-        }
-    } else if !observed.is_empty() && intended.starts_with(&observed) {
-        FailedWrite {
-            delivery: Delivery::Fallback,
-            detail: format!(
-                "The original target holds only {} of {} characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. {advice} {fallback}",
-                observed.chars().count(),
-                intended.chars().count()
-            ),
-            uncertain: true,
-        }
-    } else {
-        FailedWrite {
-            delivery: Delivery::Fallback,
-            detail: format!(
-                "The write to the original target could not be confirmed ({error}); the target content changed and may be partially written. {advice} {fallback}"
-            ),
-            uncertain: true,
-        }
+    FailedWrite {
+        delivery: if uncertain {
+            Delivery::Uncertain
+        } else {
+            Delivery::Fallback
+        },
+        detail,
+        uncertain,
     }
 }
 
@@ -1142,6 +1254,13 @@ pub struct Application {
     current_sequence: u64,
     completion_tx: mpsc::Sender<Delivered>,
     completion_rx: mpsc::Receiver<Delivered>,
+    /// The one ordered target-delivery pipeline (oldest capture order first).
+    delivery_queue: Arc<DeliveryQueue>,
+    /// Saved results whose delivery job was created during this poll. They are
+    /// handed to the queue together, after every session event of the poll was
+    /// applied, so two results that became ready together are ordered by capture
+    /// order rather than by application order.
+    pending_deliveries: Vec<DeliveryJob>,
     /// Deliveries that already finished but are not applied yet, keyed by capture
     /// order so old segments are applied in capture order.
     deliveries: BTreeMap<u64, Delivered>,
@@ -1264,6 +1383,8 @@ impl Application {
             current_sequence: 0,
             completion_tx,
             completion_rx,
+            delivery_queue: Arc::new(DeliveryQueue::default()),
+            pending_deliveries: Vec::new(),
             deliveries: BTreeMap::new(),
             control_error,
             targets: None,
@@ -1468,7 +1589,7 @@ impl Application {
             self.segments[index].usage = Some(usage.clone());
             if let Some(record) = self.store.record_mut(sequence) {
                 record.usage = Some(usage);
-                record.updated_utc = segments::now_utc();
+                record.updated_utc = now_utc();
                 if self.store.problem().is_none() {
                     if let Err(error) = self.store.persist() {
                         self.note_record_problem(error);
@@ -1489,13 +1610,7 @@ impl Application {
     /// recovered result stays in the panel.
     fn recover_previous_session(&mut self) {
         let deliveries = self.delivery.states();
-        let delivery_problem = self.delivery.problem().is_some();
-        let mut plan = recovery::plan(
-            &self.runtime,
-            self.store.records(),
-            &deliveries,
-            delivery_problem,
-        );
+        let mut plan = recovery::plan(&self.runtime, self.store.records(), &deliveries);
         if plan.is_empty() {
             return;
         }
@@ -1550,9 +1665,9 @@ impl Application {
                     record.text_chars = text.chars().count();
                 }
                 if let Some(delivery) = recovered_segment.delivery {
-                    record.delivery = Some(delivery_name(delivery).into());
+                    record.delivery = Some(DeliveryState::from(delivery).name().into());
                 }
-                record.updated_utc = segments::now_utc();
+                record.updated_utc = now_utc();
             }
             self.segments.push(recovered_segment);
         }
@@ -1776,7 +1891,7 @@ impl Application {
             && !terms.is_empty()
         {
             record.glossary_terms = terms;
-            record.updated_utc = segments::now_utc();
+            record.updated_utc = now_utc();
             if self.store.problem().is_none()
                 && let Err(error) = self.store.persist()
             {
@@ -1996,7 +2111,7 @@ impl Application {
             self.note_record_problem(error);
         } else if let Some(record) = self.store.record_mut(sequence) {
             record.text_chars = refined.chars().count();
-            record.updated_utc = segments::now_utc();
+            record.updated_utc = now_utc();
             if let Err(error) = self.store.persist() {
                 self.note_record_problem(error);
             }
@@ -2030,8 +2145,9 @@ impl Application {
         }
         match control {
             // A new capture is refused only while another capture runs. An older
-            // segment that waits for the network or is still being processed must
-            // never block the next sentence.
+            // segment that waits for the network, is still being processed, or keeps
+            // a failed capture's audio for an explicit retry must never block the
+            // next sentence.
             Control::Start if !self.is_capturing() => self.start_capture(),
             Control::Stop if self.is_capturing() => self.stop_capture(),
             Control::Refine => {
@@ -2169,10 +2285,9 @@ impl Application {
     /// their own target, audio and result; only the playback device is exclusive.
     fn start_capture(&mut self) {
         let start_requested = Instant::now();
-        if self.any_retained() {
-            self.snapshot.detail = "A failed capture's audio is retained for retry. Retry recognition or clean the failed audio before starting a new capture; the current result is unchanged.".into();
-            return;
-        }
+        // A failed segment's retained audio is a panel/retry concern, not a reason to
+        // refuse the next sentence: the new capture binds its own target and keeps its
+        // own sequence, and the older failure stays retryable beside it (#33/#35).
         // Storage is checked before the target is bound and before any session
         // directory exists: over the pending-audio budget or at/below the free-disk
         // floor, no capture may start and nothing may be overwritten.
@@ -2745,6 +2860,10 @@ impl Application {
                 break;
             }
         }
+        // Every result that became ready in this poll now enters the ordered target
+        // pipeline together, so capture order — not application order — decides the
+        // append order. Recognition/save keep their newest-first priority above.
+        self.start_pending_deliveries();
         // Apply a finished delivery, newest first. The current segment's confirmed
         // append is never held behind an older background delivery; an older one is
         // applied on the next poll, and the panel order still comes from the segment
@@ -2969,7 +3088,7 @@ impl Application {
         if let Some(record) = self.store.record_mut(sequence) {
             record.text_file = Some(name);
             record.text_chars = text.chars().count();
-            record.updated_utc = segments::now_utc();
+            record.updated_utc = now_utc();
             if self.store.problem().is_none() {
                 if let Err(error) = self.store.persist() {
                     self.note_record_problem(error);
@@ -3046,38 +3165,19 @@ impl Application {
         self.current_sequence = self.current_sequence.max(sequence);
         self.segments[index].timing = timing.clone();
         self.segments[index].finalizing = true;
-        let tx = self.completion_tx.clone();
-        let ledger = self.delivery.clone();
-        let worker_text = text.clone();
-        let worker_timing = timing.clone();
-        let worker_directory = directory.clone();
-        thread::spawn(move || {
-            let delivery_started_at = Instant::now();
-            let outcome = if recovered {
-                deliver_late(target, &worker_text, sequence, ledger.as_ref())
-            } else {
-                deliver(target, &worker_text, sequence, ledger.as_ref())
-            };
-            let delivery_finished_at = Instant::now();
-            let mut timing = worker_timing;
-            timing.delivery_ms = Some(millis_between(delivery_finished_at, delivery_started_at));
-            timing.delivery_queue_ms = Some(millis_between(delivery_started_at, save_finished_at));
-            // The target read and the write/read-back are part of `delivery_ms`;
-            // keeping them separate says where a slow editor spent the time.
-            timing.delivery_lock_ms = outcome.lock_ms;
-            timing.delivery_read_ms = outcome.read_ms;
-            timing.delivery_write_ms = outcome.write_ms;
-            timing.delivery_save_ms = outcome.save_ms;
-            let _ = tx.send(Delivered {
-                sequence,
-                text: worker_text,
-                description,
-                outcome,
-                timing,
-                directory: worker_directory,
-                stopped_at,
-                delivery_finished_at,
-            });
+        // The delivery itself runs off the UI thread, but it is queued, not spawned
+        // here: the poll hands every result that became ready in this tick to the one
+        // ordered pipeline, so the target receives capture order (oldest first).
+        self.pending_deliveries.push(DeliveryJob {
+            sequence,
+            text,
+            description,
+            target,
+            recovered,
+            timing,
+            directory,
+            stopped_at,
+            save_finished_at,
         });
     }
 
@@ -3159,6 +3259,23 @@ impl Application {
         self.refresh_recovery_snapshot();
     }
 
+    /// Hand this poll's saved results to the one ordered delivery pipeline. The
+    /// queue sorts by capture order and runs one delivery at a time, so a newer
+    /// result can never be appended to the target before an older one that became
+    /// ready in the same tick.
+    fn start_pending_deliveries(&mut self) {
+        if self.pending_deliveries.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.pending_deliveries);
+        if self.delivery_queue.enqueue(jobs) {
+            let queue = self.delivery_queue.clone();
+            let completion = self.completion_tx.clone();
+            let ledger = self.delivery.clone();
+            thread::spawn(move || delivery_worker(queue, completion, ledger));
+        }
+    }
+
     fn apply_delivery(&mut self, delivered: Delivered) {
         let Some(index) = self
             .segments
@@ -3217,14 +3334,18 @@ impl Application {
             Ok(()) => {}
             Err(error) => cleanup_error = Some(error.to_string()),
         }
-        let keep_record = delivery == Delivery::Fallback || cleanup_error.is_some();
+        // An uncertain write may have landed and is never retried; its complete text
+        // must stay as a pending result (record + text file) across a restart, exactly
+        // like a fallback. Only a confirmed append leaves nothing pending.
+        let keep_record =
+            matches!(delivery, Delivery::Fallback | Delivery::Uncertain) || cleanup_error.is_some();
         if let Some(record) = self.store.record_mut(delivered.sequence) {
             record.state = self.segments[index].state.name().to_owned();
             record.detail = self.segments[index].detail.clone();
             record.text_file = Some(SegmentStore::text_name(delivered.sequence));
             record.text_chars = delivered.text.chars().count();
-            record.delivery = Some(delivery_name(delivery).into());
-            record.updated_utc = segments::now_utc();
+            record.delivery = Some(DeliveryState::from(delivery).name().into());
+            record.updated_utc = now_utc();
             if self.store.problem().is_none() {
                 if let Err(error) = self.store.persist() {
                     self.note_record_problem(error);
@@ -3356,7 +3477,7 @@ impl Application {
         }
         record.state = state;
         record.detail = detail;
-        record.updated_utc = segments::now_utc();
+        record.updated_utc = now_utc();
         if self.store.problem().is_some() {
             return;
         }
@@ -3587,14 +3708,6 @@ impl Application {
 pub const EXIT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
 /// The same bound for a local capture, whose last window is closed by the device.
 const LOCAL_EXIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-
-fn delivery_name(delivery: Delivery) -> &'static str {
-    match delivery {
-        Delivery::Appended => "appended",
-        Delivery::Fallback => "fallback",
-        Delivery::Uncertain => "uncertain",
-    }
-}
 
 /// One failure message with the retained audio paths, never a credential.
 fn failure_detail(error: &str, retained_audio: &[PathBuf]) -> String {

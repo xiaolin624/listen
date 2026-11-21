@@ -169,6 +169,11 @@ $hostTestPatterns = @(
     '(?i)listen-worktrees',
     '(?i)\\luyin\\'
 )
+# Large files are not exempt from scanning by size: only these exact pinned
+# binaries may skip the byte scan, and the manifest hash check still verifies their
+# content. Any other file over the limit is a package error, so a large log renamed
+# as an arbitrary file cannot bypass key detection.
+$contentScanAllowlist = @('models\ggml-small.bin')
 function Read-Latin1([string]$Path) {
     return [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
 }
@@ -205,7 +210,12 @@ foreach ($file in $packageFiles) {
     if ($forbiddenNames -contains $file.Name.ToLowerInvariant()) {
         throw ('The package contains a test/runtime file: ' + $relative)
     }
-    if ($file.Length -gt 8MB) { continue }
+    if ($file.Length -gt 8MB) {
+        if ($contentScanAllowlist -notcontains $relative) {
+            throw ('The package contains a file over 8 MiB that is not an allowlisted pinned binary: ' + $relative)
+        }
+        continue
+    }
     $scannedFiles++
     $blob = Read-Latin1 $file.FullName
     foreach ($pattern in $highConfidenceSecretPatterns) {
