@@ -1,10 +1,11 @@
 param(
     [string]$ToolsRoot = '',
     [string]$Runtime = '',
-    # sensevoice (default) or whisper select the engine; a path selects whisper.cpp
-    # and uses that executable. Only the whisper paths are passed to listen.exe, so
-    # the default launch exercises the same SenseVoice engine the product ships.
-    [string]$Engine = 'sensevoice',
+    # Empty selects the daily default: the accepted Alibaba cloud trial. Pass
+    # -Engine sensevoice (or whisper / a whisper-cli.exe path) to select the
+    # explicit local fallback; -CloudTrial ali selects the cloud path explicitly.
+    # The two selections cannot be combined.
+    [string]$Engine = '',
     [ValidateSet('', 'ali')][string]$CloudTrial = '',
     [string]$Model = '',
     [string]$VadModel = '',
@@ -59,23 +60,29 @@ $commonGit = & git -C $projectRoot rev-parse --path-format=absolute --git-common
 if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the shared repository root.' }
 $repositoryRoot = Split-Path $commonGit -Parent
 if (-not $ToolsRoot) { $ToolsRoot = Join-Path $repositoryRoot '.tools' }
-if (-not $Runtime) { $Runtime = Join-Path $repositoryRoot '.artifacts\listen' }
-if (-not $Glossary) { $Glossary = Join-Path $projectRoot 'packaging\glossary.txt' }
 $engineKind = $Engine.Trim()
-if ($CloudTrial -and $engineKind -ine 'sensevoice') { throw '-CloudTrial ali cannot be combined with a different -Engine; cloud trial has no local fallback.' }
+if ($CloudTrial -and $engineKind) {
+    throw '-CloudTrial ali cannot be combined with -Engine; cloud trial has no local fallback. Omit -Engine for the cloud default, or omit -CloudTrial to select local recognition.'
+}
+$localMode = [bool]$engineKind
+if (-not $Runtime) {
+    # Cloud continuous PCM and local recognition windows must not share a runtime:
+    # a recovery must never hand one mode's audio to the other adapter.
+    $Runtime = if ($localMode) { Join-Path $repositoryRoot '.artifacts\listen-local' } else { Join-Path $repositoryRoot '.artifacts\listen' }
+}
+if (-not $Glossary) { $Glossary = Join-Path $projectRoot 'packaging\glossary.txt' }
 $whisperPath = $false
 if ($engineKind -ieq 'whisper') {
     $whisperPath = $true
     if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-small.bin' }
     if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
 } elseif ($engineKind -ieq 'sensevoice' -or $engineKind -ieq 'sense-voice' -or $engineKind -ieq 'sense_voice') {
-    # The default engine needs no flags; passing none is what keeps this launcher
-    # honest about the shipped default.
+    # The local fallback is explicit even for the resident engine.
     $engineKind = 'sensevoice'
     if ($Model -or $VadModel) {
         throw 'The SenseVoice engine does not take --model or --vad-model; select -Engine whisper to use the whisper.cpp fallback.'
     }
-} else {
+} elseif ($engineKind) {
     $whisperPath = $true
     if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-small.bin' }
     if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
@@ -105,10 +112,15 @@ if ($CloudTrial) { $launchArguments += @('--cloud-trial', 'ali') }
 if ($whisperPath) {
     $launchArguments += @('--engine', (ConvertTo-QuotedWindowsPath $whisperExecutable), '--model', (ConvertTo-QuotedWindowsPath $Model), '--vad-model', (ConvertTo-QuotedWindowsPath $VadModel), '--backend', $Backend)
 }
+elseif ($localMode) {
+    # The local fallback is an explicit selection; the cloud default is never
+    # silently replaced by local recognition.
+    $launchArguments += @('--engine', 'sensevoice')
+}
 if ($Hidden) { $launchArguments += '--hidden' }
 $process = Start-Process -FilePath $binary -ArgumentList $launchArguments -WindowStyle Hidden -PassThru
 Write-Output "Listen PID: $($process.Id)"
-Write-Output "Engine: $(if ($CloudTrial) { 'Alibaba cloud trial / qwen-audio-3.1-asr-flash-message / cn-beijing (explicit selection; budget protection applies)' } elseif ($whisperPath) { $whisperExecutable } else { 'SenseVoice (default resident engine, sherpa-onnx)' })"
+Write-Output "Engine: $(if ($CloudTrial) { 'Alibaba cloud trial / qwen-audio-3.1-asr-flash-message / cn-beijing (explicit selection; budget protection applies)' } elseif ($whisperPath) { $whisperExecutable + ' (explicit local fallback)' } elseif ($localMode) { 'SenseVoice (explicit local fallback, sherpa-onnx)' } else { 'Alibaba cloud default / qwen-audio-3.1-asr-flash-message / cn-beijing (daily default; live free-only protection applies)' })"
 Write-Output "Current status: $(Join-Path $Runtime 'status.txt')"
 Write-Output "Glossary: $Glossary"
 Write-Output "Panel text: $(Join-Path $Runtime 'panel.txt')"

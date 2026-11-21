@@ -1,10 +1,11 @@
-//! Packaging/config guarantees for the explicit cloud trial delivered by #40.
+//! Packaging/config guarantees for the cloud path that #40 made the daily default.
 //!
-//! The formal paid-network and real-editor acceptance has not run, so these tests
-//! deliberately prove only the offline surface: the shipped settings file and
-//! credential boundary reject invalid values before capture/connect, the runtime
-//! description names the one selected vendor/model/region, and no key material
-//! reaches the runtime files.
+//! The paid-network and real-editor acceptance is recorded in
+//! `docs/issue-40-acceptance-20261121.md`; these tests deliberately prove only the
+//! offline configuration surface: the shipped settings file and credential
+//! boundary reject invalid values before capture/connect, the runtime description
+//! names the one selected vendor/model/region, and no key material reaches the
+//! runtime files.
 
 use listen::{
     AppResult, Application, Control, Phase, PlaybackAudio, Preparation, Recording,

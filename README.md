@@ -1,12 +1,12 @@
-# Listen：耳机音频本地转写
+# Listen：耳机音频转写（云端默认 + 显式本地备用）
 
-Windows 后台工具：先点击目标编辑区，按 **Ctrl+Alt+R** 采集**默认多媒体播放设备**上的声音，再按一次停止；它在本机用 **SenseVoiceSmall q8（sherpa-onnx，常驻进程内）** 转写，把完整结果追加到开始时选定的目标编辑区。没有有效目标或写入无法确认时，完整结果保留在**展开结果面板**中，可直接复制。工具不会自动发送消息，也不会把转写文本作为命令执行。
+Windows 后台工具：先点击目标编辑区，按 **Ctrl+Alt+R** 采集**默认多媒体播放设备**上的声音，再按一次停止；日常默认把这段连续音频送到**已通过验收的阿里云百炼北京识别**，把完整结果追加到开始时选定的目标编辑区。本地 **SenseVoiceSmall q8（sherpa-onnx）** 识别保留为**显式备用**，只有用 `--engine` 或包内“本地备用”启动器才会运行。没有有效目标或写入无法确认时，完整结果保留在**展开结果面板**中，可直接复制。工具不会自动发送消息，也不会把转写文本作为命令执行。
 
 v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任务栏，并用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏；胶囊只用颜色、形状和动效表达状态，点击展开**结果面板**（完整结果、复制、重试、清理、精修）。原详情窗口已删除，托盘仍可打开面板。更早版本的历史与验收记录保持不变：[#2 采集到复制](docs/issue-2-verification.md)、[#3 原生目标](docs/issue-3-verification.md)、[#4 通用编辑区](docs/issue-4-verification.md)、[#6 长会话](docs/issue-6-verification.md)、[#7 失败重试](docs/issue-7-verification.md)、[#8 路由中断](docs/issue-8-verification.md)、[#9 质量基线](docs/issue-9-verification.md)、[#10 准备与延迟](docs/issue-10-verification.md)、[#11 交付包](docs/issue-11-verification.md)。v0.2 的引擎、术语表、胶囊、面板与精修验收见 [#17](docs/issue-17-verification.md)、[#19](docs/issue-19-verification.md)、[#20](docs/issue-20-verification.md)、[#21](docs/issue-21-verification.md)；本轮代码审查的修复与实测数字见 [审查修复记录](docs/issue-review-fixes.md)，用户真实语音暴露的术语表加载与匹配修复见 [术语表真实语音修复记录](docs/issue-glossary-real-speech.md)。
 
 ## v0.2 的行为
 
-- **引擎**：默认 SenseVoiceSmall q8，通过 sherpa-onnx C API 常驻应用进程，CPU 推理，**要求 AVX2**。模型固定 SHA-256 后加载；whisper.cpp 代码路径保留，但只有显式 `--engine whisper` 或 `--engine <whisper-cli.exe>` 才使用，绝不静默回退到云端或 whisper。
+- **引擎**：日常默认是阿里云百炼 Model Studio / `qwen-audio-3.1-asr-flash-message` / `cn-beijing`（单厂商），依据 2026-11-21 的 20 段真实音频验收（20/20 交付、最慢 844 ms、准确率 95.86% 对比本地基线 75.39%，见 [验收证据](docs/issue-40-acceptance-20261121.md)）。本地 SenseVoiceSmall q8 通过 sherpa-onnx C API 常驻应用进程（CPU，**要求 AVX2**）保留为**显式备用**：只有 `--engine sensevoice`（或 `--engine whisper` / `--engine <whisper-cli.exe>`）才运行；云端失败时绝不静默改用本地，本地结果也不会冒充云端结果。
 - **准备期可采集**：模型在后台准备；准备期间按快捷键仍能立刻进入采集，音频先缓冲，模型就绪后继续识别并交付完整结果。准备中与就绪在状态上可区分，准备失败明确失败并保留本次音频。
 - **非语音门禁**：Silero VAD 判为无语音时不调用识别器；音乐/提示音不会产生“The.”这类凭空文字。
 - **术语表校正**：识别结果在交付前经过本地术语表，一个词一条、支持拼音/中文写法/近似匹配，不要求穷举错误写法；普通词不会被替换。文件在每次开始采集时重新读取。
@@ -40,15 +40,23 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 
 ```powershell
 .\scripts\build-listen.ps1
-.\scripts\run-listen.ps1                  # 默认 SenseVoice，不传任何引擎参数
-.\scripts\run-listen.ps1 -Engine whisper  # 显式使用 whisper.cpp 回退
-.\scripts\run-listen.ps1 -Control show    # 打开结果面板；还有 panel/copy/start/stop/retry/cleanup/refine/quit 等
+.\scripts\run-listen.ps1                  # 日常默认：云端（需要本机凭据与免费保护）
+.\scripts\run-listen.ps1 -Engine sensevoice   # 显式选择本地 SenseVoice 备用
+.\scripts\run-listen.ps1 -Engine whisper      # 显式使用 whisper.cpp 本地备用
+.\scripts\run-listen.ps1 -CloudTrial ali      # 显式选择云端（与 -Engine 不能组合）
+.\scripts\run-listen.ps1 -Control show        # 打开结果面板；还有 panel/copy/start/stop/retry/cleanup/refine/quit 等
 .\scripts\run-listen.ps1 -Control delete-segment:2  # 清理面板中采集序号为 2 的待处理音频/待取结果
 ```
 
-`run-listen.ps1 -Engine` 接受 `sensevoice`（默认）、`whisper` 或一个 `whisper-cli.exe` 路径；只有选择 whisper 时才传 `--model`/`--vad-model`/`--backend`。脚本从 Git 共享元数据目录解析仓库根目录，工作树里复用同一份 `.tools`。构建输出为 `app\listen\target\release\listen.exe` 与相邻的 `libunwind.dll`；构建使用锁定且已缓存的依赖，可离线执行。
+`run-listen.ps1 -Engine` 接受 `sensevoice`、`whisper` 或一个 `whisper-cli.exe` 路径；不传
+`-Engine` 时和产品默认一样走云端，且 `-CloudTrial ali` 不能与任何 `-Engine` 组合（两个方向
+都拒绝，进程不会在云端与本地之间自动切换）。云端和本地开发运行目录分开
+（`.artifacts\listen` / `.artifacts\listen-local`），避免把一种引擎的待处理音频交给另一种。
+脚本从 Git 共享元数据目录解析仓库根目录，工作树里复用同一份 `.tools`。构建输出为
+`app\listen\target\release\listen.exe` 与相邻的 `libunwind.dll`；构建使用锁定且已缓存的依赖，
+可离线执行。
 
-直接启动 `listen.exe` 也支持 `--engine <sensevoice|whisper|whisper-cli.exe>`、`--runtime <directory>`、`--glossary <file>`、`--threads <count>`、`--hidden`，以及 SenseVoice 的 `--sherpa-lib`、`--sensevoice-model`、`--sensevoice-tokens`、`--sensevoice-vad`、`--sensevoice-language`。帮助文本见 `listen.exe --help`。
+直接启动 `listen.exe` 也支持 `--cloud-trial ali`（显式云端，默认即云端）、`--engine <sensevoice|whisper|whisper-cli.exe>`（显式本地）、`--runtime <directory>`、`--glossary <file>`、`--threads <count>`、`--hidden`，以及 SenseVoice 的 `--sherpa-lib`、`--sensevoice-model`、`--sensevoice-tokens`、`--sensevoice-vad`、`--sensevoice-language`。帮助文本见 `listen.exe --help`。没有可用凭据/工作空间/型号/地域时，默认启动显示可操作的失败原因；开始采集被拒绝，不会悄悄改成本地识别。
 
 存储与清理选项：
 
@@ -76,17 +84,23 @@ Rust | re
 
 在结果面板里点**精修**，应用才把当前完整转写文本发送到 DeepSeek API 校正；不发送音频，不发送目标输入框里的其它内容。Key 只从本机环境变量 `DEEPSEEK_API_KEY` 读取，没有 key 时按钮置灰、本地功能不受影响。回填沿用“先读回、再确认”的安全边界：只有目标内容仍等于交付后的完整内容时才替换本次追加的文本；用户改过则把精修文本留在面板。精修失败或断网时保留本地结果，不重复追加。
 
-## 云端识别试用（显式选择）
+## 云端识别（日常默认）
 
-只有主动用 `--cloud-trial ali` 启动时，应用才会在免费保护、共享费用账本和业务空间鉴权均通过后，把本段耳机音频及开始时固定的术语发给阿里云；核验失败不发送音频，保留已收到的本地录音。日常默认仍是本地 SenseVoice。费用上，CNY 50 是首轮共享硬上限；每月 CNY 100 只是提醒线，并在本月合计达到 90 元（90%）时就提前提醒，提醒不会停止采集、取消录音或提高额度。原生 Message 的真实应用及计费验收尚未完成，配置、数据范围与限制见 [#29 试用指南](docs/issue-29-cloud-trial.md)。
+默认把本段耳机音频及开始时固定的术语发给阿里云百炼北京 Message 型号；只使用这一个厂商，不常规双发，不在失败时跨厂商切换，也不用本地结果冒充云端结果。每次开始采集前，应用会现场只读核验免费保护（当前 CLI 身份下唯一默认业务空间、精确型号、额度 > 0、`autoStop=true`、到期日）并检查共享费用账本；核验或鉴权不通过就不发送音频，已收到的音频保留在本机。缺凭据、工作空间、型号或地域时，启动状态给出可操作提示，开始采集被拒绝。
+
+费用上，**免费额度到 2026-12-21 为止，之后按厂商实际计费转为付费**。CNY 50 是首轮共享硬上限（所有已结算估计与未决预留之和不得超过；不会自动购买套餐或提高预算）；每月 CNY 100 只是提醒线，并在本月合计达到 90 元时就提前提醒，提醒不会停止采集、取消录音或提高额度。实际现金账单仍需你在阿里云控制台核对；验收只证明免费保护使额外现金扣费路径不成立。首次配置、数据范围、失败行为与未验证项见 [交付包云端指南](packaging/CLOUD-TRIAL.md)、[本轮交付说明](docs/issue-40-delivery.md) 和 [#40 验收证据](docs/issue-40-acceptance-20261121.md)。
+
+显式本地备用：`.\scripts\run-listen.ps1 -Engine sensevoice`（或 `-Engine whisper`）。这一选择会取消云端默认，二者不能组合；`runtime\status.txt` 的 `recognition_mode=local` 与 `backend=` 会写明本机来源。
 
 ## Windows 交付包（现状）
 
-当前 `scripts\package-listen.ps1` 生成的仍是一个 **whisper.cpp 版本**的目录（`dist\Listen-0.1.0\`，包含 `engine\whisper-cli.exe`、`models\ggml-*.bin`），包内 README 也仍是 v0.1 说明。把交付包换成 SenseVoice 运行库与 q8 模型、移除 whisper、加入本页署名与许可证，是 ticket **#23**，由 #22 的真实语料基准把关；本文不声称 SenseVoice 已在交付包内。开发构建与真机验证都以 SenseVoice 为默认引擎。
+`scripts\package-listen.ps1` 生成的 `dist\Listen-0.1.0\` 日常默认是**已通过验收的云端路径**：`启动 Listen.cmd` 使用 `runtime-cloud\` 和固定阿里云型号；`启动 Listen 本地备用.cmd` 是明确标注的本地 whisper.cpp 备用。包内 README/CLOUD-TRIAL 说明首次凭据配置、`bl.cmd` 免费保护、费用与数据边界；`manifest.json` 记录 `default_mode=cloud` 和固定厂商/型号/地域。把交付包引擎换成 SenseVoice 运行库与 q8 模型仍属 ticket **#23**；本文不声称 SenseVoice 已在交付包内，开发构建与真机验证都以 SenseVoice 为显式本地引擎。
 
 ## 路径与本地数据
 
-默认运行目录是共享仓库根目录下的 `.artifacts\listen`（`--runtime` 可改），已被 Git 忽略。
+开发启动器的云端默认运行目录是共享仓库根目录下的 `.artifacts\listen`；显式本地备用默认用
+`.artifacts\listen-local`（都可 `--runtime` 改），两者都被 Git 忽略。交付包用
+`runtime-cloud\` / `runtime\`，理由相同：云端连续 PCM 与本地识别窗口不能混用。
 
 | 内容 | 用途 |
 | --- | --- |
@@ -97,7 +111,7 @@ Rust | re
 | `playback.state` | 仅云端连续 PCM 段：`committed_bytes=` 与 `clean_stop=`，是异常退出后判断录音是否完整结束的结束标记 |
 | `recovered.pcm` / `recovered.wav` | 仅在需要修复时生成在该段目录内（云端截断 PCM 的可读前缀 / 本地损坏识别窗口的重拼）；计入待处理音频预算，随完整文字保存后的音频清理释放 |
 | `panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新，供自动化读取 |
-| `status.txt` | 当前阶段、说明、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、`segments.json`/`delivery.json` 降级、等待/待取段数、`storage_level`/`storage_fault`、各段耗时、进程 ID；不含转写正文 |
+| `status.txt` | 当前阶段、说明、`recognition_mode=cloud-trial\|local`、实际来源 `backend`、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、`segments.json`/`delivery.json` 降级、等待/待取段数、`storage_level`/`storage_fault`、各段耗时、进程 ID；不含转写正文 |
 | `latency.jsonl` | 每次采集/失败的准备、采集启动、收尾、识别、保存、交付耗时；不含音频 |
 | 本次会话临时目录 | `session-*` 下是采集音频（云端连续 PCM + `pcm-format.txt`/`playback.state`，或本地重叠识别窗口）、临时上传分片与修复副本；完整文字保存后释放，失败时保留以便人工恢复 |
 
