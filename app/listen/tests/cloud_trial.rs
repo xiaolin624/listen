@@ -187,19 +187,25 @@ fn wait(app: &mut Application, phase: Phase) -> listen::Snapshot {
     }
 }
 
-/// Wait for a user-visible message without assuming a phase change: a problem
-/// that retrying cannot fix is reported while the capture keeps running.
-fn wait_detail(app: &mut Application, phrase: &str) -> listen::Snapshot {
+/// Wait for one of several user-visible messages without assuming a phase change:
+/// a problem that retrying cannot fix is reported while the capture keeps running.
+fn wait_detail_any(app: &mut Application, phrases: &[&str]) -> listen::Snapshot {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         app.poll();
         let snapshot = app.snapshot();
-        if snapshot.detail.contains(phrase) {
+        if phrases
+            .iter()
+            .any(|phrase| snapshot.detail.contains(phrase))
+        {
             return snapshot;
         }
         assert!(Instant::now() < deadline, "{snapshot:?}");
         thread::sleep(Duration::from_millis(2));
     }
+}
+fn wait_detail(app: &mut Application, phrase: &str) -> listen::Snapshot {
+    wait_detail_any(app, &[phrase])
 }
 
 fn event(task: &str, kind: &str, payload: Value) -> String {
@@ -1394,6 +1400,32 @@ fn another_runtime_and_restart_cannot_spend_a_pending_reservation_again() {
     assert_eq!(ledger.committed_nanoyuan, 28_500_000_000);
 }
 
+/// The two admission answers this test tells apart. A held ledger lock is the
+/// transient "no new paid request was allowed, try later" result, not the trial
+/// cap's verdict, so the actor retries it instead of reporting it as the answer.
+const SHARED_CAP: &str = "shared CNY 50 trial budget";
+const LEDGER_BUSY: &str = "in use by another process";
+
+/// Attempt one paid request and return only a definitive ledger answer.
+/// `Control::Start` reserves the request before it connects, so this is the one
+/// admission attempt available to the actor; `LedgerBusy` means another process
+/// held the ledger lock at that instant (the product's "try later"), never that
+/// the cap refused the request. Retry a bounded number of times so the test can
+/// assert what the cap — not the lock — decided.
+fn reserve_until_verdict(app: &mut Application) -> listen::Snapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.dispatch(Control::Start);
+        app.poll();
+        let snapshot = app.snapshot();
+        if !snapshot.detail.contains(LEDGER_BUSY) {
+            return snapshot;
+        }
+        assert!(Instant::now() < deadline, "{snapshot:?}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 #[ignore = "offline child-process actor, launched by the concurrent-budget test"]
 fn cross_process_budget_actor() {
@@ -1410,25 +1442,30 @@ fn cross_process_budget_actor() {
     );
     let mut app =
         Application::with_recognition_sessions(Box::new(sessions), runtime.0.join("app"), Ok(()));
-    app.dispatch(Control::Start);
-    if app.snapshot().phase == Phase::Capturing {
+    let first = reserve_until_verdict(&mut app);
+    if first.phase == Phase::Capturing {
         // This process booked the one available reservation. A second paid request
         // is refused by the shared cap; the capture is kept until the user stops.
-        wait_detail(&mut app, "shared CNY 50 trial budget");
-        app.dispatch(Control::Stop);
-        let failure = wait(&mut app, Phase::Failure);
-        assert!(
-            failure.detail.contains("shared CNY 50 trial budget"),
-            "{failure:?}"
-        );
+        let observed = wait_detail_any(&mut app, &[SHARED_CAP, LEDGER_BUSY]);
+        if observed.detail.contains(LEDGER_BUSY) {
+            // The automatic rebuild reached the ledger while another process was
+            // admitting. That is the lock, not the cap: stop the blocked capture
+            // (its reservation stays committed) and reserve again.
+            app.dispatch(Control::Stop);
+            let blocked = wait(&mut app, Phase::Failure);
+            assert!(blocked.detail.contains(LEDGER_BUSY), "{blocked:?}");
+            let refusal = reserve_until_verdict(&mut app);
+            assert_eq!(refusal.phase, Phase::Failure, "{refusal:?}");
+            assert!(refusal.detail.contains(SHARED_CAP), "{refusal:?}");
+        } else {
+            app.dispatch(Control::Stop);
+            let failure = wait(&mut app, Phase::Failure);
+            assert!(failure.detail.contains(SHARED_CAP), "{failure:?}");
+        }
         println!("budget_actor=admitted");
     } else {
-        let detail = app.snapshot().detail;
-        assert!(
-            detail.contains("shared CNY 50 trial budget")
-                || detail.contains("in use by another process"),
-            "{detail}"
-        );
+        let detail = first.detail;
+        assert!(detail.contains(SHARED_CAP), "{detail}");
         println!("budget_actor=denied");
     }
 }
