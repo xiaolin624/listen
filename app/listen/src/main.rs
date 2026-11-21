@@ -42,6 +42,8 @@ pub struct Config {
     sensevoice_vad: PathBuf,
     sensevoice_language: String,
     cloud_trial: bool,
+    /// The pending-audio budget, its warning line and the free-disk floor (#36).
+    storage: listen::storage::StoragePolicy,
 }
 
 impl Config {
@@ -51,14 +53,16 @@ impl Config {
                 Box::new(CloudSessions::from_local(Arc::new(WasapiPcmPlayback))?),
                 self.runtime.clone(),
                 registration,
-            ))
+            )
+            .with_storage_policy(self.storage))
         } else {
             Ok(Application::new(
                 Arc::new(WasapiPlayback),
                 self.transcriber(),
                 self.runtime.clone(),
                 registration,
-            ))
+            )
+            .with_storage_policy(self.storage))
         }
     }
     /// Builds the configured local engine. The default is the resident
@@ -123,18 +127,43 @@ Options:
         whisper.cpp fallback settings; --backend host (default) keeps the model resident, cli starts one process per window.
   --runtime <directory> --threads <count> --hidden
         runtime files, recognition threads and start-hidden behavior.
+  --pending-audio-budget-mib <MiB>
+        pending capture audio allowed across every segment before a new capture is
+        refused and a running one is stopped (default 1024 = 1 GiB). The measurement
+        counts every segment's temporary upload, overlapping recognition windows and
+        repair/retry files, not just the final WAV. Saved text has its own bound.
+  --pending-audio-warn-mib <MiB>
+        pending audio at which the approaching-limit warning is shown; the warning
+        never stops anything (default: four fifths of the budget).
+  --free-disk-floor-mib <MiB>
+        free space that must remain on the runtime volume; at or below it no new
+        capture starts and a running one is stopped with its received audio kept
+        (default 1024 = 1 GiB). This is a storage condition, never a network wait.
   --glossary <glossary.txt>
         local UTF-8 term list, one term per line, re-read at every capture start
         (default: <runtime>\\glossary.txt, then glossary.txt next to listen.exe;
         the dev launcher passes packaging\\glossary.txt). A malformed file is
         reported and the uncorrected transcript is still delivered.
 
-Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|refine|quit>
+Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|refine|quit|delete-segment:<n>>
 Retry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.
+delete-segment:<n> deletes exactly one segment's pending recording and pending result (the
+capture order shown in the panel). Every other segment and unfinished task is untouched;
+a segment that is still recovering is stopped safely first, and late results cannot
+recreate it or write to a target.
 show opens the expanded result panel, panel toggles it and copy copies the complete current result to the clipboard.
 refine asks the DeepSeek API to correct the complete current result. Only that transcript text is sent, never the audio.
 The refined text replaces the appended transcript only while the original target still holds exactly what Listen wrote; if the target was edited, the refined text stays in the panel and the edit is preserved. Without DEEPSEEK_API_KEY in the local environment the refine entry is unavailable, and local recognition is unaffected.
 Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail. Text is never submitted as a message automatically.";
+
+/// Parse one explicit MiB option for the storage bounds (#36). The byte value is
+/// passed through exactly; only the CLI spelling uses MiB.
+fn parse_mib(option: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map(listen::storage::StoragePolicy::mib)
+        .map_err(|_| format!("{option} must be a whole number of MiB"))
+}
 
 fn parse() -> Result<LaunchAction, String> {
     let executable = env::current_exe().map_err(|e| e.to_string())?;
@@ -161,6 +190,7 @@ fn parse() -> Result<LaunchAction, String> {
         sensevoice_vad: root.join(".tools/models/sense-voice/silero_vad.onnx"),
         sensevoice_language: "auto".into(),
         cloud_trial: false,
+        storage: listen::storage::StoragePolicy::default(),
     };
     let mut glossary = None;
     let mut explicit_engine = false;
@@ -210,6 +240,17 @@ fn parse() -> Result<LaunchAction, String> {
             "--model" => config.model = PathBuf::from(value),
             "--vad-model" => config.vad_model = PathBuf::from(value),
             "--runtime" => config.runtime = PathBuf::from(value),
+            "--pending-audio-budget-mib" => {
+                config.storage.pending_audio_budget_bytes =
+                    parse_mib("--pending-audio-budget-mib", &value)?;
+            }
+            "--pending-audio-warn-mib" => {
+                config.storage.warning_at_bytes =
+                    Some(parse_mib("--pending-audio-warn-mib", &value)?);
+            }
+            "--free-disk-floor-mib" => {
+                config.storage.free_disk_floor_bytes = parse_mib("--free-disk-floor-mib", &value)?;
+            }
             "--glossary" => glossary = Some(PathBuf::from(value)),
             "--language" => config.language = value,
             "--backend" => {

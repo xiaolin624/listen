@@ -41,6 +41,12 @@ const ID_CLEANUP: usize = 106;
 const ID_PANEL: usize = 107;
 /// `--control copy`: copy the complete current result without opening the panel.
 const ID_COPY_RESULT: usize = 108;
+/// Panel command ids 1-10 are reserved for the documented `--control` commands.
+/// A tray menu item and `--control delete-segment:<n>` both encode one capture order
+/// from this base, so one table decides both paths (#36).
+const DELETE_SEGMENT_ID_BASE: usize = 200;
+/// The highest capture order a 16-bit `WM_COMMAND` id can carry.
+const MAX_DELETABLE_SEQUENCE: u64 = 60_000;
 /// How often the application snapshot is polled and `status.txt` is refreshed.
 const POLL_TIMER_MS: u32 = 100;
 
@@ -114,7 +120,12 @@ pub fn control(command: &str) -> Result<(), String> {
         "panel" => 8,
         "copy" => 9,
         "refine" => 10,
-        _ => return Err(format!("Unknown control command: {command}")),
+        // The one explicit per-segment cleanup entry. The number is the capture
+        // order shown in the panel; nothing else is deleted.
+        _ => match command.strip_prefix("delete-segment:") {
+            Some(sequence) => segment_command_id(sequence)?,
+            None => return Err(format!("Unknown control command: {command}")),
+        },
     };
     unsafe {
         let hwnd =
@@ -122,6 +133,19 @@ pub fn control(command: &str) -> Result<(), String> {
         PostMessageW(Some(hwnd), CONTROL_MESSAGE, WPARAM(id), LPARAM(0))
             .map_err(|e| format!("Cannot contact running Listen: {e}"))
     }
+}
+
+/// Decode `delete-segment:<n>` into the id scheme the tray menu also uses.
+fn segment_command_id(sequence: &str) -> Result<usize, String> {
+    let sequence: u64 = sequence.parse().map_err(|_| {
+        format!("--control delete-segment:<n> needs the 1-based segment number, not '{sequence}'")
+    })?;
+    if sequence == 0 || sequence > MAX_DELETABLE_SEQUENCE {
+        return Err(format!(
+            "--control delete-segment:<n> needs a segment number between 1 and {MAX_DELETABLE_SEQUENCE}"
+        ));
+    }
+    Ok(DELETE_SEGMENT_ID_BASE + sequence as usize)
 }
 
 pub fn run(config: Config) -> Result<(), String> {
@@ -333,6 +357,7 @@ impl Ui {
                     || last.notice != state.notice
                     || last.usage != state.usage
                     || last.segments != state.segments
+                    || last.storage != state.storage
             });
             let phase_changed = self
                 .last
@@ -475,6 +500,33 @@ impl Ui {
                     usage.trial_cap_nanoyuan,
                 ),
                 None => "usage_available=0\n".into(),
+            });
+            // The storage bounds are appended for the same reason: `status.txt` is a
+            // machine-readable contract and existing keys never change meaning. A
+            // warning is not a stop, and a real save failure is reported as a fault
+            // instead of being inferred from a phase.
+            status.push_str(&match &state.storage {
+                Some(storage) => format!(
+                    "storage_level={}\nstorage_pending_audio_bytes={}\nstorage_budget_bytes={}\nstorage_warning_bytes={}\nstorage_free_disk_bytes={}\nstorage_free_disk_floor_bytes={}\nstorage_text_bytes={}\nstorage_text_budget_bytes={}\nstorage_fault={}\n",
+                    storage.level().name(),
+                    storage.pending_audio_bytes,
+                    storage.budget_bytes,
+                    storage.warning_at_bytes,
+                    storage
+                        .free_disk_bytes
+                        .map(|bytes| bytes.to_string())
+                        .unwrap_or_default(),
+                    storage.free_disk_floor_bytes,
+                    storage.text_bytes,
+                    storage.text_budget_bytes,
+                    storage
+                        .fault
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('\r', "")
+                        .replace('\n', " "),
+                ),
+                None => "storage_level=none\n".into(),
             });
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
@@ -645,6 +697,12 @@ impl Ui {
                         let _ = DestroyWindow(self.hwnd);
                     }
                 }
+                // The tray's per-segment cleanup submenu and --control
+                // delete-segment:<n> share this id scheme.
+                id if id >= DELETE_SEGMENT_ID_BASE => {
+                    self.app
+                        .dispatch(Control::DeleteSegment((id - DELETE_SEGMENT_ID_BASE) as u64));
+                }
                 _ => {}
             }
             self.refresh();
@@ -699,6 +757,37 @@ unsafe fn show_tray_menu(hwnd: HWND, state: &Snapshot) {
             ID_CLEANUP,
             w!("清理失败音频"),
         );
+        // Explicit per-segment cleanup (#36). Every entry names one capture order so
+        // the delete can never be mistaken for "clean everything"; a live capture is
+        // never offered here and the application refuses it anyway.
+        let deletable = panel::deletable_segments(state);
+        if !deletable.is_empty() {
+            if let Ok(submenu) = CreatePopupMenu() {
+                for sequence in deletable {
+                    let label = match state
+                        .segments
+                        .iter()
+                        .find(|segment| segment.sequence == sequence)
+                    {
+                        Some(segment) => {
+                            format!("第 {sequence} 段：{}", panel::segment_label(segment))
+                        }
+                        None => format!("第 {sequence} 段"),
+                    };
+                    let label = wide(&label);
+                    let _ = AppendMenuW(
+                        submenu,
+                        MF_STRING,
+                        DELETE_SEGMENT_ID_BASE + sequence as usize,
+                        PCWSTR(label.as_ptr()),
+                    );
+                }
+                if AppendMenuW(menu, MF_POPUP, submenu.0 as usize, w!("清理待处理段")).is_err()
+                {
+                    let _ = DestroyMenu(submenu);
+                }
+            }
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
         let mut point = POINT::default();
@@ -791,5 +880,27 @@ unsafe extern "system" fn window_proc(
         } else {
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_segment_control_encodes_exactly_one_capture_order() {
+        assert_eq!(segment_command_id("1").unwrap(), DELETE_SEGMENT_ID_BASE + 1);
+        assert_eq!(
+            segment_command_id("60000").unwrap(),
+            DELETE_SEGMENT_ID_BASE + 60_000
+        );
+        // No segment number, an out-of-range number and a non-number are refused
+        // before any window is contacted.
+        assert!(segment_command_id("").is_err());
+        assert!(segment_command_id("0").is_err());
+        assert!(segment_command_id("60001").is_err());
+        assert!(control("delete-segment:zero").is_err());
+        assert!(control("delete-segment:0").is_err());
+        assert!(control("not-a-control").is_err());
     }
 }
