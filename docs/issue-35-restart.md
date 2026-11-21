@@ -98,7 +98,7 @@
 .\scripts\build-listen.ps1 -Task CheckFormat
 ```
 
-离线、锁定依赖构建与测试通过：**289 passed / 0 failed / 17 ignored**（忽略项都是需要真实模型、真实
+离线、锁定依赖构建与测试通过：**289 passed / 0 failed / 16 ignored**（忽略项都是需要真实模型、真实
 密钥或操作员编辑器的既有测试，不计为通过）。`cargo fmt --check` 通过。
 
 ## 与 #38（200e9ef）合并后的核对
