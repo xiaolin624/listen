@@ -2,7 +2,7 @@
 //! local file decoding and its window stitching stay inside the local adapter.
 use crate::{
     AppResult, CaptureEndpoint, CapturedAudio, LocalTranscriber, PlaybackAudio, Preparation,
-    Recording, Timing, capture_scope, elapsed_ms,
+    Recording, Timing, UsageSummary, capture_scope, elapsed_ms,
     glossary::Glossary,
     preparation_note,
     streaming::{self, CaptureProgress, RecognitionWorker},
@@ -126,6 +126,13 @@ pub trait RecognitionSessions: Send {
     /// must not silently upload after failing to load its declared term snapshot.
     fn requires_valid_glossary(&self) -> bool {
         false
+    }
+    /// Cumulative usage and cost of this tool's own cloud requests, when this
+    /// adapter keeps a durable ledger. `None` means "this engine has no cloud
+    /// cost", never "zero was spent": a cloud adapter with an unreadable ledger
+    /// must report an explicitly unknown summary instead.
+    fn usage(&mut self) -> Option<UsageSummary> {
+        None
     }
     fn preparation(&mut self) -> RecognitionReadiness;
     fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>>;

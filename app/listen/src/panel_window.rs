@@ -412,7 +412,10 @@ unsafe fn layout(hwnd: HWND) {
         let font = ensure_font(hwnd, scale);
         let margin = s(12.0);
         let gap = s(8.0);
-        let status_height = s(104.0);
+        // The status block now also carries the 云端试用 usage lines (confirmed,
+        // conservative and unknown cost, plus the monthly reminder), so it gets two
+        // extra lines of room instead of clipping them.
+        let status_height = s(136.0);
         let button_height = s(30.0);
         let width = (client.right - 2 * margin).max(1);
         let button_y = (client.bottom - margin - button_height).max(margin);

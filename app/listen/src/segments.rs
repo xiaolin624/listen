@@ -170,7 +170,9 @@ impl SegmentStore {
     /// The record of one capture order, if it is still stored.
     #[allow(dead_code)]
     pub fn record(&self, sequence: u64) -> Option<&SegmentRecord> {
-        self.segments.iter().find(|record| record.sequence == sequence)
+        self.segments
+            .iter()
+            .find(|record| record.sequence == sequence)
     }
 
     pub fn record_mut(&mut self, sequence: u64) -> Option<&mut SegmentRecord> {
@@ -198,8 +200,9 @@ impl SegmentStore {
     /// the caller must not release that segment's audio before it succeeds.
     pub fn write_text(&self, sequence: u64, text: &str) -> AppResult<String> {
         let name = Self::text_name(sequence);
-        persist_result(&self.runtime.join(&name), text.as_bytes())
-            .map_err(|error| format!("Could not save segment {sequence}'s complete result: {error}"))?;
+        persist_result(&self.runtime.join(&name), text.as_bytes()).map_err(|error| {
+            format!("Could not save segment {sequence}'s complete result: {error}")
+        })?;
         Ok(name)
     }
 
@@ -323,7 +326,10 @@ mod tests {
         fs::write(runtime.0.join(SegmentStore::text_name(7)), "旧的待取结果").unwrap();
         let mut store = SegmentStore::open(&runtime.0);
         let (sequence, _) = store.begin(&runtime.0.join("session-new"), "capturing");
-        assert_eq!(sequence, 8, "an existing text file must never be overwritten");
+        assert_eq!(
+            sequence, 8,
+            "an existing text file must never be overwritten"
+        );
         assert_eq!(
             fs::read_to_string(runtime.0.join(SegmentStore::text_name(7))).unwrap(),
             "旧的待取结果"

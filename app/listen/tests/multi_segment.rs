@@ -8,8 +8,8 @@
 //! content or on-disk record observed through `Application::dispatch`, `poll` and
 //! `snapshot`; no paid network is contacted and no thread count is asserted.
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Delivery, Phase, SegmentState, Snapshot, Target,
-    TargetSelection, Timing,
+    AppResult, Application, CapturedAudio, Control, Delivery, Phase, SegmentState, Snapshot,
+    Target, TargetSelection, Timing,
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
         SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
@@ -119,11 +119,7 @@ impl Registry {
         let entry = entries
             .get(index)
             .unwrap_or_else(|| panic!("no segment {} was started", index + 1));
-        (
-            entry.id,
-            entry.directory.clone(),
-            entry.events.clone(),
-        )
+        (entry.id, entry.directory.clone(), entry.events.clone())
     }
     fn controls(&self, index: usize) -> Arc<Controls> {
         self.entries.lock().unwrap()[index].controls.clone()
@@ -132,10 +128,14 @@ impl Registry {
         self.entries.lock().unwrap().len()
     }
     fn set_usage(&self, directory: &Path, usage: SegmentUsage) {
-        self.usage
-            .lock()
-            .unwrap()
-            .insert(directory.file_name().unwrap().to_string_lossy().into_owned(), usage);
+        self.usage.lock().unwrap().insert(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            usage,
+        );
     }
 }
 
@@ -143,7 +143,11 @@ struct Sessions {
     registry: Arc<Registry>,
 }
 impl Sessions {
-    fn spawn(&self, request: &SessionRequest, state: SessionState) -> AppResult<Box<dyn RecognitionSession>> {
+    fn spawn(
+        &self,
+        request: &SessionRequest,
+        state: SessionState,
+    ) -> AppResult<Box<dyn RecognitionSession>> {
         fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
         fs::write(request.directory.join("audio.wav"), b"captured segment")
             .map_err(|error| error.to_string())?;
@@ -272,7 +276,12 @@ impl Harness {
     fn start(&mut self, editor: usize) -> usize {
         *self.focus.focus.lock().unwrap() = editor;
         self.app.dispatch(Control::Start);
-        assert_eq!(self.snapshot().phase, Phase::Capturing, "{:?}", self.snapshot());
+        assert_eq!(
+            self.snapshot().phase,
+            Phase::Capturing,
+            "{:?}",
+            self.snapshot()
+        );
         self.registry.count() - 1
     }
     fn stop(&mut self) {
@@ -363,7 +372,7 @@ impl Harness {
 
 #[test]
 fn a_new_capture_starts_while_the_previous_segment_waits_and_each_segment_keeps_its_own_target_and_text()
-{
+ {
     let mut h = Harness::new(&["第一段草稿", "第二段草稿"]);
     let first = h.start(0);
     h.waiting_for_network(first);
@@ -399,8 +408,7 @@ fn a_new_capture_starts_while_the_previous_segment_waits_and_each_segment_keeps_
         waiting
             .segments
             .iter()
-            .any(|segment| segment.sequence == 1
-                && segment.delivery == Some(Delivery::Fallback)),
+            .any(|segment| segment.sequence == 1 && segment.delivery == Some(Delivery::Fallback)),
         "{waiting:?}"
     );
 
@@ -413,7 +421,11 @@ fn a_new_capture_starts_while_the_previous_segment_waits_and_each_segment_keeps_
     });
     assert_eq!(result.text, "第二段完整结果。");
     assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
-    assert_eq!(h.draft(0), "第一段草稿", "no segment writes another's target");
+    assert_eq!(
+        h.draft(0),
+        "第一段草稿",
+        "no segment writes another's target"
+    );
     assert_eq!(h.draft(1), "第二段草稿\n第二段完整结果。");
     assert_eq!(result.segments.len(), 2, "{result:?}");
     assert_eq!(result.segments[0].sequence, 1);
@@ -432,10 +444,9 @@ fn three_interleaved_captures_keep_their_own_state_and_the_newest_result_is_curr
     let first = h.start(0);
     h.waiting_for_network(first);
     h.poll_until("segment 1 waiting", |snapshot| {
-        snapshot
-            .segments
-            .iter()
-            .any(|segment| segment.sequence == 1 && segment.state == SegmentState::WaitingForNetwork)
+        snapshot.segments.iter().any(|segment| {
+            segment.sequence == 1 && segment.state == SegmentState::WaitingForNetwork
+        })
     });
     h.stop();
     assert_eq!(h.snapshot().phase, Phase::Processing);
@@ -444,10 +455,9 @@ fn three_interleaved_captures_keep_their_own_state_and_the_newest_result_is_curr
     let second = h.start(1);
     h.waiting_for_network(second);
     h.poll_until("segment 2 waiting", |snapshot| {
-        snapshot
-            .segments
-            .iter()
-            .any(|segment| segment.sequence == 2 && segment.state == SegmentState::WaitingForNetwork)
+        snapshot.segments.iter().any(|segment| {
+            segment.sequence == 2 && segment.state == SegmentState::WaitingForNetwork
+        })
     });
     h.stop();
     assert_eq!(h.snapshot().phase, Phase::Processing);
@@ -470,7 +480,10 @@ fn three_interleaved_captures_keep_their_own_state_and_the_newest_result_is_curr
     assert_eq!(captured.segments[1].state, SegmentState::Processing);
     assert_eq!(captured.segments[2].state, SegmentState::Capturing);
     assert!(
-        captured.segments.iter().all(|segment| segment.text.is_empty()),
+        captured
+            .segments
+            .iter()
+            .all(|segment| segment.text.is_empty()),
         "no unfinished segment claims text: {captured:?}"
     );
 
@@ -530,7 +543,11 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
         snapshot.phase == Phase::Processing
     });
     let third = h.start(2);
-    h.fail_with_audio(second, "The old segment lost the network for good", Some(true));
+    h.fail_with_audio(
+        second,
+        "The old segment lost the network for good",
+        Some(true),
+    );
     let isolated = h.poll_until("segment 2 failure", |snapshot| {
         snapshot
             .segments
@@ -542,7 +559,11 @@ fn a_failure_in_an_old_segment_does_not_end_the_new_capture_or_clear_other_resul
         Phase::Capturing,
         "an old failure must not end the new capture: {isolated:?}"
     );
-    assert_eq!(isolated.recognition, Some(SessionState::Capturing), "{isolated:?}");
+    assert_eq!(
+        isolated.recognition,
+        Some(SessionState::Capturing),
+        "{isolated:?}"
+    );
     assert_eq!(
         isolated.segments[0].text, "第一段待取结果。",
         "another segment's pending result must not be cleared: {isolated:?}"
@@ -654,14 +675,8 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
             fs::read_to_string(runtime.join(record["text_file"].as_str().unwrap())).unwrap()
         })
         .collect();
-    assert!(
-        texts.iter().any(|text| text == "第一段待取。"),
-        "{texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text == "第二段待取。"),
-        "{texts:?}"
-    );
+    assert!(texts.iter().any(|text| text == "第一段待取。"), "{texts:?}");
+    assert!(texts.iter().any(|text| text == "第二段待取。"), "{texts:?}");
     assert!(
         records
             .iter()

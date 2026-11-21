@@ -108,6 +108,7 @@ mod tests {
             refine: listen::Refine::Unavailable("not connected in this test".into()),
             refined_text: None,
             notice: None,
+            usage: None,
             segments: Vec::new(),
         }
     }
@@ -212,7 +213,10 @@ mod tests {
         ];
         for state in states {
             assert!(
-                !state.name().chars().any(|character| character.is_ascii_digit()),
+                !state
+                    .name()
+                    .chars()
+                    .any(|character| character.is_ascii_digit()),
                 "the capsule state must stay number-free: {}",
                 state.name()
             );

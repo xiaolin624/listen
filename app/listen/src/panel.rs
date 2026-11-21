@@ -9,7 +9,7 @@
 //! existing [`Snapshot`], so it stays consistent with the capsule and the files.
 
 use listen::{
-    Delivery, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot,
+    Delivery, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot, UsageSummary,
     streaming::SAMPLE_RATE,
 };
 
@@ -241,6 +241,83 @@ pub fn segments_note(snapshot: &Snapshot) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// One amount in CNY. Amounts are exact integer 纳元 in the ledger and become
+/// readable here only; this rounding is for display and is never used as a cost.
+fn cny(nanoyuan: u64) -> String {
+    format!("{:.2}", nanoyuan as f64 / 1_000_000_000.0)
+}
+
+/// A whole-CNY policy figure (the trial cap and the monthly reminder line are
+/// stated in whole yuan, so they are never shown with misleading decimals).
+fn whole_cny(nanoyuan: u64) -> String {
+    (nanoyuan / 1_000_000_000).to_string()
+}
+
+/// The 云端试用 usage lines: what this tool spent, kept apart from the unknown
+/// part, and the two independent limits. It is derived from the durable ledger, so
+/// it remains visible in every phase, including before any capture starts.
+fn usage_lines(usage: &UsageSummary) -> Vec<String> {
+    if usage.unreadable {
+        return vec![
+            "云端用量暂时无法读取本机账本，因此不能当作 0 元；已确认、保守估算和未知都无法计算。本机账本可读前不会发出新的付费请求。"
+                .into(),
+        ];
+    }
+    let mut counts = format!("共 {} 次请求", usage.requests);
+    if usage.retried_segments > 0 {
+        // A rebuilt or repeated request is a new paid request; the panel never
+        // implies that de-duplication makes it free.
+        counts.push_str(&format!(
+            "（含 {} 段重试请求，重试同样计费）",
+            usage.retried_segments
+        ));
+    }
+    counts.push_str(&format!(
+        "；已取得最终用量 {} 次，保守估算 {} 次，未知 {} 次（实际用量或扣款未核实，不按 0 元计）。",
+        usage.settled_requests,
+        usage.requests.saturating_sub(usage.settled_requests),
+        usage.unknown_requests
+    ));
+    let mut money = format!(
+        "累计费用估计 {} 元 = 已确认 {} 元 + 保守预留 {} 元。",
+        cny(usage.lifetime_nanoyuan()),
+        cny(usage.confirmed_nanoyuan),
+        cny(usage.estimated_nanoyuan)
+    );
+    if usage.confirmed_input_tokens > 0 || usage.confirmed_output_tokens > 0 {
+        money.push_str(&format!(
+            "已确认用量：输入 {} tokens、输出 {} tokens。",
+            usage.confirmed_input_tokens, usage.confirmed_output_tokens
+        ));
+    }
+    if usage.undated_requests > 0 {
+        money.push_str(&format!(
+            "另有 {} 次旧记录无法确定月份，已计入累计、未计入本月。",
+            usage.undated_requests
+        ));
+    }
+    let month = format!(
+        "本月（UTC）合计 {} 元，未达每月 {} 元提醒线；首轮 {} 元试用上限独立生效，提醒不会停用功能或增加额度。",
+        cny(usage.month_nanoyuan()),
+        whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN),
+        whole_cny(usage.trial_cap_nanoyuan)
+    );
+    let month = if usage.reminder_reached() {
+        format!(
+            "本月（UTC）合计 {} 元，已达到每月 {} 元提醒线；提醒不会改变采集、额度或套餐。",
+            cny(usage.month_nanoyuan()),
+            whole_cny(UsageSummary::MONTH_REMINDER_NANOYUAN)
+        )
+    } else {
+        month
+    };
+    vec![
+        format!("云端用量（仅统计本工具发出的识别请求，不含同一云账号的其他应用或套餐）：{counts}"),
+        money,
+        month,
+    ]
+}
+
 /// Everything the panel's status area shows: state, meaning, the live capture line
 /// while capturing, the application's own human-readable detail, and a note when a
 /// failed preparation blocks new captures. The live line comes before the long
@@ -254,6 +331,12 @@ pub fn status_text(snapshot: &Snapshot) -> String {
         if let Some(backend) = &snapshot.backend {
             lines.push(backend.clone());
         }
+    }
+    // The cumulative cloud cost is a fact about this tool's own usage, so it is
+    // shown wherever a cloud adapter reports it — before the long detail, and
+    // without ever hiding the three cost categories behind one rounded number.
+    if let Some(usage) = &snapshot.usage {
+        lines.extend(usage_lines(usage));
     }
     if snapshot.phase == Phase::Capturing {
         lines.push(capture_progress(snapshot));
@@ -429,6 +512,7 @@ mod tests {
             refine: Refine::Unavailable("No DeepSeek API key is configured".into()),
             refined_text: None,
             notice: None,
+            usage: None,
             segments: Vec::new(),
         }
     }
@@ -583,6 +667,131 @@ mod tests {
         let state = snapshot(Phase::Ready, Preparation::Ready);
         assert_eq!(result_text(&state), "（还没有可复制的转写文本）");
         assert!(text(&state).ends_with("（还没有可复制的转写文本）"));
+    }
+
+    #[test]
+    fn cloud_cost_is_shown_as_confirmed_conservative_and_unknown_never_as_zero() {
+        let mut state = result("完整结果", Delivery::Appended);
+        state.backend = Some(
+            "Cloud trial: Alibaba Model Studio; model=qwen-audio-3.1-asr-flash-message; \
+             region=cn-beijing; shared two-provider trial cap=CNY 50"
+                .into(),
+        );
+        state.usage = Some(listen::UsageSummary {
+            requests: 3,
+            settled_requests: 1,
+            confirmed_nanoyuan: 420_000_000,
+            estimated_nanoyuan: 28_500_000_000,
+            unknown_requests: 2,
+            retried_segments: 1,
+            undated_requests: 0,
+            month_confirmed_nanoyuan: 420_000_000,
+            month_estimated_nanoyuan: 28_500_000_000,
+            month_unknown_requests: 2,
+            trial_cap_nanoyuan: 50_000_000_000,
+            confirmed_input_tokens: 70_000,
+            confirmed_output_tokens: 1_000,
+            unreadable: false,
+        });
+        let shown = status_text(&state);
+        // Coverage is this tool's own usage, never the whole cloud account.
+        assert!(shown.contains("仅统计本工具"), "{shown}");
+        assert!(shown.contains("不含同一云账号"), "{shown}");
+        // Confirmed, conservative and unknown stay three separate figures.
+        assert!(shown.contains("已确认 0.42 元"), "{shown}");
+        assert!(shown.contains("保守预留 28.50 元"), "{shown}");
+        assert!(shown.contains("未知 2 次"), "{shown}");
+        assert!(shown.contains("不按 0 元计"), "{shown}");
+        // Retries are visible as requests, not silently merged away.
+        assert!(shown.contains("含 1 段重试"), "{shown}");
+        // The 50 CNY trial cap and the 100 CNY reminder line are separate facts.
+        assert!(shown.contains("首轮 50 元试用上限独立生效"), "{shown}");
+        assert!(shown.contains("每月 100 元提醒线"), "{shown}");
+        assert!(!shown.contains("已达每月 100 元提醒线"), "{shown}");
+        // The complete result is still rendered after the status block.
+        assert!(text(&state).ends_with("完整结果"));
+    }
+
+    #[test]
+    fn reaching_the_monthly_reminder_line_is_a_reminder_not_a_stop() {
+        let mut state = snapshot(Phase::Capturing, Preparation::Ready);
+        state.backend = Some("Cloud trial: Alibaba Model Studio".into());
+        state.usage = Some(listen::UsageSummary {
+            requests: 6,
+            settled_requests: 3,
+            confirmed_nanoyuan: 60_000_000_000,
+            estimated_nanoyuan: 60_000_000_000,
+            unknown_requests: 3,
+            retried_segments: 1,
+            undated_requests: 2,
+            month_confirmed_nanoyuan: 60_000_000_000,
+            month_estimated_nanoyuan: 60_000_000_000,
+            month_unknown_requests: 3,
+            trial_cap_nanoyuan: 50_000_000_000,
+            confirmed_input_tokens: 1_000,
+            confirmed_output_tokens: 2_000,
+            unreadable: false,
+        });
+        let shown = status_text(&state);
+        // The reminder is visible while the capture keeps running, and the panel
+        // states that the feature is unaffected.
+        assert!(shown.starts_with("正在采集（实时进度）"), "{shown}");
+        assert!(shown.contains("已达到每月 100 元提醒线"), "{shown}");
+        assert!(shown.contains("提醒不会改变采集、额度或套餐"), "{shown}");
+        // Undated history is stated instead of being folded into this month.
+        assert!(shown.contains("另有 2 次旧记录"), "{shown}");
+        assert!(shown.contains("未计入本月"), "{shown}");
+
+        // The application raises this one-shot notice; the panel renders its full
+        // promise next to the numbers, so it can never read as a stop or a charge.
+        state.notice = Some(listen::Notice::UsageReminder);
+        let shown = status_text(&state);
+        assert!(shown.contains("这只是提醒"), "{shown}");
+        assert!(shown.contains("照常继续"), "{shown}");
+        assert!(shown.contains("不会自动停用"), "{shown}");
+        assert!(shown.contains("取消当前录音"), "{shown}");
+        assert!(shown.contains("购买套餐"), "{shown}");
+        assert!(shown.contains("提高额度"), "{shown}");
+    }
+
+    #[test]
+    fn a_zero_cash_request_with_unverified_usage_is_not_shown_as_no_spend() {
+        // The free-only policy reserves zero cash, but neither the usage nor the
+        // actual bill is verified: the panel must not read as "nothing was spent".
+        let mut state = snapshot(Phase::Result, Preparation::Ready);
+        state.usage = Some(listen::UsageSummary {
+            requests: 1,
+            settled_requests: 1,
+            confirmed_nanoyuan: 0,
+            estimated_nanoyuan: 0,
+            unknown_requests: 1,
+            retried_segments: 0,
+            undated_requests: 0,
+            month_confirmed_nanoyuan: 0,
+            month_estimated_nanoyuan: 0,
+            month_unknown_requests: 1,
+            trial_cap_nanoyuan: 50_000_000_000,
+            confirmed_input_tokens: 0,
+            confirmed_output_tokens: 0,
+            unreadable: false,
+        });
+        let shown = status_text(&state);
+        assert!(shown.contains("未知 1 次"), "{shown}");
+        assert!(shown.contains("不按 0 元计"), "{shown}");
+        assert!(
+            shown.contains("累计费用估计 0.00 元 = 已确认 0.00 元 + 保守预留 0.00 元"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_usage_ledger_is_not_reported_as_zero() {
+        let mut state = snapshot(Phase::Ready, Preparation::Ready);
+        state.usage = Some(listen::UsageSummary::unreadable(50_000_000_000));
+        let shown = status_text(&state);
+        assert!(shown.contains("无法读取"), "{shown}");
+        assert!(shown.contains("不能当作 0 元"), "{shown}");
+        assert!(!shown.contains("累计费用估计 0.00 元"), "{shown}");
     }
 
     #[test]
@@ -859,7 +1068,10 @@ mod tests {
             shown.contains(&long),
             "a pending result must be shown complete, not truncated"
         );
-        assert!(shown.contains("【第 1 段 · 待取结果；可手动复制】"), "{shown}");
+        assert!(
+            shown.contains("【第 1 段 · 待取结果；可手动复制】"),
+            "{shown}"
+        );
         assert!(!shown.contains("【第 2 段"), "{shown}");
     }
 
@@ -867,9 +1079,24 @@ mod tests {
     fn pending_results_stay_in_capture_order_and_never_replace_the_current_result() {
         let mut state = result("第三段当前结果", Delivery::Appended);
         state.segments = vec![
-            segment(1, SegmentState::Result, "第一段待取结果", Some(Delivery::Fallback)),
-            segment(2, SegmentState::Result, "第二段待取结果", Some(Delivery::Fallback)),
-            segment(3, SegmentState::Result, "第三段当前结果", Some(Delivery::Appended)),
+            segment(
+                1,
+                SegmentState::Result,
+                "第一段待取结果",
+                Some(Delivery::Fallback),
+            ),
+            segment(
+                2,
+                SegmentState::Result,
+                "第二段待取结果",
+                Some(Delivery::Fallback),
+            ),
+            segment(
+                3,
+                SegmentState::Result,
+                "第三段当前结果",
+                Some(Delivery::Appended),
+            ),
         ];
         let shown = result_text(&state);
         assert!(shown.starts_with("第三段当前结果"), "{shown}");
@@ -880,7 +1107,10 @@ mod tests {
 
         let pending = pending_results(&state);
         assert_eq!(
-            pending.iter().map(|segment| segment.sequence).collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(|segment| segment.sequence)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
         let status = status_text(&state);

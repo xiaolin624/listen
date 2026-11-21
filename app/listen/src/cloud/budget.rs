@@ -1,11 +1,13 @@
 //! One ledger for the entire two-provider trial, independently of runtime paths.
 //! Only verified Token bounds or checked free-only protection admit a task.
 use super::{AliSettings, CloudError, FreeOnlyPolicy, TrialCostPolicy, VerifiedBounds};
+use crate::usage::UsageSummary;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const TRIAL_CAP_NANOYUAN: u64 = 50_000_000_000;
@@ -45,6 +47,12 @@ pub struct Attempt {
     pub free_only: Option<FreeOnlyPolicy>,
     pub price_source: String,
     pub price_verified_on: String,
+    /// Unix epoch seconds (UTC) when this paid request was reserved. Additive and
+    /// optional: ledgers written before the monthly summary existed still load, and
+    /// their attempts are reported as undated history instead of being assigned to
+    /// a month they cannot prove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at_utc: Option<u64>,
 }
 #[derive(Clone, Debug)]
 pub struct LedgerSnapshot {
@@ -147,6 +155,18 @@ impl TrialLedger {
             attempts: data.attempts,
         })
     }
+    /// What this tool's own requests cost, split into confirmed, conservatively
+    /// estimated and unknown parts. The trial cap and the monthly reminder line
+    /// stay separate: this method never admits, stops or extends a paid request.
+    ///
+    /// An unreadable ledger is reported as [`UsageSummary::unreadable`], never as
+    /// zero spend. A lock held by a worker is the same condition for the caller.
+    pub fn usage(&self) -> UsageSummary {
+        match self.snapshot() {
+            Ok(snapshot) => summarize(&snapshot.attempts, snapshot.cap_nanoyuan),
+            Err(_) => UsageSummary::unreadable(TRIAL_CAP_NANOYUAN),
+        }
+    }
     pub(crate) fn reserve(
         &self,
         task_id: &str,
@@ -207,6 +227,7 @@ impl TrialLedger {
             free_only,
             price_source,
             price_verified_on,
+            requested_at_utc: Some(utc_now_seconds()),
         });
         self.write(&data)
     }
@@ -358,6 +379,76 @@ fn committed(data: &Data) -> Result<u64, CloudError> {
         })
         .ok_or(CloudError::Ledger)
     })
+}
+
+fn utc_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Summarize persisted attempts without inventing facts. A settled request is
+/// priced from the final usage the provider reported; an unsettled one keeps its
+/// whole reservation as the conservative bound; and a request whose actual usage
+/// or actual billed charge is unproven is counted as unknown, even when its
+/// conservative bound happens to be zero (the free-only policy). No category is
+/// ever collapsed into "spent nothing".
+fn summarize(attempts: &[Attempt], trial_cap_nanoyuan: u64) -> UsageSummary {
+    let current_month = crate::usage::current_utc_month();
+    let mut summary = UsageSummary {
+        trial_cap_nanoyuan,
+        ..UsageSummary::default()
+    };
+    let mut segment_requests = std::collections::BTreeMap::<&str, u64>::new();
+    for attempt in attempts {
+        summary.requests = summary.requests.saturating_add(1);
+        *segment_requests
+            .entry(attempt.segment_id.as_str())
+            .or_default() += 1;
+        let in_month = attempt
+            .requested_at_utc
+            .is_some_and(|at| crate::usage::utc_month(at) == current_month);
+        if attempt.requested_at_utc.is_none() {
+            summary.undated_requests = summary.undated_requests.saturating_add(1);
+        }
+        let unknown = !attempt.final_usage || attempt.unknown_reason.is_some();
+        if attempt.final_usage {
+            summary.settled_requests = summary.settled_requests.saturating_add(1);
+            let amount = attempt.estimated_nanoyuan.unwrap_or(0);
+            summary.confirmed_nanoyuan = summary.confirmed_nanoyuan.saturating_add(amount);
+            summary.confirmed_input_tokens = summary
+                .confirmed_input_tokens
+                .saturating_add(attempt.usage.input_tokens.unwrap_or(0));
+            summary.confirmed_output_tokens = summary
+                .confirmed_output_tokens
+                .saturating_add(attempt.usage.output_tokens.unwrap_or(0));
+            if in_month {
+                summary.month_confirmed_nanoyuan =
+                    summary.month_confirmed_nanoyuan.saturating_add(amount);
+            }
+        } else {
+            summary.estimated_nanoyuan = summary
+                .estimated_nanoyuan
+                .saturating_add(attempt.reserved_nanoyuan);
+            if in_month {
+                summary.month_estimated_nanoyuan = summary
+                    .month_estimated_nanoyuan
+                    .saturating_add(attempt.reserved_nanoyuan);
+            }
+        }
+        if unknown {
+            summary.unknown_requests = summary.unknown_requests.saturating_add(1);
+            if in_month {
+                summary.month_unknown_requests = summary.month_unknown_requests.saturating_add(1);
+            }
+        }
+    }
+    summary.retried_segments = segment_requests
+        .values()
+        .filter(|requests| **requests > 1)
+        .count() as u64;
+    summary
 }
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension(format!(

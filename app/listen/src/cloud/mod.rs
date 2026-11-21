@@ -10,11 +10,10 @@ mod free_only;
 #[cfg(windows)]
 mod transport;
 use crate::{
-    AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, elapsed_ms,
+    AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, UsageSummary, elapsed_ms,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
+        RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
-        SegmentUsage,
     },
 };
 pub(crate) use budget::atomic_write as persist_result;
@@ -383,6 +382,12 @@ impl RecognitionSessions for CloudSessions {
     fn requires_valid_glossary(&self) -> bool {
         true
     }
+    /// The durable trial ledger is the one record of what this tool spent, so the
+    /// summary is read from it rather than accumulated in memory. An unreadable
+    /// ledger is reported as unknown, never as zero.
+    fn usage(&mut self) -> Option<UsageSummary> {
+        Some(self.ledger.usage())
+    }
     fn preparation(&mut self) -> RecognitionReadiness {
         let error = self.available().err().map(|e| e.to_string());
         RecognitionReadiness {
@@ -467,6 +472,11 @@ impl RecognitionSessions for CloudSessions {
     /// What the shared trial ledger recorded for exactly this segment, including
     /// every automatic rebuild and an explicit retry. The segment identity is the
     /// capture directory name, so another segment's cost can never be mixed in.
+    ///
+    /// This reads the ledger, so the application must call it only when no
+    /// recognition session is in flight (#37): the ledger's exclusive lock is also
+    /// the paid-request admission lock, and a UI read must never make a worker's
+    /// reservation fail. A locked or unreadable ledger reports `None`, never zero.
     fn segment_usage(&self, directory: &std::path::Path) -> Option<SegmentUsage> {
         let segment = segment_name(directory).ok()?;
         let snapshot = self.ledger.snapshot().ok()?;

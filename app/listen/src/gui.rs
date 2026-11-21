@@ -6,8 +6,8 @@ use crate::{
     panel_window::{self, Panel},
 };
 use listen::{
-    Application, Control, Delivery, Phase, Refine, Snapshot, deepseek::DeepSeek, paste,
-    target::NativeTargets,
+    Application, Control, Delivery, Phase, Refine, Snapshot, UsageSummary, deepseek::DeepSeek,
+    paste, target::NativeTargets,
 };
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
 use windows::{
@@ -331,6 +331,7 @@ impl Ui {
                     || last.refine != state.refine
                     || last.refined_text != state.refined_text
                     || last.notice != state.notice
+                    || last.usage != state.usage
                     || last.segments != state.segments
             });
             let phase_changed = self
@@ -360,7 +361,10 @@ impl Ui {
                 .as_ref()
                 .map(|notice| notice.text().replace('\r', "").replace('\n', " "))
                 .unwrap_or_default();
-            let status = format!(
+            // The 云端试用 usage keys are appended, never renamed: `status.txt` is a
+            // machine-readable contract and existing keys stay exactly as they are.
+            // The multi-segment counts are appended for the same reason.
+            let mut status = format!(
                 "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
                 state.phase,
                 state.detail,
@@ -451,6 +455,27 @@ impl Ui {
                     .count(),
                 panel::pending_results(&state).len(),
             );
+            // The cumulative use of this tool's own cloud requests. `usage_available=0`
+            // means the engine keeps no cloud ledger (local recognition), which is not
+            // the same as `usage_requests=0`: a cloud adapter always reports a summary,
+            // and an unreadable ledger reports `usage_unreadable=1` instead of zero.
+            status.push_str(&match &state.usage {
+                Some(usage) => format!(
+                    "usage_available=1\nusage_unreadable={}\nusage_requests={}\nusage_confirmed_nanoyuan={}\nusage_estimated_nanoyuan={}\nusage_unknown_requests={}\nusage_retried_segments={}\nusage_undated_requests={}\nusage_month_nanoyuan={}\nusage_month_reminder={}\nusage_month_reminder_nanoyuan={}\nusage_trial_cap_nanoyuan={}\n",
+                    if usage.unreadable { 1 } else { 0 },
+                    usage.requests,
+                    usage.confirmed_nanoyuan,
+                    usage.estimated_nanoyuan,
+                    usage.unknown_requests,
+                    usage.retried_segments,
+                    usage.undated_requests,
+                    usage.month_nanoyuan(),
+                    if usage.reminder_reached() { 1 } else { 0 },
+                    UsageSummary::MONTH_REMINDER_NANOYUAN,
+                    usage.trial_cap_nanoyuan,
+                ),
+                None => "usage_available=0\n".into(),
+            });
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
             // cannot see.

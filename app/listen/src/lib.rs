@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -16,10 +16,12 @@ pub mod glossary;
 #[cfg(windows)]
 pub mod paste;
 pub mod recognition;
+pub(crate) mod segments;
 #[cfg(windows)]
 pub mod sensevoice;
-pub(crate) mod segments;
 pub mod streaming;
+pub mod usage;
+pub use usage::UsageSummary;
 #[cfg(windows)]
 pub mod target;
 #[cfg(windows)]
@@ -279,6 +281,10 @@ pub enum Notice {
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed, so the resident
     /// status capsule is visible to screen sharing and recordings.
     CaptureExcluded(String),
+    /// This month's own cloud-recognition cost reached the CNY 100 reminder line.
+    /// It is a reminder only: nothing was stopped, cancelled, purchased or raised,
+    /// and the capture flow is unaffected.
+    UsageReminder,
 }
 
 impl Notice {
@@ -292,6 +298,7 @@ impl Notice {
             Notice::CaptureExcluded(reason) => format!(
                 "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
             ),
+            Notice::UsageReminder => "本月云端识别费用估计已达每月 100 元提醒线。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
         }
     }
 }
@@ -391,6 +398,11 @@ pub struct Snapshot {
     /// capsule that cannot be hidden from screen capture). `None` when there is
     /// nothing to report.
     pub notice: Option<Notice>,
+    /// Cumulative usage and cost of this tool's own cloud recognition requests,
+    /// read from the durable trial ledger. Confirmed, conservatively estimated and
+    /// unknown parts stay separate. `None` when the recognition adapter keeps no
+    /// such ledger (the local engine).
+    pub usage: Option<UsageSummary>,
     /// Every segment of this run in capture order. An older waiting segment keeps
     /// its own entry and its own complete text; `text` above is only the newest
     /// complete result.
@@ -468,7 +480,6 @@ struct Delivered {
     timing: Timing,
     directory: PathBuf,
     stopped_at: Option<Instant>,
-    usage: Option<SegmentUsage>,
 }
 
 /// One start/stop segment. It owns its capture directory, its bound target and its
@@ -819,6 +830,17 @@ pub struct Application {
     refine_job: Option<mpsc::Receiver<RefineOutcome>>,
     delivery_memory: Option<DeliveryMemory>,
     segments_dirty: bool,
+    /// Whether this process already raised [`Notice::UsageReminder`] for the
+    /// current month, so one reached line is announced once instead of on every
+    /// ledger refresh. Reset when the month figure falls back under the line.
+    usage_reminder_announced: bool,
+    /// The cumulative cost summary must be re-read, but only once no recognition
+    /// session is in flight: the ledger's exclusive lock is also the paid-request
+    /// admission lock (#37), and an app-side read must never make a worker's
+    /// reservation fail.
+    usage_pending: bool,
+    /// Segments whose own cost still needs a safe-point ledger read.
+    segment_usage_pending: BTreeSet<u64>,
 }
 
 impl Application {
@@ -870,7 +892,7 @@ impl Application {
             detail.push_str(&format!("\n{problem}"));
         }
         let (completion_tx, completion_rx) = mpsc::channel();
-        Self {
+        let mut application = Self {
             snapshot: Snapshot {
                 phase,
                 preparation,
@@ -890,6 +912,7 @@ impl Application {
                 refine: Refine::Unavailable(NO_REFINE_PORT.into()),
                 refined_text: None,
                 notice: None,
+                usage: None,
                 segments: Vec::new(),
             },
             sessions,
@@ -911,7 +934,15 @@ impl Application {
             refine_job: None,
             delivery_memory: None,
             segments_dirty: false,
-        }
+            usage_reminder_announced: false,
+            usage_pending: false,
+            segment_usage_pending: BTreeSet::new(),
+        };
+        // The durable ledger already exists before the first capture, so the cost
+        // this tool has accumulated is readable immediately and after a restart.
+        // This is also the one safe place to raise an already-reached reminder.
+        application.refresh_usage();
+        application
     }
 
     /// The segment whose capture is still running. The playback device admits one
@@ -929,8 +960,7 @@ impl Application {
     /// Any segment still waiting for its complete result or for a target delivery.
     fn is_processing(&self) -> bool {
         self.segments.iter().any(|segment| {
-            segment.finalizing
-                || (segment.handle.is_some() && segment.stopped && !segment.terminal)
+            segment.finalizing || (segment.handle.is_some() && segment.stopped && !segment.terminal)
         })
     }
 
@@ -957,6 +987,112 @@ impl Application {
     fn next_id(&mut self) -> SessionId {
         self.next_session_id += 1;
         SessionId(self.next_session_id)
+    }
+
+    /// Re-read the durable cost summary. It is deliberately **not** called while a
+    /// cloud session is active: the ledger's exclusive lock is also the paid-request
+    /// admission lock, so a UI read that wins the race would make the worker's next
+    /// reservation fail and block an otherwise healthy capture. The safe points are
+    /// construction, a start that failed before any worker existed, and a completed
+    /// or failed session (its worker has already returned). A locked or unreadable
+    /// ledger reports "unknown", never zero.
+    fn refresh_usage(&mut self) {
+        let usage = self.sessions.usage();
+        self.apply_usage(usage);
+    }
+
+    /// Publish one cost summary and the one reminder it may raise. The reminder is
+    /// reported beside the capture flow; it never refuses, stops or cancels one.
+    fn apply_usage(&mut self, usage: Option<UsageSummary>) {
+        let Some(usage) = usage else {
+            // The local engine has no cloud ledger; that is not "zero spent".
+            self.snapshot.usage = None;
+            return;
+        };
+        // A lock held by the worker is not evidence that the cost became unknown:
+        // keep the last readable figures instead of claiming an unknown total.
+        if usage.unreadable
+            && self
+                .snapshot
+                .usage
+                .as_ref()
+                .is_some_and(|known| !known.unreadable)
+        {
+            return;
+        }
+        let reached = usage.reminder_reached();
+        self.snapshot.usage = Some(usage);
+        if !reached {
+            // A new month (or a re-read below the line) may announce again exactly
+            // once; the reminder is never turned into a budget decision.
+            self.usage_reminder_announced = false;
+        } else if !self.usage_reminder_announced && self.snapshot.notice.is_none() {
+            self.usage_reminder_announced = true;
+            self.snapshot.notice = Some(Notice::UsageReminder);
+        }
+    }
+
+    /// Whether any recognition session is still alive. While one is, the ledger
+    /// must not be read at all: its exclusive lock is the paid-request admission
+    /// lock, so a UI read that wins the race would make the worker's next
+    /// reservation fail and block a healthy capture (#37).
+    fn recognition_in_flight(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.handle.is_some() && !segment.terminal)
+    }
+
+    /// Ask for the cumulative cost summary once no recognition session is active.
+    fn mark_usage_pending(&mut self) {
+        self.usage_pending = true;
+    }
+
+    /// Ask for one segment's own cost once no recognition session is active.
+    fn mark_segment_usage_pending(&mut self, sequence: u64) {
+        self.segment_usage_pending.insert(sequence);
+    }
+
+    /// Read the deferred cost summaries, if it is safe now. Both reads are skipped
+    /// while a recognition session is alive; the pending flags stay set until then.
+    fn flush_deferred_usage(&mut self) {
+        if self.recognition_in_flight() {
+            return;
+        }
+        if self.usage_pending {
+            self.usage_pending = false;
+            self.refresh_usage();
+        }
+        if self.segment_usage_pending.is_empty() {
+            return;
+        }
+        let pending: Vec<u64> = self.segment_usage_pending.iter().copied().collect();
+        self.segment_usage_pending.clear();
+        for sequence in pending {
+            let Some(index) = self
+                .segments
+                .iter()
+                .position(|segment| segment.sequence == sequence)
+            else {
+                continue;
+            };
+            let directory = self.segments[index].directory.clone();
+            let Some(usage) = self.sessions.segment_usage(&directory) else {
+                // No metered request for this segment, or the ledger is unreadable
+                // from another process. It is never reported as zero.
+                continue;
+            };
+            self.segments[index].usage = Some(usage.clone());
+            if let Some(record) = self.store.record_mut(sequence) {
+                record.usage = Some(usage);
+                record.updated_utc = segments::now_utc();
+                if self.store.problem().is_none() {
+                    if let Err(error) = self.store.persist() {
+                        self.note_record_problem(error);
+                    }
+                }
+            }
+            self.segments_dirty = true;
+        }
     }
 
     /// Use a specific 术语表 file for this application. The default is the first
@@ -1385,6 +1521,9 @@ impl Application {
                 self.snapshot.recognition = Some(SessionState::Failed);
                 self.snapshot.phase = Phase::Failure;
                 self.snapshot.detail = error;
+                // A start may have reserved a request before it failed. No worker
+                // exists in this branch, so the ledger can be read at the next poll.
+                self.mark_usage_pending();
             }
         }
     }
@@ -1416,6 +1555,9 @@ impl Application {
             self.snapshot.detail = detail;
         }
         self.persist_segment(index);
+        // A retry may have reserved its paid request before it spawned a worker; the
+        // summary becomes visible once no recognition session is active.
+        self.mark_usage_pending();
     }
 
     /// Reprocess the exact audio kept from the newest failed segment. This never
@@ -1477,6 +1619,9 @@ impl Application {
             }
             Err(error) => {
                 self.fail_segment(index, error, Timing::default());
+                // A retry reserves its paid request before it spawns a worker; when
+                // it fails first, that reservation must still become visible.
+                self.mark_usage_pending();
             }
         }
     }
@@ -1609,6 +1754,9 @@ impl Application {
         if let Some((_, delivered)) = self.deliveries.pop_first() {
             self.apply_delivery(delivered);
         }
+        // Cost summaries and per-segment cost are read only once no recognition
+        // session is alive, so the ledger's admission lock is never contended.
+        self.flush_deferred_usage();
         self.refresh_segments();
     }
 
@@ -1792,7 +1940,10 @@ impl Application {
             self.apply_no_speech(index, description, directory, timing, stopped_at);
             return;
         }
-        let usage = self.sessions.segment_usage(&directory);
+        // The segment's own cost is read later, at a safe point after every
+        // recognition session returned: the ledger must not be read mid-capture.
+        self.mark_segment_usage_pending(sequence);
+        self.mark_usage_pending();
         let is_current = sequence >= self.current_sequence;
         let save_started = Instant::now();
         let saved = self.save_complete_text(sequence, &text, is_current);
@@ -1807,7 +1958,6 @@ impl Application {
                 self.snapshot.refined_text = None;
             }
             self.segments[index].text = Some(text);
-            self.segments[index].usage = usage;
             self.segments[index].timing = timing.clone();
             if let Some(audio) = retry_audio {
                 self.segments[index].retained = Some(RetainedCapture { audio });
@@ -1816,7 +1966,6 @@ impl Application {
             return;
         }
         self.current_sequence = self.current_sequence.max(sequence);
-        self.segments[index].usage = usage.clone();
         self.segments[index].timing = timing.clone();
         self.segments[index].finalizing = true;
         let tx = self.completion_tx.clone();
@@ -1840,7 +1989,6 @@ impl Application {
                 timing,
                 directory: worker_directory,
                 stopped_at,
-                usage,
             });
         });
     }
@@ -1903,6 +2051,8 @@ impl Application {
                 "No valid speech detected, but this segment's temporary audio could not be cleaned: {error}"
             );
         }
+        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_usage_pending();
         self.refresh_recovery_snapshot();
     }
 
@@ -1925,7 +2075,6 @@ impl Application {
             segment.session_state = SessionState::Complete;
             segment.text = Some(delivered.text.clone());
             segment.delivery = Some(delivery);
-            segment.usage = delivered.usage.clone();
             segment.timing = delivered.timing.clone();
             segment.detail = detail.clone();
         }
@@ -1941,7 +2090,6 @@ impl Application {
             record.text_file = Some(SegmentStore::text_name(delivered.sequence));
             record.text_chars = delivered.text.chars().count();
             record.delivery = Some(delivery_name(delivery).into());
-            record.usage = delivered.usage.clone();
             record.updated_utc = segments::now_utc();
             if self.store.problem().is_none() {
                 if let Err(error) = self.store.persist() {
@@ -1989,9 +2137,7 @@ impl Application {
                 }
                 Some(error) => self.fail(
                     Some(&delivered.directory),
-                    format!(
-                        "Could not save the current result or clean temporary audio: {error}"
-                    ),
+                    format!("Could not save the current result or clean temporary audio: {error}"),
                 ),
             }
         }
@@ -2000,6 +2146,10 @@ impl Application {
         } else {
             self.remove_segment_record(index);
         }
+        // The request's final usage was observed before the result was reported, so
+        // the per-segment and cumulative figures become exact at this safe point.
+        self.mark_segment_usage_pending(delivered.sequence);
+        self.mark_usage_pending();
         self.refresh_recovery_snapshot();
         self.segments_dirty = true;
     }
@@ -2036,6 +2186,10 @@ impl Application {
             self.record_latency("Failure", &timing, &directory, 0, None);
             self.fail(Some(&directory), error);
         }
+        // A failed segment still has paid requests; its own cost is persisted at the
+        // next safe point even though no result was produced.
+        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_usage_pending();
         self.refresh_recovery_snapshot();
     }
 
