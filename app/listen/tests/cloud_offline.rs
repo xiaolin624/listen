@@ -452,9 +452,9 @@ fn capture_started_while_offline_keeps_the_beginning_and_recovers_without_re_rec
 
     let result = scenario.wait_phase(Phase::Result);
     assert_eq!(result.text, "开头也保留。");
-    // A result recovered after waiting is conservatively kept out of the target
-    // until the later late-backfill task can prove the draft is unchanged.
-    assert_eq!(result.delivery, Some(Delivery::Fallback));
+    // The draft recorded when the capture stopped is still intact, so the late
+    // result is appended once to its end (#34 safe late backfill).
+    assert_eq!(result.delivery, Some(Delivery::Appended));
     assert!(
         result.detail.to_lowercase().contains("recovered")
             || result
@@ -463,7 +463,10 @@ fn capture_started_while_offline_keeps_the_beginning_and_recovers_without_re_rec
                 .contains("waiting for the network"),
         "{result:?}"
     );
-    assert_eq!(scenario.draft(), scenario.original_draft());
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n开头也保留。", scenario.original_draft())
+    );
     assert_eq!(scenario.saved_result(), "开头也保留。");
     assert!(
         audio_files(&scenario.runtime.0).is_empty(),
@@ -539,8 +542,13 @@ fn a_mid_capture_drop_keeps_recording_and_rebuilds_the_task_from_retained_audio(
         result.text, "第一句。第二句。",
         "a rebuilt session must not duplicate or drop text from the dropped one"
     );
-    assert_eq!(result.delivery, Some(Delivery::Fallback));
-    assert_eq!(scenario.draft(), scenario.original_draft());
+    // The capture's own target still holds its Stop-time draft, so the rebuilt
+    // result is a safe late append to that same editor's latest draft.
+    assert_eq!(result.delivery, Some(Delivery::Appended));
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n第一句。第二句。", scenario.original_draft())
+    );
     assert_eq!(scenario.saved_result(), result.text);
     assert!(
         audio_files(&scenario.runtime.0).is_empty(),
@@ -602,13 +610,22 @@ fn a_drop_at_stop_waits_for_the_network_and_confirms_the_saved_recording_once() 
 
     let result = scenario.wait_phase(Phase::Result);
     assert_eq!(result.text, "等待后的完整结果。");
-    assert_eq!(result.delivery, Some(Delivery::Fallback));
-    assert_eq!(scenario.draft(), scenario.original_draft());
+    // The whole stopped capture was confirmed once, and its Stop-time draft is
+    // intact, so the late result lands directly after that draft exactly once.
+    assert_eq!(result.delivery, Some(Delivery::Appended));
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n等待后的完整结果。", scenario.original_draft())
+    );
     assert_eq!(scenario.saved_result(), result.text);
     scenario.app.dispatch(Control::Stop);
     scenario.app.poll();
     assert_eq!(scenario.app.snapshot().text, result.text);
-    assert_eq!(scenario.draft(), scenario.original_draft());
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n等待后的完整结果。", scenario.original_draft()),
+        "a repeated Stop and poll never append the same result twice"
+    );
     assert!(audio_files(&scenario.runtime.0).is_empty());
 }
 
@@ -794,7 +811,8 @@ fn bounded_automatic_retries_then_an_explicit_retry_replays_the_retained_recordi
     );
 
     // The network is back. The explicit Retry reprocesses the same audio without
-    // asking the user to record again, and the late result stays in the panel.
+    // asking the user to record again; its Stop-time draft never changed, so the
+    // retried result is a safe late append to that same target.
     let remote = scenario.transport.accept();
     scenario.app.dispatch(Control::Retry);
     let run = scenario.receive_text("run-task");
@@ -818,8 +836,11 @@ fn bounded_automatic_retries_then_an_explicit_retry_replays_the_retained_recordi
 
     let result = scenario.wait_phase(Phase::Result);
     assert_eq!(result.text, "补处理的完整结果。");
-    assert_eq!(result.delivery, Some(Delivery::Fallback));
-    assert_eq!(scenario.draft(), scenario.original_draft());
+    assert_eq!(result.delivery, Some(Delivery::Appended));
+    assert_eq!(
+        scenario.draft(),
+        format!("{}\n补处理的完整结果。", scenario.original_draft())
+    );
     assert_eq!(scenario.saved_result(), result.text);
     assert!(audio_files(&scenario.runtime.0).is_empty());
     let attempts = scenario.ledger.snapshot().unwrap().attempts;

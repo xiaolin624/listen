@@ -10,8 +10,8 @@
 //! and the runtime directory itself); no test creates real disk pressure and no
 //! paid network is contacted.
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Notice, Phase, SegmentState, Snapshot, Target,
-    TargetSelection, Timing,
+    AppResult, Application, CapturedAudio, Control, Delivery, Notice, Phase, SegmentState,
+    Snapshot, Target, TargetSelection, Timing,
     recognition::{
         RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
         SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
@@ -340,6 +340,39 @@ impl Harness {
     fn draft(&self, editor: usize) -> String {
         self.editors[editor].draft.lock().unwrap().clone()
     }
+    fn set_draft(&self, editor: usize, draft: &str) {
+        *self.editors[editor].draft.lock().unwrap() = draft.into();
+    }
+    /// Wait until the draft read taken when this segment stopped is recorded, so a
+    /// test can rewrite the draft afterwards without racing that reader (#34).
+    fn wait_for_stop_draft(&mut self, sequence: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.app.poll();
+            let recorded = fs::read(self.runtime.0.join("delivery.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|index| {
+                    index["segments"].as_array().and_then(|records| {
+                        records
+                            .iter()
+                            .find(|record| record["sequence"] == sequence)
+                            .cloned()
+                    })
+                })
+                .is_some_and(|record| {
+                    record["baseline"].is_string() || record["baseline_problem"].is_string()
+                });
+            if recorded {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for segment {sequence}'s stop-time draft"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     /// Hold the next target read for this editor until the returned gate opens, so
     /// the "delivery is being written" state can be observed without a race.
     fn gate_editor(&self, editor: usize) -> Arc<AtomicBool> {
@@ -607,7 +640,11 @@ fn audio_over_the_budget_never_blocks_saving_the_complete_text_to_its_own_bound(
         "{stopped:?}"
     );
     // The audio budget is already exceeded, but the complete text has its own bound
-    // and must still be saved: the two limits are not interchangeable.
+    // and must still be saved: the two limits are not interchangeable. The draft is
+    // rewritten after the storage stop, so the recovered result stays a pending
+    // result whose durable text file proves the save (#34).
+    h.wait_for_stop_draft(1);
+    h.set_draft(0, "草稿（改写）");
     h.finish(first, "这段完整文字仍要保存。", true);
     let saved = h.poll_until("the saved complete text", |snapshot| {
         snapshot
@@ -616,6 +653,7 @@ fn audio_over_the_budget_never_blocks_saving_the_complete_text_to_its_own_bound(
             .any(|segment| segment.state == SegmentState::Result)
     });
     assert_eq!(saved.text, "这段完整文字仍要保存。");
+    assert_eq!(h.draft(0), "草稿（改写）");
     let text_file = h.runtime().join("segment-00000001.txt");
     assert!(
         text_file.is_file(),
@@ -703,6 +741,12 @@ fn deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_re
     h.stop();
     let second = h.start(1);
     h.stop();
+    // Both drafts are rewritten after their own stop, so each recovered result stays
+    // its own pending result — exactly the state this test deletes explicitly (#34).
+    h.wait_for_stop_draft(1);
+    h.wait_for_stop_draft(2);
+    h.set_draft(0, "一段草稿\n用户改写");
+    h.set_draft(1, "二段草稿\n用户改写");
     h.finish(first, "第一段待取结果。", true);
     h.finish(second, "第二段待取结果。", true);
     let settled = h.poll_until("both pending results", |snapshot| {
@@ -756,7 +800,11 @@ fn deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_re
     let after = h.snapshot();
     assert_eq!(after.segments.len(), 1);
     assert!(after.segments.iter().all(|segment| segment.sequence != 1));
-    assert_eq!(h.draft(0), "一段草稿", "the target was never written");
+    assert_eq!(
+        h.draft(0),
+        "一段草稿\n用户改写",
+        "the deleted pending result never wrote its target"
+    );
 
     // Deleting the remaining (current) pending result also clears its durable
     // current copy and record; it never expires by date and nothing else is touched.
@@ -770,7 +818,11 @@ fn deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_re
         "",
         "a deleted current result must not come back after a restart"
     );
-    assert_eq!(h.draft(1), "二段草稿");
+    assert_eq!(
+        h.draft(1),
+        "二段草稿\n用户改写",
+        "the deleted pending result never wrote its target"
+    );
     assert_eq!(h.snapshot().phase, Phase::Ready);
 }
 
@@ -879,9 +931,14 @@ fn deleting_a_failed_recording_keeps_other_unfinished_work_and_remaining_tasks_u
     );
     assert_eq!(after.segments.len(), 1, "{after:?}");
     assert_eq!(after.segments[0].text, "第一段待取。");
-    assert_eq!(h.draft(0), "草稿一");
+    assert_eq!(
+        after.segments[0].delivery,
+        Some(Delivery::Appended),
+        "the earlier result was safely delivered to its own target: {after:?}"
+    );
+    assert_eq!(h.draft(0), "草稿一\n第一段待取。");
 
-    // The untouched pending result is still available, and a new capture still runs
+    // The untouched earlier result is still available, and a new capture still runs
     // to a complete result and is delivered to its own target.
     let third = h.start(2);
     h.stop();
