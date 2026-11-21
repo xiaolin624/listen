@@ -612,6 +612,10 @@ struct SegmentSession {
     /// Its original target cannot be reused, so its result is always a late,
     /// panel-only result even when the recognition adapter reports a normal one.
     recovered: bool,
+    /// The recovery fact that must survive later status refreshes (#35): the
+    /// recording was not re-recorded, an incomplete one is not a complete
+    /// recording, and the old target is not reused. `None` for a normal capture.
+    recovery_note: Option<String>,
 }
 
 /// What a successful append left behind. The bound target is kept alive so a later
@@ -1644,6 +1648,7 @@ impl Application {
             usage: recovered.usage.clone(),
             timing: Timing::default(),
             recovered: true,
+            recovery_note: recovered.note.clone(),
         }
     }
 
@@ -2233,6 +2238,7 @@ impl Application {
                     usage: None,
                     timing: Timing::default(),
                     recovered: false,
+                    recovery_note: None,
                 };
                 self.snapshot.endpoint = segment.endpoint.clone();
                 self.snapshot.recognition = Some(status.state);
@@ -2779,9 +2785,13 @@ impl Application {
         let previous_state = self.segments[index].state;
         // A storage stop's reason is kept beside the adapters' own progress detail,
         // so a later status refresh cannot silently turn it back into a normal
-        // capture message.
+        // capture message. The recovery fact is kept for the same reason (#35).
         let mut detail = status.detail.clone();
         if let Some(note) = &self.segments[index].storage_note {
+            detail.push('\n');
+            detail.push_str(note);
+        }
+        if let Some(note) = &self.segments[index].recovery_note {
             detail.push('\n');
             detail.push_str(note);
         }
@@ -3082,6 +3092,10 @@ impl Application {
             segment.detail = format!(
                 "No valid speech detected; nothing was delivered.\nPlayback: {description}"
             );
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
+            }
             segment.timing = timing.clone();
         }
         // A no-speech segment has no result to keep, so its audio and record go.
@@ -3174,6 +3188,12 @@ impl Application {
             segment.delivery = Some(delivery);
             segment.timing = timing.clone();
             segment.detail = detail.clone();
+            // A recovered result keeps saying that it came back after a restart and
+            // that an incomplete recording's text is not a passing transcript.
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
+            }
         }
         let mut cleanup_error = None;
         match fs::remove_dir_all(&delivered.directory) {
@@ -3279,6 +3299,13 @@ impl Application {
                     ". The capture was interrupted, so this text is incomplete and kept with this segment: {}. This is not a completed transcription.",
                     partial.chars().count()
                 ));
+            }
+            // A recovered segment's failure says it came from the previous session
+            // and, when its recording was incomplete, that nothing here was a
+            // complete recording.
+            if let Some(note) = &segment.recovery_note {
+                segment.detail.push('\n');
+                segment.detail.push_str(note);
             }
         }
         self.segments_dirty = true;

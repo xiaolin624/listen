@@ -418,6 +418,37 @@ fn stored_index(runtime: &Runtime) -> serde_json::Value {
     serde_json::from_slice(&fs::read(runtime.app().join("segments.json")).unwrap()).unwrap()
 }
 
+/// The raw durable state of an abnormal exit: a continuous PCM recording written
+/// without the writer's end marker, optionally larger than the bytes the previous
+/// process had committed.
+fn crashed_capture_directory(
+    runtime: &Runtime,
+    name: &str,
+    pcm: &[u8],
+    committed_bytes: Option<u64>,
+    clean_stop: bool,
+) -> PathBuf {
+    let directory = runtime.app().join(name);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("playback.pcm"), pcm).unwrap();
+    fs::write(
+        directory.join("pcm-format.txt"),
+        "sample_rate=16000\nchannels=1\nbits=16\nencoding=signed-little-endian\n",
+    )
+    .unwrap();
+    if let Some(committed_bytes) = committed_bytes {
+        fs::write(
+            directory.join("playback.state"),
+            format!(
+                "committed_bytes={committed_bytes}\nclean_stop={}\n",
+                u8::from(clean_stop)
+            ),
+        )
+        .unwrap();
+    }
+    directory
+}
+
 fn write_delivery(runtime: &Runtime, records: &[serde_json::Value]) {
     let stored = serde_json::json!({ "version": 1, "segments": records });
     fs::write(runtime.app().join("delivery.json"), stored.to_string()).unwrap();
@@ -985,6 +1016,134 @@ fn several_recovered_segments_keep_their_identity_and_order_and_a_new_capture_wi
     assert!(
         runtime.session_directories().is_empty(),
         "every recovered result released its audio after the complete text was saved"
+    );
+}
+
+#[test]
+fn partial_audio_from_an_abnormal_exit_is_repaired_and_clearly_marked_incomplete() {
+    let runtime = Runtime::new();
+    let registry = Arc::new(Registry::default());
+    let editor = Editor::new("用户草稿");
+    let audio = samples();
+    let full = sample_bytes(&audio);
+
+    // Segment 1: the process was killed mid-capture. There is no end marker and the
+    // file ends in the middle of a 16-bit sample, so the last byte is not audio.
+    let mut torn = full.clone();
+    torn.push(0x7f);
+    let first = crashed_capture_directory(&runtime, "session-35-crash-1", &torn, None, false);
+    // Segment 2: the end marker only committed half the bytes that reached the file
+    // (the writer was torn down between the sync and the marker).
+    let second = crashed_capture_directory(
+        &runtime,
+        "session-35-crash-2",
+        &full,
+        Some((full.len() / 2) as u64),
+        false,
+    );
+    write_index(
+        &runtime,
+        3,
+        &[
+            index_record(1, "session-35-crash-1", "capturing", "capture", None, None, &[]),
+            index_record(2, "session-35-crash-2", "capturing", "capture", None, None, &[]),
+        ],
+    );
+
+    let mut app = application(&runtime, registry.clone(), Vec::new(), true)
+        .with_targets(Arc::new(Selection(editor.clone())));
+    let recovered = wait_for(&mut app, "the first partial recording", |snapshot| {
+        snapshot.segments.len() == 2
+    });
+    for segment in &recovered.segments {
+        assert!(
+            segment.detail.to_lowercase().contains("incomplete")
+                && segment.detail.contains("neither a complete recording nor a passing transcript"),
+            "an unprovable recording is marked clearly: {segment:?}"
+        );
+    }
+
+    // Only the readable whole samples of the first recording are processed, from a
+    // repair copy inside the same segment directory.
+    let retries = registry.retries();
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    assert_eq!(retries[0].directory, first);
+    assert_eq!(
+        retries[0].audio_bytes, full,
+        "the torn trailing byte is not presented as audio"
+    );
+    assert_ne!(
+        retries[0].audio,
+        first.join("playback.pcm"),
+        "a repaired copy is processed, not the torn original"
+    );
+    assert_eq!(
+        fs::metadata(first.join("playback.pcm")).unwrap().len(),
+        (full.len() + 1) as u64,
+        "the original evidence is kept while it is still the only recovery basis"
+    );
+
+    registry.finish(0, "第一段残缺录音的可读部分。", true);
+    let first_done = wait_for(&mut app, "the first incomplete result", |snapshot| {
+        snapshot
+            .segments
+            .iter()
+            .any(|segment| segment.sequence == 1 && segment.state == SegmentState::Result)
+    });
+    assert_eq!(
+        first_done
+            .segments
+            .iter()
+            .find(|segment| segment.sequence == 1)
+            .unwrap()
+            .text,
+        "第一段残缺录音的可读部分。"
+    );
+    assert!(!first.exists(), "the audio is released after the text is saved");
+
+    // The second recording keeps only what the marker says was committed.
+    let second_retry = wait_for(&mut app, "the second partial recording", |snapshot| {
+        snapshot
+            .segments
+            .iter()
+            .any(|segment| segment.sequence == 2 && segment.state == SegmentState::Processing)
+    });
+    assert!(
+        second_retry.segments[1].detail.contains("committed bytes"),
+        "{second_retry:?}"
+    );
+    let retries = registry.retries();
+    assert_eq!(retries.len(), 2, "{retries:?}");
+    assert_eq!(retries[1].directory, second);
+    assert_eq!(
+        retries[1].audio_bytes,
+        full[..full.len() / 2].to_vec(),
+        "only the bytes the marker committed are processed"
+    );
+    registry.finish(1, "第二段残缺录音的可读部分。", true);
+    let done = wait_for(&mut app, "the second incomplete result", |snapshot| {
+        snapshot
+            .segments
+            .iter()
+            .any(|segment| segment.sequence == 2 && segment.state == SegmentState::Result)
+    });
+    assert_eq!(
+        done.segments
+            .iter()
+            .find(|segment| segment.sequence == 2)
+            .unwrap()
+            .text,
+        "第二段残缺录音的可读部分。"
+    );
+    assert!(!second.exists());
+    assert_eq!(editor.draft(), "用户草稿");
+    assert_eq!(
+        done.segments
+            .iter()
+            .map(|segment| segment.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "recovery keeps its capture order"
     );
 }
 

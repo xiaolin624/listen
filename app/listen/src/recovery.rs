@@ -32,6 +32,12 @@ use std::{
 const PCM_FILE: &str = "playback.pcm";
 const PCM_FORMAT_FILE: &str = "pcm-format.txt";
 const PCM_STATE_FILE: &str = "playback.state";
+/// The repair copy of a damaged continuous recording. It lives in the same segment
+/// directory, so it counts toward the pending-audio budget and is released with
+/// the segment once the complete text is saved.
+const REPAIRED_PCM_FILE: &str = "recovered.pcm";
+/// The rejoined copy of a local capture whose windows could not all be read.
+const REPAIRED_WAV_FILE: &str = "recovered.wav";
 const SESSION_PREFIX: &str = "session-";
 const SEGMENT_TEXT_PREFIX: &str = "segment-";
 const SEGMENT_TEXT_SUFFIX: &str = ".txt";
@@ -78,6 +84,20 @@ pub(crate) struct RecoveredSegment {
     pub resumable: bool,
     /// Whether the complete text is durably readable, so the audio may be released.
     pub release_audio: bool,
+    /// The recovery fact that must survive every later status refresh: a recovered
+    /// segment's recording is not re-recorded, its old target is not reused, and an
+    /// incomplete recording is never presented as a complete one.
+    pub note: Option<String>,
+}
+
+/// The persistent sentence beside a recovered segment's own progress detail. The
+/// adapter's status may change it, but never erase it.
+pub(crate) fn recovery_note(problem: Option<&str>) -> String {
+    let mut note = "Recovered after Listen restarted; the original input target cannot be reused, so this segment's result stays in the panel.".to_string();
+    if let Some(problem) = problem {
+        note.push_str(&incomplete_note(problem));
+    }
+    note
 }
 
 /// A complete text file the index does not describe: the previous process saved
@@ -146,6 +166,10 @@ impl Plan {
                 retained_paths: Vec::new(),
                 resumable: false,
                 release_audio: false,
+                note: Some(
+                    "Recovered after Listen restarted from a complete text the segment index did not describe; it stays in the panel and is never written to any old target."
+                        .to_string(),
+                ),
             });
             let record = SegmentRecord {
                 sequence: orphan.sequence,
@@ -165,10 +189,14 @@ impl Plan {
         }
         for orphan in std::mem::take(&mut self.orphan_directories) {
             let sequence = store.allocate();
+            let audio_problem = orphan
+                .audio
+                .as_ref()
+                .and_then(|audio| audio.problem.clone());
             let (state, detail, delivery, resumable) = match &orphan.audio {
-                Some(audio) => {
+                Some(_) => {
                     let mut detail = ORPHAN_RESUMED_DETAIL.to_string();
-                    if let Some(problem) = &audio.problem {
+                    if let Some(problem) = &audio_problem {
                         detail.push_str(&incomplete_note(problem));
                     }
                     (SegmentState::Processing, detail, None, true)
@@ -195,6 +223,7 @@ impl Plan {
                 retained_paths: orphan.retained,
                 resumable,
                 release_audio: false,
+                note: resumable.then(|| recovery_note(audio_problem.as_deref())),
             });
             let record = SegmentRecord {
                 sequence,
@@ -394,6 +423,8 @@ pub(crate) fn plan(
         let delivery_state = deliveries.get(&sequence).copied();
         let recorded_delivery = parse_delivery(record.delivery.as_deref());
         let delivery = delivery_state.or(recorded_delivery);
+        let text_is_some = text.is_some();
+        let audio_problem = audio.as_ref().and_then(|audio| audio.problem.clone());
         let resumable_state = matches!(
             record.state.as_str(),
             "capturing" | "waiting_for_network" | "processing"
@@ -463,6 +494,16 @@ pub(crate) fn plan(
                 }
             },
         };
+        let note = if text_is_some {
+            Some(
+                "Recovered after Listen restarted; this complete result stays in the panel and is never written to the old target automatically."
+                    .to_string(),
+            )
+        } else if resumable {
+            Some(recovery_note(audio_problem.as_deref()))
+        } else {
+            None
+        };
         segments.push(RecoveredSegment {
             sequence,
             directory,
@@ -476,6 +517,7 @@ pub(crate) fn plan(
             retained_paths,
             resumable,
             release_audio,
+            note,
         });
     }
     // Artifacts the index never described: a complete text saved just before the
@@ -628,24 +670,22 @@ fn recovered_audio(directory: &Path) -> Option<RecoveredAudio> {
         return local_audio(directory);
     }
     let manifest = read_pcm_state(directory);
-    let mut problem: Option<String> = None;
+    let mut problems: Vec<String> = Vec::new();
     let committed = match &manifest {
         Some(manifest) => {
             if !manifest.clean_stop {
-                problem = Some("the recording was not closed by a normal stop".into());
+                problems.push("the recording was not closed by a normal stop".into());
             }
             if manifest.committed_bytes != len {
-                problem.get_or_insert_with(|| {
-                    format!(
-                        "the end marker reports {} committed bytes but {len} bytes are readable",
-                        manifest.committed_bytes
-                    )
-                });
+                problems.push(format!(
+                    "the end marker reports {} committed bytes but {len} bytes are readable",
+                    manifest.committed_bytes
+                ));
             }
             manifest.committed_bytes.min(len)
         }
         None => {
-            problem = Some(
+            problems.push(
                 "the previous session ended without an end-of-recording marker, so the recording cannot be proven complete"
                     .into(),
             );
@@ -653,46 +693,232 @@ fn recovered_audio(directory: &Path) -> Option<RecoveredAudio> {
         }
     };
     if !pcm_format_ok(directory) {
-        problem.get_or_insert_with(|| {
-            "the recording has no matching 16 kHz mono 16-bit format descriptor".into()
-        });
+        problems
+            .push("the recording has no matching 16 kHz mono 16-bit format descriptor".into());
     }
     let usable = (committed / 2) * 2;
     if usable != len {
-        problem.get_or_insert_with(|| {
-            format!("only {usable} of {len} readable bytes are whole audio samples")
-        });
+        problems.push(format!(
+            "only {usable} of {len} readable bytes are whole audio samples"
+        ));
     }
-    if usable == 0 || usable != len {
-        // Recovering the readable prefix needs a repair copy, which the next
-        // recovery slice adds together with its test.
+    let mut problem = (!problems.is_empty()).then(|| problems.join("; "));
+    if usable == 0 {
         return None;
     }
+    // The recognition adapter can only resume a whole-sample stream, so a torn or
+    // over-long spool is copied up to the readable whole samples. The original
+    // stays where it is: it is still the only recovery basis until the complete
+    // text is saved.
+    let (path, repaired) = if usable == len {
+        (pcm, false)
+    } else {
+        match repair_copy(&pcm, directory, usable) {
+            Ok(path) => (path, true),
+            Err(error) => {
+                problem.get_or_insert_with(|| {
+                    format!("the readable audio could not be copied for recovery ({error})")
+                });
+                return None;
+            }
+        }
+    };
+    let mut description = format!(
+        "Recovered continuous playback recording ({:.1} s, 16 kHz mono)",
+        usable as f64 / 2.0 / 16_000.0
+    );
+    if repaired {
+        description.push_str("; only the readable part is repaired and processed");
+    }
     Some(RecoveredAudio {
-        path: pcm,
+        path,
+        description,
+        problem,
+        retained: crate::audio_paths(directory),
+    })
+}
+
+/// Copy the readable prefix of a damaged continuous recording into a separate file
+/// inside the same segment directory. The copy is bounded by the committed bytes
+/// and is streamed, so a large spool is never held in memory.
+fn repair_copy(pcm: &Path, directory: &Path, usable: u64) -> Result<PathBuf, String> {
+    let mut source = std::fs::File::open(pcm)
+        .map_err(|error| format!("the damaged recording could not be read: {error}"))?;
+    let path = directory.join(REPAIRED_PCM_FILE);
+    let mut target = std::fs::File::create(&path)
+        .map_err(|error| format!("the repaired recording could not be created: {error}"))?;
+    std::io::copy(&mut std::io::Read::take(&mut source, usable), &mut target)
+        .map_err(|error| format!("the repaired recording could not be written: {error}"))?;
+    target
+        .sync_all()
+        .map_err(|error| format!("the repaired recording could not be saved: {error}"))?;
+    Ok(path)
+}
+
+/// A local capture's recognition windows. The adapter's own rejoin helper is used
+/// first; when a torn window makes that refuse the whole capture, the readable
+/// windows are rejoined here instead, so an abnormal exit still recovers every
+/// whole sample it can and the result is marked incomplete.
+fn local_audio(directory: &Path) -> Option<RecoveredAudio> {
+    let whole = directory.join("retry-audio.wav");
+    if let Some(bytes) = readable_wav_bytes(&whole) {
+        return Some(RecoveredAudio {
+            path: whole,
+            description: format!(
+                "Recovered local playback recording ({:.1} s)",
+                bytes as f64 / 2.0 / 16_000.0
+            ),
+            problem: None,
+            retained: crate::audio_paths(directory),
+        });
+    }
+    let mut windows: Vec<PathBuf> = fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("segment-"))
+        })
+        .map(|path| path.join("playback.wav"))
+        .filter(|path| path.is_file())
+        .collect();
+    windows.sort();
+    if windows.is_empty() {
+        // No window at all: the adapter's helper may still know a stored rejoin.
+        let path = crate::streaming::retained_audio_path(directory).ok()?;
+        let bytes = readable_wav_bytes(&path)?;
+        return Some(RecoveredAudio {
+            path,
+            description: format!(
+                "Recovered local playback recording ({:.1} s)",
+                bytes as f64 / 2.0 / 16_000.0
+            ),
+            problem: None,
+            retained: crate::audio_paths(directory),
+        });
+    }
+    let mut readable: Vec<(PathBuf, Vec<i16>)> = Vec::new();
+    let mut problem: Option<String> = None;
+    for window in &windows {
+        match read_window(window) {
+            Some(samples) => readable.push((window.clone(), samples)),
+            None => {
+                problem.get_or_insert_with(|| {
+                    format!(
+                        "a recognition window of the previous session was torn and is not audio; {} of {} readable windows are used",
+                        readable.len(),
+                        windows.len()
+                    )
+                });
+            }
+        }
+    }
+    if readable.is_empty() {
+        return None;
+    }
+    let overlap = capture_overlap(directory);
+    if overlap.is_none() {
+        problem.get_or_insert_with(|| {
+            "the window overlap of the previous session is missing; the readable windows are joined without overlap removal".into()
+        });
+    }
+    let path = match rejoin_windows(directory, &readable, overlap.unwrap_or(0)) {
+        Ok(path) => path,
+        Err(error) => {
+            problem.get_or_insert_with(|| format!("the readable windows could not be joined ({error})"));
+            return None;
+        }
+    };
+    let bytes = readable_wav_bytes(&path).unwrap_or(0);
+    Some(RecoveredAudio {
+        path,
         description: format!(
-            "Recovered continuous playback recording ({:.1} s, 16 kHz mono)",
-            usable as f64 / 2.0 / 16_000.0
+            "Recovered local playback recording ({:.1} s, rejoined from {} readable window(s))",
+            bytes as f64 / 2.0 / 16_000.0,
+            readable.len()
         ),
         problem,
         retained: crate::audio_paths(directory),
     })
 }
 
-/// A local capture's recognition windows are rejoined by the local adapter's own
-/// helper, so recovery never has to understand the WAV layout.
-fn local_audio(directory: &Path) -> Option<RecoveredAudio> {
-    let path = crate::streaming::retained_audio_path(directory).ok()?;
-    let bytes = fs::metadata(&path).map(|metadata| metadata.len()).ok()?;
-    if bytes == 0 {
+/// The whole, readable content of one local recognition window.
+fn read_window(path: &Path) -> Option<Vec<i16>> {
+    let mut reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_rate != 16_000 || spec.bits_per_sample != 16 {
         return None;
     }
-    Some(RecoveredAudio {
-        path,
-        description: "Recovered local playback recording".into(),
-        problem: None,
-        retained: crate::audio_paths(directory),
-    })
+    reader.samples::<i16>().collect::<Result<Vec<_>, _>>().ok()
+}
+
+/// One WAV file's total audio bytes, if its header and content are readable.
+fn readable_wav_bytes(path: &Path) -> Option<u64> {
+    let mut reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_rate != 16_000 || spec.bits_per_sample != 16 {
+        return None;
+    }
+    let samples = reader.samples::<i16>().count();
+    (samples > 0).then_some(samples as u64 * 2)
+}
+
+fn capture_overlap(directory: &Path) -> Option<usize> {
+    let manifest = fs::read_to_string(directory.join("capture-manifest.txt")).ok()?;
+    manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("overlap_samples="))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// Rejoin readable windows into one WAV, trimming the shared overlap so a word
+/// that spans a boundary is not repeated.
+fn rejoin_windows(
+    directory: &Path,
+    windows: &[(PathBuf, Vec<i16>)],
+    overlap: usize,
+) -> Result<PathBuf, String> {
+    let path = directory.join(REPAIRED_WAV_FILE);
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec)
+        .map_err(|error| format!("the rejoined recording could not be created: {error}"))?;
+    let mut written = 0usize;
+    for (index, (_, samples)) in windows.iter().enumerate() {
+        let skip = if index == 0 { 0 } else { overlap.min(samples.len()) };
+        if skip < overlap && index > 0 {
+            // A window shorter than the overlap cannot be trimmed exactly; keep it
+            // whole rather than dropping its end.
+            for sample in samples {
+                writer
+                    .write_sample(*sample)
+                    .map_err(|error| error.to_string())?;
+                written += 1;
+            }
+            continue;
+        }
+        for sample in &samples[skip..] {
+            writer
+                .write_sample(*sample)
+                .map_err(|error| error.to_string())?;
+            written += 1;
+        }
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("the rejoined recording could not be saved: {error}"))?;
+    if written == 0 {
+        return Err("no readable audio samples remained".into());
+    }
+    Ok(path)
 }
 
 struct PcmState {
