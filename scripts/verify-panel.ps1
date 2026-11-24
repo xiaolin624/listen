@@ -1,4 +1,4 @@
-# Verify the expanded result panel (issue #20) of a running Listen build.
+﻿# Verify the expanded result panel (issue #20) of a running Listen build.
 #
 # The panel is the only place Listen shows text: clicking the capsule opens it, a
 # second click / Esc / the close button closes it, and a fallback result opens it by
@@ -482,8 +482,10 @@ function Start-Listen([string]$RunDirectory, [string[]]$Extra = @()) {
 }
 
 function Get-EngineProvenance([Diagnostics.Process]$Process) {
-    # Which engine files the running process actually loaded. The panel window is not
-    # an oracle for this; the loaded module paths are.
+    # Diagnostics only: which engine files the running process loaded. The panel window
+    # is not an oracle for this, and neither is this list (issue #15 forbids asserting
+    # the recognizer's internals); it is written to the evidence for review while the
+    # acceptance assertion stays on status.txt backend / recognition_mode.
     $modules = @()
     try { $modules = @($Process.Modules | ForEach-Object { $_.FileName }) } catch { }
     return [ordered]@{
@@ -623,9 +625,10 @@ try {
     Check ($panelText.Length -gt (Get-StatusValue $status 'detail').Length) 'panel.txt has a result section after the status detail'
 
     # --- engine provenance (acceptance) ------------------------------------
-    # The local engine must be the one that was asked for, and it must have loaded its
-    # native files from the paths that were named, so a package run proves the packaged
-    # bytes. The panel window says nothing about this.
+    # The local engine must be the one that was asked for. The accepted oracle is
+    # status.txt: a SenseVoice run must say recognition_mode=local (an absent or empty
+    # field fails: ADR 0006 makes the mode part of the user-visible state) and must
+    # name the resident SenseVoice backend. The panel window says nothing about this.
     $provenance = Get-EngineProvenance $listen
     $summary.engine = $provenance
     $recognitionMode = Get-StatusValue $status 'recognition_mode'
@@ -636,10 +639,18 @@ try {
     if ($engineKind -eq 'sensevoice') {
         Check ($backendNote -match 'SenseVoice q8') "status.txt reports the resident SenseVoice backend ($backendNote)"
     }
-    if ($engineKind -eq 'sensevoice' -and $SherpaLib) {
-        $loaded = @($provenance.engine_modules | Where-Object { $_ -match '(?i)\\sherpa-onnx-c-api\.dll$' })
-        $expected = Join-Path $SherpaLib 'sherpa-onnx-c-api.dll'
-        Check (($loaded.Count -eq 1) -and ($loaded[0] -eq $expected)) "the running process loaded sherpa-onnx from $expected ($(@($provenance.engine_modules) -join '; '))"
+    # Diagnostics only, never an acceptance assertion: which engine module the process
+    # loaded. The specification's Testing Decisions allow only what the user can
+    # observe (state, text, delivery, visibility), so the loaded DLL path is recorded
+    # for a human reviewer but PASS/FAIL does not depend on it.
+    $expectedModule = if ($SherpaLib) { Join-Path $SherpaLib 'sherpa-onnx-c-api.dll' } else { '' }
+    $loadedModules = @($provenance.engine_modules | Where-Object { $_ -match '(?i)\\sherpa-onnx-c-api\.dll$' })
+    $summary.engine_module_diagnostic = [ordered]@{
+        expected_path = $expectedModule
+        loaded_paths = @($loadedModules)
+        all_engine_modules = @($provenance.engine_modules)
+        exactly_the_expected_file = [bool]($expectedModule -and $loadedModules.Count -eq 1 -and $loadedModules[0] -eq $expectedModule)
+        note = 'diagnostic only: the acceptance assertion for the engine source is status.txt backend / recognition_mode above'
     }
 
     # REMOVAL CHECK - the only legacy-window assertion in this script. It proves

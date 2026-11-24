@@ -107,7 +107,7 @@ cd E:\luyin
 ## 反例与偏差
 
 1. **10 句 → 20 段**：见文首。工单验收第一条「10 句录制完成」按「20 段真人录音的超集，且 10 句内容逐字包含其中」满足，没有新录音。
-2. **`docs/issue-22-recording-guide.md` 已过时**：它的「SenseVoice（默认参数，`-ListenArgs @()`）」在 #40 之后会走云端试用。该文档的待填比较表已改为指向本文与 `docs/issue-22-benchmark.md`。
+2. **`docs/issue-22-recording-guide.md` 当时的命令已过时**：它的「SenseVoice（默认参数，`-ListenArgs @()`）」在 #40 之后会走云端试用。该文档的待填比较表已改为指向本文与 `docs/issue-22-benchmark.md`；2026-11-24 复审又把「跑基准」两段命令换成本文「测量方法」里的当前命令（`-ListenArgs` 显式传引擎参数）。数字未改。
 3. **比较文档由脚本生成**：`docs/issue-22-benchmark.md` 是 `benchmark-meeting-corpus.ps1` 在两份结果同 manifest 时的产物，重新跑基准会覆盖它，不要手改。
 4. **本次未跑固定基线模式**（`-Baseline`）：那一模式测的是 `4b8a487` 旧二进制，与「今天两个引擎谁更好」无关；历史结果保留在 `.artifacts\cloud-evaluation\baseline-run-20261115-125129.json` 供追溯。
 

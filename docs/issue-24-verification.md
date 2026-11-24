@@ -30,7 +30,7 @@
 | 1 | 原有目标追加、重复停止、邻居不变等场景全部通过 | **PASS** | 原生 EDIT 目标 4 例（§2.1）+ 浏览器夹具 `plain\|rich`（§2.2） |
 | 2 | 只读、容量截断、目标失效仍进备用面板且不误写 | **PASS** | 三例全过（§3）；只读的**浏览器**子路径今日未复现，见 §3.1 与偏差 1 |
 | 3 | 识别失败重试、成功清理、设备中断、长会话回归通过 | **PASS** | 失败重试 5 例（§4）+ 设备中断（§5）+ 600 s 长会话（§6） |
-| 4 | 胶囊置顶、不抢焦点、共享隐身有截图或可复核证据 | **PASS** | 胶囊 43/43 + 面板 46/46 验收（§8），5 张 PNG |
+| 4 | 胶囊置顶、不抢焦点、共享隐身有截图或可复核证据 | **PASS** | 胶囊 42 检查 + 面板 45/45 验收 + 42/42 自检（§8、§13 复审重跑），5 张 PNG |
 | 5 | 精修自动回填与手改不覆盖两条路径都有证据 | **部分** | 应用层 15 项测试 + 包上「无 key 不可用」桌面证据（§7）；**真实 DeepSeek API 往返未覆盖**，两条路径缺桌面级证据 |
 | 6 | 验收记录更新到仓库文档 | **PASS** | 本文件 |
 
@@ -48,9 +48,15 @@
 | `-SherpaLib` / `-SenseVoiceModel` / `-SenseVoiceTokens` / `-SenseVoiceVad` / `-SenseVoiceLanguage` | 显式 SenseVoice 路径，用于任意位置的包或仓库构建 |
 | `-Model` / `-VadModel` | whisper 模型覆盖（不变） |
 
-两个脚本都新增引擎来源断言（属验收组）：`recognition_mode=local`、`backend` 含 `SenseVoice q8`，
-并在给了 `-SherpaLib` 时断言运行中进程**实际加载的** `sherpa-onnx-c-api.dll` 就是该目录下的那份
-（`Process.Modules`）。失败态改用参数覆盖而不是追加重复的 `--sensevoice-model`。
+两个脚本都新增引擎来源断言（属验收组），且**口径一致**：SenseVoice/包内模式下**严格**要求
+`recognition_mode=local`（字段缺失或为空即失败，与 ADR 0006 要求状态写明
+`recognition_mode=cloud-trial|local` 一致；此前 `verify-capsule.ps1` 曾把空值也算通过，2026-11-24
+复审已改为与 `verify-panel.ps1` 相同的严格判定），并要求 `backend` 含 `SenseVoice q8`。运行中进程
+**实际加载的** `sherpa-onnx-c-api.dll` 路径（`Process.Modules`）只写进证据 JSON 的
+`engine_module_diagnostic`（`expected_path` / `loaded_paths` / `exactly_the_expected_file`），
+**不是** PASS/FAIL 条件——规格 #15 的 Testing Decisions 只允许断言用户可观察的行为（状态、文本、
+交付结果、可见性），不断言识别器内部实现；引擎来源的验收断言只保留 `status.txt` 的
+`backend` / `recognition_mode`。失败态改用参数覆盖而不是追加重复的 `--sensevoice-model`。
 
 顺带修掉一个真实缺陷：旧 `verify-capsule.ps1` 的 `-Engine` 会经过 `ConvertTo-QuotedWindowsPath`
 变成绝对路径，所以 `-Engine sensevoice` 会被应用当成“whisper-cli 路径”。现在引擎关键字先分类
@@ -91,8 +97,8 @@ powershell -File scripts\verify-panel.ps1   -PackageRoot <包> -Runtime <..> -Ev
 
 | 脚本 | 结果 | 耗时 | 引擎来源证据 |
 | --- | --- | --- | --- |
-| `verify-capsule.ps1` | **PASS**，43 检查 / 0 失败 | 15 s | `status.txt` `recognition_mode=local`、`backend=SenseVoice q8, resident (sherpa-onnx), CPU, 6 thread(s)…`；进程模块 `…\Listen-0.1.0\engine\sherpa\sherpa-onnx-c-api.dll` 与 `onnxruntime.dll` 均来自包内 |
-| `verify-panel.ps1` | **PASS**，46/46 验收 + 42/42 自检 / 0 失败 | 15 s | 同上（两条新验收断言 + 模块路径断言） |
+| `verify-capsule.ps1` | **PASS**，42 检查 / 0 失败（复审重跑实测；模块路径断言降级为诊断前是 43） | 15 s | `status.txt` `recognition_mode=local`、`backend=SenseVoice q8, resident (sherpa-onnx), CPU, 6 thread(s)…`；进程模块路径按设计只作诊断，见证据 JSON 的 `engine_module_diagnostic` |
+| `verify-panel.ps1` | **PASS**，45/45 验收 + 42/42 自检 / 0 失败（复审重跑实测；模块路径断言降级前验收是 46） | 15 s | 同上（两条引擎来源验收断言：`recognition_mode` 与 `backend`；模块路径为诊断字段） |
 
 包级其它实测（`status.txt`）：`startup_capsule_ms=35`、`capsule=Ready`、`preparation=Ready`、
 `capsule_capture_excluded=1`；停止到结果、拖拽位置持久化、`--control quit` 干净退出、无残留进程。
@@ -151,7 +157,9 @@ powershell -File scripts\verify-panel.ps1   -PackageRoot <包> -Runtime <..> -Ev
 
 > 稳定性注记（实测现象，不隐藏）：同一 `-Profile` 目录在上一实例未退出时，新启动会交给已在运行的
 > 浏览器实例，而那个实例没有带 `--force-renderer-accessibility`，于是又退化成「找不到夹具窗口」。
-> 改为**每次新 `-Profile`** 后 plain/rich 各一次通过；两次 `readonly` 重试仍卡在同一处（见 §3.1）。
+> 当时靠**每次手工传新 `-Profile`** 才让 plain/rich 各通过一次；两次 `readonly` 重试仍卡在同一处
+> （见 §3.1）。2026-11-24 复审把这件事固化进脚本：**不传 `-Profile` 时自动生成本次专用目录**
+> （时间戳 + 随机后缀）并在结束时删除；显式传入的 `-Profile` 原样使用、不删除（见 §13 的 F 项）。
 
 ## 3. 只读 / 容量截断 / 目标失效（验收点 2）
 
@@ -167,6 +175,12 @@ powershell -File scripts\verify-panel.ps1   -PackageRoot <包> -Runtime <..> -Ev
   用了 124 ms，超过 100 ms 预算；重跑通过），另两次与 §2.2 注记同一个「夹具窗口 30 s 内不可见」现象。
   **没有任何一次场景断言失败**，但也没有拿到通过记录——因此不把浏览器只读记为 PASS。只读行为本身
   已由原生目标覆盖。
+- **2026-11-24 复审再试（§13 F）**：仍**未复现**。修好 profile 复用陷阱后，夹具窗口在部分尝试里能
+  被 UIA 识别到（`DOCS=2`、5 个 Edit / 4 个页面 Edit，见 `docs` 下 §13 F 的现象记录），但子流程又被
+  同一组**与场景无关**的全套测试计时用例挡住（本次为
+  `glossary::...millisecond_range` 105.9/132.9 ms 与 `storage_bounds::...late_event_cannot_resurrect_it`
+  的 10 s 等待超时；两者在机器无额外负载时单独跑均通过）。结论保持：「浏览器只读未复现，只读行为
+  由原生目标覆盖」，不把浏览器子路径记为 PASS，也不谎报。
 
 ### 3.2 容量截断（40 字符夹具）
 
@@ -351,27 +365,31 @@ partial-result.txt,panel.txt,delivery.json,…}`、`device.log`。
 | --- | --- |
 | `scripts\verify-capsule.ps1` | +`-PackageRoot`/`-SherpaLib`/`-SenseVoiceModel`/`-SenseVoiceTokens`/`-SenseVoiceVad`/`-SenseVoiceLanguage`；引擎关键字不再被当路径；+引擎来源验收断言；失败态改为参数覆盖 |
 | `scripts\verify-panel.ps1` | 同上（此前完全没有引擎参数，只能跑云端默认） |
-| `scripts\verify-generic-editor.ps1` | 加 UTF-8 BOM 使 5.1 可解析；浏览器命令行加 `--force-renderer-accessibility`；清理按传入浏览器 exe 名过滤（`-Chrome` 支持任意 Chromium） |
-| `scripts\verify-native-target.ps1` | **新增**（第 1 段）：新包上的追加 + 重复停止、只读、40 字符容量截断、目标销毁 4 例 |
-| `scripts\verify-package-retry.ps1` | **新增**（第 1 段）：新包上的识别失败 → 重试 → 结果 → 清理 5 例（含坏模型对照） |
-| `scripts\verify-package-device.ps1` | **新增**（本段）：新包上的真实默认端点切换 → 中断 → 证据 → 恢复 3 个角色 |
+| `scripts\verify-generic-editor.ps1` | 加 UTF-8 BOM 使 5.1 可解析；浏览器命令行加 `--force-renderer-accessibility`；清理按传入浏览器 exe 名过滤（`-Chrome` 支持任意 Chromium）；不传 `-Profile` 时自动生成本次专用目录并在结束时删除（§13 F） |
+| `scripts\verify-native-target.ps1` | **新增**（第 1 段）：新包上的追加 + 重复停止、只读、40 字符容量截断、目标销毁 4 例；`-FixtureRoot` 默认改为 `scripts\fixtures`（§13 G） |
+| `scripts\verify-package-retry.ps1` | **新增**（第 1 段）：新包上的识别失败 → 重试 → 结果 → 清理 5 例（含坏模型对照）；`-FixtureRoot` 默认改为 `scripts\fixtures`（§13 G） |
+| `scripts\verify-package-device.ps1` | **新增**（本段）：新包上的真实默认端点切换 → 中断 → 证据 → 恢复 3 个角色；失败也写 `device-evidence.json`（§13 D）；`-FixtureRoot` 默认改为 `scripts\fixtures`（§13 G） |
+| `scripts\verify-listen-package.ps1` | +启动器冒烟（launcher smoke，§13 J）：通过暂存目录运行包内本地启动器，断言 `phase=Ready`、`recognition_mode=local`、`backend` 含 `SenseVoice q8` 与 `--control quit` 退出 |
 | `scripts\measure-long-session.ps1` | +`-PackageRoot`/`-SherpaLib`/`-SenseVoice*`，`-Engine sensevoice` 透传；metadata 记录 SenseVoice 文件哈希；`-Backend` 对 SenseVoice 忽略并注明 |
-| `app\listen\examples\long_session.rs` | +SenseVoice 引擎选择与参数（形状照抄应用），whisper 路径不变 |
+| `app\listen\examples\long_session.rs` | +SenseVoice 引擎选择与参数（形状照抄应用），whisper 路径不变；`--engine` 接受与应用相同的三个别名（§13 E） |
 
-两个新桌面脚本只依赖 git 忽略的既有夹具
-`E:\luyin\.artifacts\issue-11\accept\{AudioRoute.cs,PackageFixture.cs,ListenNativeQa.cs}`
-（`-FixtureRoot` 可改），不复制它们入库。
+三个新桌面脚本（`verify-native-target.ps1`、`verify-package-retry.ps1`、`verify-package-device.ps1`）
+原先只依赖 git 忽略的 `.artifacts\issue-11\accept\{PackageFixture.cs,ListenNativeQa.cs,AudioRoute.cs}`，
+干净检出无法运行。2026-11-24 复审把这三个 `.cs` **逐字节**复制进 `scripts\fixtures\`（该目录
+`README.md` 记录字节数与 SHA-256），并把三个脚本的 `-FixtureRoot` 默认值改为 `scripts\fixtures`
+（仍可用 `-FixtureRoot` 指回旧路径）；从仓库路径的实跑证据见 §13 G。
 
 ## 10. 偏差、限制与未覆盖
 
-1. **只读的浏览器子路径未复现**（§3.1）：Edge 下 3 次尝试，1 次走到子流程但被无关的全套测试计时
-   用例挡住，2 次卡在夹具窗口不可见；**没有任何场景断言失败**，但也没有通过记录。只读行为已由原生
-   EDIT 目标覆盖。
+1. **只读的浏览器子路径未复现**（§3.1）：Edge 下多次尝试，部分走到子流程但被无关的全套测试计时
+   用例挡住，部分卡在夹具窗口不可见；**没有任何场景断言失败**，但也没有通过记录。只读行为已由原生
+   EDIT 目标覆盖。复审重试的结论相同（§13 F）。
 2. **浏览器通道依赖 Edge + `--force-renderer-accessibility`**：本机 Chrome 157.0.8103.79 即使加该
    开关也不向 UIA 暴露渲染树；Edge 158.0.4370.33 加开关后正常。驱动的 `-Chrome` 默认值仍是 Chrome
    路径，跑浏览器夹具时需显式传 Edge 路径。这是特定版本的 Chromium 可访问性行为，未做跨版本矩阵。
-3. **浏览器夹具的稳定性**：同一 `-Profile` 目录在旧实例未退出时会被复用且丢失开关；必须每次用新
-   `-Profile`（§2.2 注记）。
+3. **浏览器夹具的稳定性**：同一 `-Profile` 目录在旧实例未退出时会被复用且丢失开关；2026-11-24
+   复审后驱动**不传 `-Profile` 时自动生成唯一目录并在结束时删除**，显式 `-Profile` 仍原样使用
+   （§2.2 注记、§13 F）；旧的手工「每次新 `-Profile`」不再是前提。
 4. **真实 DeepSeek API 往返未覆盖**（用户 2026-11-24 决定）：精修的两条桌面路径因此缺桌面级证据，
    只有应用层测试 + 不可用路径桌面证据（§7.3）。
 5. **“坏模型 → retry → Result”不可达**：坏模型是准备期失败，没有采集就没有保留音频；第 5 例把这一
@@ -425,3 +443,148 @@ partial-result.txt,panel.txt,delivery.json,…}`、`device.log`。
 | 胶囊 / 面板 / 托盘截图 | `capsule\*.png`、`panel\*.png`（含 `panel\tray-menu.png`） |
 
 以上 `.artifacts` 目录被 Git 忽略；仓库内的交付物是本文件与 `scripts\` 下的脚本。
+
+## 13. 2026-11-24 复审修复（分支 `fix/v02-review`）
+
+本节记录复审单里的 10 项修复与实跑证据。除注明外，证据目录都是 `.artifacts\issue-24-review\`
+（Git 忽略），交付包只用 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0` 的字节，没有重新打包、
+没有写回 `dist`。
+
+### A. `recognition_mode` 判定统一
+
+`scripts\verify-capsule.ps1` 过去把空值也算通过（`($recognitionMode -eq 'local') -or ($recognitionMode -eq '')`），
+而 `scripts\verify-panel.ps1` 要求严格 `-eq 'local'`。现在两者口径相同：SenseVoice/包内模式下
+**字段缺失或为空即 FAIL**，`backend` 必须含 `SenseVoice q8`。实测（包上重跑）：
+
+```
+PASS: status.txt reports recognition_mode=local (local)
+PASS: status.txt reports the resident SenseVoice backend (SenseVoice q8, resident (sherpa-onnx), CPU, 6 thread(s); …)
+```
+
+### B. UTF-8 BOM
+
+- `scripts\verify-panel.ps1`（第 802 行有中文字面量）原来首字节不是 `EF BB BF`，PowerShell 5.1 会按
+  ANSI 读取。用 `[IO.File]::WriteAllText($path,$text,(New-Object Text.UTF8Encoding($true)))` 写回，
+  首字节变为 `EF BB BF`，其余字节除本次内容改动外不变。
+- 扫描 `scripts\*.ps1`：只有 `verify-generic-editor.ps1` 与 `verify-panel.ps1` 含中文字面量；两者现在
+  都有 BOM（前者原本就有；复审期间被编辑器改写时再次丢过 BOM，已恢复）。其余 22 个脚本保持纯 ASCII、
+  无 BOM（脚本头部「ASCII only on purpose」）。
+- 所有改过的 `.ps1` 用 `[System.Management.Automation.Language.Parser]::ParseFile` 复检：0 语法错误
+  （在 Windows PowerShell 5.1 下运行，`$PSVersionTable.PSVersion = 5.1.26100.9818`）。
+
+### C. DLL 模块路径降级为诊断
+
+`Process.Modules` 里 `sherpa-onnx-c-api.dll` 的精确路径不再是 PASS/FAIL 条件：两个脚本把它写进证据
+JSON 的 `engine_module_diagnostic`（`expected_path` / `loaded_paths` / `exactly_the_expected_file` /
+`all_engine_modules`），引擎来源的验收断言只剩 `status.txt` 的 `recognition_mode` 与 `backend`。
+断言计数随之变化并已按实测更新：胶囊 **42 检查**（原 43）、面板 **45/45 验收 + 42/42 自检**（原 46 验收）。
+重跑输出：`Result: PASS (42 checks, 0 failures)`、`acceptance (control channel only): 45 of 45 passed`。
+胶囊重跑时把焦点的操作者自有 EDIT 目标放在前台，使结果按 `appended` 交付（与 §2.1 的原始记录同一交付
+路径，不写任何用户窗口）；证据 `capsule\capsule-verification.json`、`panel\panel-verification.json`、
+`capsule.log`、`panel.log`。
+
+### D. `verify-package-device.ps1` 失败也写证据
+
+主流程改为 `try/catch/finally`：`device-evidence.json` 先建骨架（`ok=false`、`error`、
+`checks_completed`），每完成一组检查就追加；`catch` 记录错误，`finally` 仍恢复默认端点并写
+`restore.json`，最后按 `$failure` 设置退出码。两条实跑：
+
+| 路径 | 结果 | 证据 |
+| --- | --- | --- |
+| 完整成功路径 | `ok=true`，10 项 `checks_completed`，`restore_verified=true`，端点回读 `耳机 (WH-1000XM4)` | `device\device-evidence.json`、`device\restore.json`、`device.log`（退出码 0） |
+| 强制失败路径（`-TimeoutSeconds 1`，在 Ready 前超时） | 打印 `FAIL Wait expired for phase Ready`，`ok=false`、`error` 有原文、`checks_completed` 含已完成项、`restore.json` 存在且 `restore_verified=true`，退出码 1 | `device-failure-path\device-evidence.json`、`device-failure-path\restore.json`、`device-failure-path.log` |
+
+### E. `long_session.rs` 引擎别名
+
+`app\listen\examples\long_session.rs` 的 `--engine` 现在与应用 `app\listen\src\launch.rs:139` 一致接受
+`sensevoice` / `sense-voice` / `sense_voice`（大小写不敏感），其它值仍是 whisper-cli 路径，
+`--model` / `--vad-model` / `--backend` 行为不变；`--help` 也列出三个别名。`-Task Test` 会编译
+example，`app\listen\target\debug\examples\long_session.exe` 构建成功。
+
+### F. `verify-generic-editor.ps1` 的 `-Profile` 复用陷阱（浏览器只读仍**未复现**）
+
+改动：
+- 未显式传 `-Profile` 时自动生成本次专用目录（`issue-4-profile-<yyyyMMdd-HHmmss>-<8 位随机>`），
+  结束时删除；显式传入的 `-Profile` 原样使用、不再删除（尊重调用者）。
+- 复审发现新 profile 还有第二个问题：Edge 会把**登录首启体验**盖在夹具页面上，页面永远不进 UIA
+  （现象：窗口标题已是夹具标题，但 `DOCS=0`、只有地址栏 1 个 Edit）。因此自动目录额外预置
+  `First Run` 与最小 `Default\Preferences`（`has_seen_signin_fre=true`、`has_seen_welcome_page=true`），
+  并在浏览器命令行加 `--disable-sync --disable-background-networking`。之后新 profile 能在几秒内
+  暴露夹具的三个具名 Edit。
+
+实跑（`-Target plain -Scenario readonly -Chrome <Edge 158>`，串行，前后无其它 Listen/音频测试）：
+
+| 尝试 | 结果 | 现象 |
+| --- | --- | --- |
+| 1（仅唯一目录） | 失败 | `The owned fixture window did not appear`：UIA 只看到 `DOCS=0`、1 个页面 Edit（Edge 登录首启页盖住夹具） |
+| 2–3（预置 profile） | 夹具窗口可识别，子流程被无关用例挡住 | `glossary::...millisecond_range` 105.9 ms / 132.9 ms > 100 ms 预算 |
+| 4（+ 关闭 sync/后台网络） | 夹具窗口可识别（测试进程数秒内启动） | 计时用例通过（82.7 ms），但 `storage_bounds::...late_event_cannot_resurrect_it` 在 10 s 等待上超时 |
+
+**结论**：浏览器只读**仍未复现**；没有任何一次场景断言失败，阻塞点都是**与场景无关**的全套测试
+计时用例在浏览器负载下抖动（这些用例单独跑 `-Task Test` 是 306 passed / 0 failed）。因此保持
+「浏览器只读未复现、只读行为由原生目标覆盖」的结论，不记 PASS。证据：`browser-readonly.log`、
+`edge-desktop.png`（夹具页面被首启遮罩时的桌面截图）、`probe-edge-tree.ps1`、`probe-nosync.ps1`。
+
+### G. 验收夹具入库
+
+`scripts\fixtures\` 新增 `PackageFixture.cs`、`ListenNativeQa.cs`、`AudioRoute.cs`（与
+`.artifacts\issue-11\accept\` 下同名文件逐字节相同，SHA-256 见该目录 `README.md`）与说明。三个脚本的
+`-FixtureRoot` 默认值改为 `scripts\fixtures`，仍可用 `-FixtureRoot` 指回旧路径。从仓库路径实跑：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-native-target.ps1 `
+  -PackageRoot E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0 `
+  -Output E:\luyin\.artifacts\issue-24-review\native-target
+```
+
+结果：退出码 **0**，4 例全 PASS（追加 + 重复 stop、只读、40 字符截断、目标销毁），
+`target-evidence.json` 里 `fixture_root = …\review-fixes\scripts\fixtures`，`result = PASS`。
+
+### H. `docs\issue-22-recording-guide.md` 的过时命令
+
+「跑基准」两段命令换成 `docs\issue-22-verification.md`「测量方法」里的当前命令（whisper 显式
+`whisper-cli.exe` + `--backend host`；SenseVoice `--engine sensevoice` + 四个路径 +
+`--sensevoice-language auto`），`-Corpus` 指向 `recording\manifest.json`，并说明两条都必须显式传引擎
+参数。已实测数字（66.4% / 75.8%、6,812 / 952 ms 等）一字未改。
+
+### I. 许可证哈希的换行口径
+
+`packaging\THIRD-PARTY-NOTICES.md` 与 `docs\issue-23-verification.md` 改成事实口径：`core.autocrlf=true`
+来自**本机 Git 系统级配置**（`git config --system core.autocrlf` = `true`；`--local`/`--global` 均未设置），
+仓库**没有** `.gitattributes`；因此换机器检出可能得到 CRLF，而许可证哈希按 **LF** 计算。未新增
+`.gitattributes`，未做全仓换行改写。
+
+### J. `verify-listen-package.ps1` 启动器冒烟
+
+新增 `-SkipLauncherSmoke`（默认在 `included_models=true` 的包上启用）。步骤：创建本次专用 staging
+目录（`<Runtime>\launcher-smoke-<guid>`，由脚本创建；`listen.exe`/`libunwind.dll`/`glossary.txt`
+复制、`engine`/`models` 用目录联接指向包内），把**逐字节相同**的本地启动器复制进去并用
+`cmd.exe /c ""…""` 运行（包内启动器固定 `--runtime "%~dp0runtime"`，直接跑会写进交付目录），等待
+`status.txt` 出现 `phase=Ready` + `recognition_mode=local` + `backend` 含 `SenseVoice q8`，再
+`--control quit` 并断言进程退出；包目录前后快照必须不变。`-IncludeModels=false` 的包跳过并记录原因。
+
+实跑（交付件的逐字节副本，去掉 #23 遗留的 `runtime\`，见下）：
+
+```
+PASS launcher smoke: 启动 Listen 本地备用.cmd started listen.exe, phase=Ready, recognition_mode=local, backend=SenseVoice q8, …
+```
+
+证据 `package-evidence.json` 的 `launcher_smoke`：`staged_launcher_identical=true`、
+`staging_created_by_script=true`、`runtime_inside_staging=true`、`package_untouched=true`、
+`launcher_exit_code=0`、`phase=Ready`、`recognition_mode=local`、
+`exited_after_control_quit=true`、`request_to_ready_ms=1876`；同次运行的包检查
+`hashes_verified=19`、`pinned_hashes_verified=5`、`cloud_paid_requests=0`。证据 `package-verify.log`。
+
+> 为什么用副本跑：交付目录 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0` 里有 #23 遗留的
+> `runtime\`（本文件开头已记录），包检查会按设计拒绝 `runtime` 目录；本单**没有**删除或改写交付目录，
+> 而是用 robocopy 复制出 21 文件 / 264,881,704 B 的逐字节副本（不含该遗留目录）再验证。重打包与
+> 清理由下一个交付件重建负责。
+
+### 测试与格式（复审复跑）
+
+- `.\scripts\build-listen.ps1 -Task Test`：**306 passed / 0 failed / 16 ignored**（第一次跑时
+  `glossary::...millisecond_range` 以 100.36 ms 超预算失败一次，重跑全绿；该用例是本文件 §10.10
+  已记录的负载敏感用例，未改动）。日志 `.artifacts\review-fixes-test2.log`。
+- `.\scripts\build-listen.ps1 -Task CheckFormat`：无输出，退出码 0。
+- example 编译：`long_session.exe`（debug profile，`-Task Test` 一并构建）成功，别名改动不改变
+  whisper 路径行为。

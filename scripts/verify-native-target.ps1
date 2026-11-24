@@ -56,7 +56,9 @@ $artifacts = Join-Path $sharedRoot '.artifacts'
 
 $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 $Output = [IO.Path]::GetFullPath($Output)
-if (-not $FixtureRoot) { $FixtureRoot = Join-Path $artifacts 'issue-11\accept' }
+# The fixtures are repository content (scripts\fixtures), so a clean checkout can run this
+# script; -FixtureRoot still overrides it, e.g. for the old .artifacts copy.
+if (-not $FixtureRoot) { $FixtureRoot = Join-Path $repoRoot 'scripts\fixtures' }
 $FixtureRoot = [IO.Path]::GetFullPath($FixtureRoot)
 if (-not $AudioClip) {
     foreach ($candidate in @((Join-Path $artifacts 'issue-2-integration\source-a.wav'), (Join-Path $artifacts 'asr-quality-probe\zh-term.wav'))) {

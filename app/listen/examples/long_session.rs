@@ -176,7 +176,7 @@ fn run() -> AppResult<()> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "long_session --input <16k-mono-PCM16.wav> --runtime <directory>\n  SenseVoice: --engine sensevoice --sherpa-lib <directory> --sensevoice-model <model.int8.onnx> --sensevoice-tokens <tokens.txt> --sensevoice-vad <silero_vad.onnx> [--sensevoice-language auto]\n  Whisper:    --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--backend host|cli]\n  Common:     [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
+                "long_session --input <16k-mono-PCM16.wav> --runtime <directory>\n  SenseVoice: --engine sensevoice|sense-voice|sense_voice --sherpa-lib <directory> --sensevoice-model <model.int8.onnx> --sensevoice-tokens <tokens.txt> --sensevoice-vad <silero_vad.onnx> [--sensevoice-language auto]\n  Whisper:    --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--backend host|cli]\n  Common:     [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
             );
             return Ok(());
         }
@@ -230,9 +230,19 @@ fn run() -> AppResult<()> {
         config,
     };
     // `--engine sensevoice` selects the resident engine exactly like the application's
-    // command line; anything else is a whisper-cli path (the historical shape).
+    // command line; anything else is a whisper-cli path (the historical shape). The
+    // application accepts three spellings of that name (launch.rs `--engine`:
+    // sensevoice | sense-voice | sense_voice); the harness accepts the same three so a
+    // name that works with listen.exe cannot silently become a whisper-cli path here.
     let engine = engine.ok_or("--engine is required")?;
-    let transcriber: Arc<dyn LocalTranscriber> = if engine.to_str() == Some("sensevoice") {
+    let sense_voice = engine
+        .to_str()
+        .map(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            name == "sensevoice" || name == "sense-voice" || name == "sense_voice"
+        })
+        .unwrap_or(false);
+    let transcriber: Arc<dyn LocalTranscriber> = if sense_voice {
         Arc::new(SenseVoice::new(
             sherpa_lib.ok_or("--sherpa-lib is required for --engine sensevoice")?,
             sensevoice_model.ok_or("--sensevoice-model is required for --engine sensevoice")?,

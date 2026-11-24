@@ -275,9 +275,10 @@ New-NetFirewallRule -DisplayName "Listen offline acceptance <stamp> listen.exe" 
   Corporation`。差异只在版权行年份，MIT 正文一致。这一点写进了
   `THIRD-PARTY-NOTICES.md`，不冒充“逐字节等于上游 main”。
 - 上述三个哈希对应**LF 换行**的文本（包内就是这一形式，已复核：5306/11358/1073 B 且 CR=0）。
-  仓库配置 `core.autocrlf=true`，重新检出后这些 `.txt` 在工作树里是 CRLF，字节与哈希会不同
-  （只差行尾）；用检出后的工作树重新打包时，应以包内文件重新计算哈希。`THIRD-PARTY-NOTICES.md`
-  里也写了同一句提醒。
+  换行口径来自**本机 Git 的系统级配置**（`git config --system core.autocrlf` 为 `true`），
+  仓库本身没有 `.gitattributes`；换一台机器重新检出后这些 `.txt` 在工作树里可能变成 CRLF，
+  字节与哈希会不同（只差行尾）。哈希一律按 LF 计算；用检出后的工作树重新打包时，应以包内
+  文件重新计算哈希。`THIRD-PARTY-NOTICES.md` 里也写了同一句提醒。
 
 ### 6.3 验证脚本断言
 

@@ -58,7 +58,9 @@ $artifacts = Join-Path $sharedRoot '.artifacts'
 
 $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 $Output = [IO.Path]::GetFullPath($Output)
-if (-not $FixtureRoot) { $FixtureRoot = Join-Path $artifacts 'issue-11\accept' }
+# The fixtures are repository content (scripts\fixtures), so a clean checkout can run this
+# script; -FixtureRoot still overrides it, e.g. for the old .artifacts copy.
+if (-not $FixtureRoot) { $FixtureRoot = Join-Path $repoRoot 'scripts\fixtures' }
 $FixtureRoot = [IO.Path]::GetFullPath($FixtureRoot)
 if (-not $PlaybackWav) {
     foreach ($candidate in @((Join-Path $artifacts 'issue-2-integration\source-a.wav'), (Join-Path $artifacts 'issue-6-smoke\loop-96s.wav'))) {
@@ -190,6 +192,24 @@ function Save-Screen([string]$Path) {
     }
 }
 
+# The evidence object is filled in as the checks complete, so a failure still leaves a
+# device-evidence.json with ok=false, the error and the checks that did pass, exactly
+# like verify-package-retry.ps1 and verify-native-target.ps1 do.
+$evidence = [ordered]@{
+    captured_utc = [DateTime]::UtcNow.ToString('o')
+    ok = $false
+    error = $null
+    package_root = $PackageRoot
+    binary = $binary
+    runtime = $runtime
+    playback_wav = $PlaybackWav
+    engine = 'sensevoice'
+    oracle = '--control start/quit plus runtime\status.txt, current-result.txt and delivery.json; no window class or control id is used as evidence'
+    checks_completed = [Collections.Generic.List[string]]::new()
+}
+$failure = ''
+function Complete-Check([string]$Name) { $evidence.checks_completed.Add($Name) }
+
 try {
     if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $runtime | Out-Null
@@ -222,6 +242,9 @@ try {
     [IO.File]::WriteAllText((Join-Path $Output 'original-endpoints.json'), ($originalRecord | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
     Write-Output ('ORIGINAL multimedia=' + $originalMm.ToString())
     Write-Output ('SWITCH TARGET=' + $switch.ToString())
+    $evidence.original_endpoints = $originalRecord
+    $evidence.switched_endpoint = Endpoint-Json $switch
+    Complete-Check 'original default multimedia/communications/console endpoints captured'
 
     # ---- start the packaged local engine -------------------------------
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -237,6 +260,12 @@ try {
     if ((Get-Field 'recognition_mode') -ne 'local') { throw ('The run is not on the local engine: ' + (Get-Field 'recognition_mode')) }
     if ((Get-Field 'backend') -notmatch 'SenseVoice q8') { throw ('The SenseVoice backend is not reported: ' + (Get-Field 'backend')) }
     Write-Output ('Ready: ' + (Get-Field 'backend'))
+    $evidence.engine_ready = [ordered]@{
+        recognition_mode = (Get-Field 'recognition_mode')
+        backend = (Get-Field 'backend')
+        preparation = (Get-Field 'preparation')
+    }
+    Complete-Check 'packaged local engine ready: recognition_mode=local and backend names SenseVoice q8'
 
     [PackageFixture]::Start()
     $fixtureStarted = $true
@@ -256,10 +285,14 @@ try {
     if ((Get-Field 'endpoint_role') -notmatch 'multimedia') {
         throw ('The capture does not report a multimedia endpoint role: ' + (Get-Field 'endpoint_role'))
     }
+    $evidence.capturing_status = $capturing
+    Complete-Check 'capture started on the original default multimedia endpoint'
     [AudioRoute]::StartPlayback($originalMm.Id, $PlaybackWav)
     Start-Sleep -Seconds 3
     $switched = Set-Default $switch.Id 1 'multimedia'
     Write-Output ('SWITCHED multimedia=' + $switched.ToString())
+    $evidence.switched_live = Endpoint-Json $switched
+    Complete-Check ('default multimedia endpoint switched to ' + $switch.Name + ' while capturing')
 
     $failureText = Wait-Phase 'Failure'
     $playbackDone = [AudioRoute]::WaitPlayback(30000)
@@ -278,6 +311,10 @@ try {
     if ($detail -notmatch 'changed during capture|AUDCLNT_E_DEVICE_INVALIDATED') {
         throw ('The interruption reason is not explicit: ' + $detail)
     }
+    $evidence.failure_status = $failureText
+    $evidence.failure_detail = $detail
+    $evidence.phase_sequence = @('Ready', 'Capturing', 'Failure')
+    Complete-Check 'capture interrupted with Failure naming both endpoints and marked incomplete'
     # It must not have adopted the new default endpoint as the capture source.
     if ((Get-Field 'endpoint_id') -ne $originalMm.Id) {
         throw ('status.txt no longer names the original endpoint after the switch: ' + (Get-Field 'endpoint_id'))
@@ -294,6 +331,7 @@ try {
             throw ('The interrupted run followed the new default endpoint: ' + $Matches[1])
         }
     } until ([DateTime]::UtcNow -gt $settle)
+    Complete-Check 'the interrupted run stayed on Failure and did not follow the new default for 3 s'
 
     # The already received audio has to survive the interruption.
     $retained = Get-Field 'retained_audio'
@@ -302,16 +340,29 @@ try {
     if (-not $retained -and $partial.Count -eq 0 -and $wavs.Count -eq 0) {
         throw 'Neither retained audio nor a checkpoint survived the device interruption.'
     }
+    $evidence.retained_audio = $retained
+    $evidence.partial_result_files = @($partial | ForEach-Object { $_.FullName })
+    $evidence.spooled_wav_files = @($wavs | ForEach-Object { $_.FullName })
+    Complete-Check 'already received audio or a checkpoint survived the interruption'
     # A device interruption is not a recognition failure: no local retry offer.
     if ((Get-Field 'retry_available') -ne 'false') {
         throw 'A device interruption incorrectly offered a recognition retry.'
     }
+    $evidence.retry_available = 'false'
+    Complete-Check 'a device interruption did not offer a recognition retry'
     if ((Read-Text $resultPath) -cne $sentinel) { throw 'The interrupted capture overwrote the previous current result.' }
+    $evidence.previous_current_result_unchanged = $true
     Assert-Equal (Read-Target) $initialTarget 'Target after the device interruption'
     Assert-Equal (Read-Neighbor) $initialNeighbor 'Neighbour after the device interruption'
     Assert-Equal (Read-Other) $initialOther 'Other window after the device interruption'
+    $evidence.target_unchanged = $true
+    $evidence.neighbour_unchanged = $true
+    $evidence.other_window_unchanged = $true
     if ([PackageFixture]::Sends -ne 0) { throw 'An automatic send action occurred.' }
     if ([PackageFixture]::ReturnKeys -ne 0) { throw 'An automatic Enter key action occurred.' }
+    $evidence.automatic_send_count = [PackageFixture]::Sends
+    $evidence.enter_key_count = [PackageFixture]::ReturnKeys
+    Complete-Check 'previous result, target, neighbour and other window unchanged; no automatic send or Enter'
 
     # Visual evidence only: expand the panel so the same reason is visible, and record
     # whether the panel text repeats it. No assertion depends on the panel layout.
@@ -319,40 +370,22 @@ try {
     Start-Sleep -Milliseconds 900
     Save-Screen (Join-Path $Output 'device-panel.png')
     $panel = Read-Text (Join-Path $runtime 'panel.txt')
+    $evidence.panel_visible = (Get-Field 'panel_visible')
+    $evidence.panel_mentions_incomplete = ($panel -match 'incomplete')
+    $evidence.panel_excerpt = @(($panel -split "`n") | Where-Object { $_ -match 'incomplete|changed during capture' } | Select-Object -First 2)
+    $evidence.screenshots = @((Join-Path $Output 'device-failure.png'), (Join-Path $Output 'device-panel.png'))
+    Complete-Check 'the expanded panel shows the same interruption reason'
 
-    $evidence = [ordered]@{
-        captured_utc = [DateTime]::UtcNow.ToString('o')
-        package_root = $PackageRoot
-        binary = $binary
-        runtime = $runtime
-        playback_wav = $PlaybackWav
-        engine = 'sensevoice'
-        oracle = '--control start/quit plus runtime\status.txt, current-result.txt and delivery.json; no window class or control id is used as evidence'
-        original_endpoints = $originalRecord
-        switched_endpoint = Endpoint-Json $switch
-        capturing_status = $capturing
-        failure_status = $failureText
-        failure_detail = $detail
-        phase_sequence = @('Ready', 'Capturing', 'Failure')
-        incomplete_marked = $true
-        followed_new_default = $false
-        retained_audio = $retained
-        partial_result_files = @($partial | ForEach-Object { $_.FullName })
-        spooled_wav_files = @($wavs | ForEach-Object { $_.FullName })
-        previous_current_result_unchanged = $true
-        target_unchanged = $true
-        neighbour_unchanged = $true
-        other_window_unchanged = $true
-        retry_available = (Get-Field 'retry_available')
-        panel_visible = (Get-Field 'panel_visible')
-        panel_mentions_incomplete = ($panel -match 'incomplete')
-        panel_excerpt = @(($panel -split "`n") | Where-Object { $_ -match 'incomplete|changed during capture' } | Select-Object -First 2)
-        screenshots = @((Join-Path $Output 'device-failure.png'), (Join-Path $Output 'device-panel.png'))
-        automatic_send_count = [PackageFixture]::Sends
-        enter_key_count = [PackageFixture]::ReturnKeys
-    }
-    [IO.File]::WriteAllText((Join-Path $Output 'device-evidence.json'), ($evidence | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $evidence.ok = $true
     Write-Output 'PASS real default-endpoint switch: interrupted with both endpoint identities, marked incomplete, received audio preserved, previous result and target unchanged.'
+}
+catch {
+    # A failed run must still leave its evidence behind, like the other #24 desktop
+    # scripts: ok=false, the error and the checks that did complete.
+    $failure = $_.Exception.Message
+    $evidence.ok = $false
+    $evidence.error = $failure
+    Write-Output ('FAIL ' + $failure)
 }
 finally {
     if ($null -ne $app -and -not $app.HasExited) {
@@ -379,4 +412,10 @@ finally {
     }
     [IO.File]::WriteAllText((Join-Path $Output 'restore.json'), ($restore | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
     if (-not $restoreVerified) { Write-Warning 'The original multimedia endpoint was not verified after restore.' }
+    # The evidence is written after the restore so a failed run records both the
+    # completed checks and the endpoint restore in one file.
+    $evidence.restore = $restore
+    [IO.File]::WriteAllText((Join-Path $Output 'device-evidence.json'), ($evidence | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    Write-Output ('Evidence: ' + (Join-Path $Output 'device-evidence.json'))
 }
+if ($failure) { exit 1 }

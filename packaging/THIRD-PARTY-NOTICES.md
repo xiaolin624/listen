@@ -62,10 +62,11 @@ Get-FileHash .\licenses\sherpa-onnx-LICENSE.txt -Algorithm SHA256
 Get-FileHash .\licenses\onnxruntime-LICENSE.txt -Algorithm SHA256
 ```
 
-上表数值对应**以 LF 换行保存**的字节（本包内就是这一形式）。本仓库配置了
-`core.autocrlf=true`，从 Git 重新检出后这些 `.txt` 在工作树里会变成 CRLF，字节数与哈希随之
-不同——只有行尾不同，条款文字不变。如果你用检出后的工作树重新打包，请以**包内文件**重新计算
-哈希，不要拿上表去核对 CRLF 版本。
+上表数值对应**以 LF 换行保存**的字节（本包内就是这一形式）。换行口径来自**本机 Git 的系统级
+配置**：`git config --system core.autocrlf` 为 `true`；本仓库没有 `.gitattributes`，也不会把行尾
+规范化写进仓库。换一台机器重新检出时，这些 `.txt` 在工作树里可能变成 CRLF，字节数与哈希随之
+不同——只有行尾不同，条款文字不变。上表与包内哈希一律按 **LF** 计算；如果你用检出后的工作树
+重新打包，请以**包内文件**重新计算哈希，不要拿上表去核对 CRLF 版本。
 
 ## 5. 已移除的组件
 

@@ -70,25 +70,30 @@
 
 录音完成后，同一个 manifest 会同时用于两个引擎。默认结果写入 `.artifacts\meeting-corpus-bench\<engine>.json`。
 
-whisper（显式启动参数）：
+两条命令都**必须显式传引擎参数**：`#40` 之后不带 `--engine` 会启动云端试用默认，结果却仍被标成
+`sensevoice`。下面是 2026-11-24 实测通过的当前命令，与
+[issue-22-verification.md](issue-22-verification.md)「测量方法」一致；`-Corpus` 指向你要跑的那份
+`manifest.json`（本次复用的是 `.artifacts\cloud-evaluation\recording\manifest.json`）。
+
+whisper（显式 whisper-cli 路径 + host 后端）：
 
 ```powershell
 cd E:\luyin
 .\scripts\benchmark-meeting-corpus.ps1 `
-  -Corpus .artifacts\meeting-corpus `
+  -Corpus .artifacts\cloud-evaluation\recording\manifest.json `
   -Runtime .artifacts\meeting-bench\whisper-runtime `
   -Engine whisper `
-  -ListenArgs @('--engine', "$PWD\.tools\whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe", '--model', "$PWD\.tools\models\ggml-small.bin", '--vad-model', "$PWD\.tools\models\ggml-silero-v5.1.2.bin", '--backend', 'host')
+  -ListenArgs @('--engine',"$PWD\.tools\whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe",'--model',"$PWD\.tools\models\ggml-small.bin",'--vad-model',"$PWD\.tools\models\ggml-silero-v5.1.2.bin",'--backend','host','--threads','6','--glossary',"$PWD\.artifacts\cloud-evaluation\frozen-v1-20261115-125129\glossary.txt",'--hidden')
 ```
 
-SenseVoice（**#17 合并后**，默认参数；具体 flag 以 #17 为准）：
+SenseVoice（`--engine sensevoice` + 四个本地引擎路径）：
 
 ```powershell
 .\scripts\benchmark-meeting-corpus.ps1 `
-  -Corpus .artifacts\meeting-corpus `
+  -Corpus .artifacts\cloud-evaluation\recording\manifest.json `
   -Runtime .artifacts\meeting-bench\sensevoice-runtime `
   -Engine sensevoice `
-  -ListenArgs @()
+  -ListenArgs @('--engine','sensevoice','--sherpa-lib',"$PWD\.tools\sherpa-onnx\sherpa-onnx-v2.0.1-win-x64-shared-MT-Release\lib",'--sensevoice-model',"$PWD\.tools\models\sense-voice\model.int8.onnx",'--sensevoice-tokens',"$PWD\.tools\models\sense-voice\tokens.txt",'--sensevoice-vad',"$PWD\.tools\models\sense-voice\silero_vad.onnx",'--sensevoice-language','auto','--threads','6','--glossary',"$PWD\.artifacts\cloud-evaluation\frozen-v1-20261115-125129\glossary.txt",'--hidden')
 ```
 
 说明：
@@ -120,7 +125,3 @@ SenseVoice（**#17 合并后**，默认参数；具体 flag 以 #17 为准）：
 
 Gate decision: **继续替换**。中文准确率与停止延迟两项判据都明显占优；专名召回与纯英文段是
 需要随替换一起带走的已知限制。
-
-> 注意：本指南「跑基准」一节里 SenseVoice 的 `-ListenArgs @()` 写法已过时。那是 #40 之前的
-> 默认值；今天不带 `--engine sensevoice` 会启动云端试用路径，而结果文件仍被标成 `sensevoice`。
-> 现存命令见 [issue-22-verification.md](issue-22-verification.md)「测量方法」。

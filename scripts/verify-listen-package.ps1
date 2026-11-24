@@ -3,7 +3,8 @@ param(
     [string]$Runtime = '',
     [string]$Evidence = '',
     [int]$TimeoutSeconds = 90,
-    [switch]$SkipHash
+    [switch]$SkipHash,
+    [switch]$SkipLauncherSmoke
 )
 # Check a packaged Listen directory, then start it through the daily cloud default
 # and through the explicitly labelled local fallback.
@@ -14,6 +15,12 @@ param(
 # without starting a capture. The local fallback launch must report a local backend
 # when models are included and an explicit model error when they are not. No real
 # key is read, no paid request is sent, and the ledger must stay empty.
+#
+# On a package with models the script also runs a launcher smoke (skip it with
+# -SkipLauncherSmoke): the packaged local launcher is started once from a staging
+# directory this script creates, its status.txt must reach Ready with
+# recognition_mode=local and the resident SenseVoice q8 backend, and --control quit
+# must end the process. Nothing is written into the delivered package.
 #
 # The guard checks fail the package if it contains key material, test audio/private
 # runtime data or host-specific test-environment paths. It never replaces or closes
@@ -662,6 +669,159 @@ if ($cloudPaidRequests -ne 0) {
     throw ('The package cloud check reserved a paid request (' + $cloudPaidRequests + ' attempts).')
 }
 
+# --- launcher smoke: the packaged local launcher must really start Listen -----
+# The checks above prove the launcher scripts *name* the right arguments. This step
+# proves the shipped local launcher actually starts the shipped binary: it runs the
+# launcher once, waits for its status.txt to say Ready with recognition_mode=local and
+# the resident SenseVoice backend, then quits through --control and checks the process
+# exited. The shipped launcher fixes `--runtime "%~dp0runtime"`, which would write into
+# the delivered directory, so the smoke runs from a staging directory this script
+# creates: a byte-identical copy of the launcher plus copies of listen.exe,
+# libunwind.dll and glossary.txt, directory junctions for engine and models, and a
+# runtime directory created under the staging root. Nothing is written into the
+# package; the package tree is snapshotted before and after and must be unchanged.
+$launcherSmoke = [ordered]@{
+    enabled = $false
+    skipped = $true
+    reason = ''
+}
+if (-not $manifest.included_models) {
+    $launcherSmoke.reason = 'the package does not include models, so its local launcher refuses to start by design'
+}
+elseif ($SkipLauncherSmoke) {
+    $launcherSmoke.reason = 'skipped with -SkipLauncherSmoke'
+}
+else {
+    $launcherName = [string]$manifest.local_fallback.launcher
+    $launcherPath = Join-Path $PackageRoot $launcherName
+    if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+        throw ('The packaged local launcher is missing: ' + $launcherPath)
+    }
+    $smokeRoot = Join-Path $Runtime ('launcher-smoke-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $smokeRoot) { throw ('The staging directory already exists: ' + $smokeRoot) }
+    $packageBefore = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force |
+            ForEach-Object { $_.FullName.Substring($PackageRoot.Length + 1) + '|' + $_.Length + '|' + $_.LastWriteTimeUtc.Ticks })
+    New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+    $stagingCreated = Test-Path -LiteralPath $smokeRoot -PathType Container
+    Copy-Item -LiteralPath $launcherPath -Destination (Join-Path $smokeRoot $launcherName) -Force
+    foreach ($stagedFile in @('listen.exe', 'libunwind.dll', 'glossary.txt')) {
+        Copy-Item -LiteralPath (Join-Path $PackageRoot $stagedFile) -Destination (Join-Path $smokeRoot $stagedFile) -Force
+    }
+    foreach ($stagedDirectory in @('engine', 'models')) {
+        New-Item -ItemType Junction -Path (Join-Path $smokeRoot $stagedDirectory) -Target (Join-Path $PackageRoot $stagedDirectory) | Out-Null
+    }
+    $launcherSha = (Get-FileHash -LiteralPath $launcherPath -Algorithm SHA256).Hash
+    $stagedLauncherSha = (Get-FileHash -LiteralPath (Join-Path $smokeRoot $launcherName) -Algorithm SHA256).Hash
+    if ($launcherSha -ne $stagedLauncherSha) { throw 'The staged launcher is not byte-identical to the packaged launcher.' }
+    Write-Output ('Launcher smoke staging: ' + $smokeRoot)
+
+    $smokeStarted = [DateTime]::UtcNow
+    $smokeLauncherInfo = [Diagnostics.ProcessStartInfo]::new()
+    $smokeLauncherInfo.FileName = 'cmd.exe'
+    # The doubled outer quotes are cmd's documented form for running a quoted path that
+    # contains spaces: cmd strips one pair and executes the remaining quoted path.
+    $smokeLauncherInfo.Arguments = '/c ""' + (Join-Path $smokeRoot $launcherName) + '""'
+    $smokeLauncherInfo.WorkingDirectory = $smokeRoot
+    $smokeLauncherInfo.UseShellExecute = $false
+    $smokeLauncherInfo.CreateNoWindow = $true
+    $launcherProcess = [Diagnostics.Process]::Start($smokeLauncherInfo)
+    try {
+        if (-not $launcherProcess.WaitForExit(30000)) { throw 'The packaged local launcher did not exit within 30 seconds.' }
+        $launcherExit = $launcherProcess.ExitCode
+    }
+    finally { $launcherProcess.Dispose() }
+    if ($launcherExit -ne 0) { throw ('The packaged local launcher failed (exit ' + $launcherExit + ').') }
+
+    $smokeRuntime = Join-Path $smokeRoot 'runtime'
+    $smokeStatusPath = Join-Path $smokeRuntime 'status.txt'
+    $smokeStatus = ''
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $smokeStatusPath -PathType Leaf) {
+            $text = Read-Status $smokeStatusPath
+            if ($text -match '(?m)^phase=Ready\r?$') { $smokeStatus = $text; break }
+            if ($text -match '(?m)^phase=Failure\r?$') {
+                throw ('The launcher-started Listen reported Failure:' + [Environment]::NewLine + $text)
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $smokeStatus) { throw ('The launcher-started Listen did not report Ready within ' + $TimeoutSeconds + ' seconds.') }
+    $smokeReadyMs = [int]([DateTime]::UtcNow - $smokeStarted).TotalMilliseconds
+    $smokeMode = Get-StatusField $smokeStatus 'recognition_mode'
+    $smokeBackend = Get-StatusField $smokeStatus 'backend'
+    if ($smokeMode -ne 'local') {
+        throw ('The launcher-started Listen did not report recognition_mode=local:' + [Environment]::NewLine + $smokeStatus)
+    }
+    if ($smokeBackend -notmatch 'SenseVoice q8') {
+        throw ('The launcher-started Listen did not report the resident SenseVoice q8 backend: ' + $smokeBackend)
+    }
+    $smokePid = Get-StatusField $smokeStatus 'process_id'
+    $smokeProcess = if ($smokePid -match '^\d+$') { Get-Process -Id ([int]$smokePid) -ErrorAction SilentlyContinue } else { $null }
+    if ($null -eq $smokeProcess) { throw ('The launcher-started listen.exe is not running (process_id=' + $smokePid + ').') }
+    $smokeProcessPath = ''
+    try { $smokeProcessPath = $smokeProcess.Path } catch { }
+    $expectedSmokeExe = Join-Path $smokeRoot 'listen.exe'
+    if ([string]::Compare($smokeProcessPath, $expectedSmokeExe, [StringComparison]::OrdinalIgnoreCase) -ne 0) {
+        throw ('The launcher started a different executable: ' + $smokeProcessPath)
+    }
+    # Leave through the documented control command, exactly as a user would.
+    $quitControl = New-ControlProcess 'quit'
+    try {
+        if (-not $quitControl.WaitForExit(15000)) { throw 'The launcher smoke quit control did not exit within 15 seconds.' }
+        if ($quitControl.ExitCode -ne 0) { throw ('The launcher smoke did not accept --control quit (exit ' + $quitControl.ExitCode + ').') }
+    }
+    finally {
+        if (-not $quitControl.HasExited) { try { $quitControl.Kill() } catch { } }
+        $quitControl.Dispose()
+    }
+    if (-not $smokeProcess.WaitForExit(15000)) { throw 'The launcher-started listen.exe did not exit after --control quit.' }
+    # A Process object obtained from Get-Process does not expose the exit code after
+    # exit on this host, so the contract asserted here is termination; the code is
+    # recorded when the runtime does expose it.
+    $smokeExit = $null
+    try { $smokeExit = $smokeProcess.ExitCode } catch { $smokeExit = $null }
+    $smokeProcess.Dispose()
+    if ($null -ne $smokeExit -and $smokeExit -ne 0) {
+        throw ('The launcher-started listen.exe exited with ' + $smokeExit + ' after --control quit.')
+    }
+    if (@(Get-Process -Name listen -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw 'A Listen process is still running after the launcher smoke.'
+    }
+    $packageAfter = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force |
+            ForEach-Object { $_.FullName.Substring($PackageRoot.Length + 1) + '|' + $_.Length + '|' + $_.LastWriteTimeUtc.Ticks })
+    $packageChanges = @(Compare-Object -ReferenceObject $packageBefore -DifferenceObject $packageAfter)
+    if ($packageChanges.Count -ne 0) {
+        throw ('The launcher smoke wrote into the package directory: ' + (($packageChanges | ForEach-Object { [string]$_.InputObject }) -join ', '))
+    }
+    $launcherSmoke = [ordered]@{
+        enabled = $true
+        skipped = $false
+        reason = ''
+        launcher = $launcherPath
+        launcher_sha256 = $launcherSha
+        staged_launcher = (Join-Path $smokeRoot $launcherName)
+        staged_launcher_sha256 = $stagedLauncherSha
+        staged_launcher_identical = ($launcherSha -eq $stagedLauncherSha)
+        staging_root = $smokeRoot
+        staging_created_by_script = $stagingCreated
+        runtime = $smokeRuntime
+        runtime_inside_staging = $smokeRuntime.StartsWith($smokeRoot, [StringComparison]::OrdinalIgnoreCase)
+        package_untouched = ($packageChanges.Count -eq 0)
+        launcher_exit_code = $launcherExit
+        phase = 'Ready'
+        request_to_ready_ms = $smokeReadyMs
+        recognition_mode = $smokeMode
+        backend = $smokeBackend
+        process_id = [int]$smokePid
+        process_path = $smokeProcessPath
+        exited_after_control_quit = $true
+        exit_code = $smokeExit
+        exit_code_observed = ($null -ne $smokeExit)
+    }
+    Write-Output ('PASS launcher smoke: ' + $launcherName + ' started listen.exe, phase=Ready, recognition_mode=local, backend=' + $smokeBackend)
+}
+
 $summary = [ordered]@{
     checked_utc              = [DateTime]::UtcNow.ToString('o')
     package_root             = $PackageRoot
@@ -702,6 +862,7 @@ $summary = [ordered]@{
     runtime                  = $local.runtime
     start_to_state_ms        = $local.start_to_state
     control_quit_ok          = $true
+    launcher_smoke           = $launcherSmoke
 }
 if ($Evidence) {
     if (-not [IO.Path]::IsPathRooted($Evidence)) { $Evidence = Join-Path $PWD $Evidence }
