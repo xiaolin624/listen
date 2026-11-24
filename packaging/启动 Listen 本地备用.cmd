@@ -1,7 +1,8 @@
 @echo off
 rem Explicit local fallback. Use this launcher only when you choose local
-rem recognition (whisper.cpp on this CPU). It is not the daily default, it is
-rem never started automatically, and it never replaces a cloud result.
+rem recognition (SenseVoice q8 through sherpa-onnx on this CPU). It is not the
+rem daily default, it is never started automatically, and it never replaces a
+rem cloud result.
 setlocal
 cd /d "%~dp0"
 if not exist "%~dp0listen.exe" (
@@ -15,22 +16,23 @@ if not exist "%~dp0libunwind.dll" (
   pause
   exit /b 1
 )
-if not exist "%~dp0engine\whisper-cli.exe" goto engine_missing
-if not exist "%~dp0engine\vad-speech-segments.exe" goto engine_missing
-if not exist "%~dp0models\ggml-small.bin" goto model_missing
-if not exist "%~dp0models\ggml-silero-v5.1.2.bin" goto model_missing
-start "" "%~dp0listen.exe" --engine "%~dp0engine\whisper-cli.exe" --model "%~dp0models\ggml-small.bin" --vad-model "%~dp0models\ggml-silero-v5.1.2.bin" --runtime "%~dp0runtime" --glossary "%~dp0glossary.txt"
+if not exist "%~dp0engine\sherpa\sherpa-onnx-c-api.dll" goto engine_missing
+if not exist "%~dp0engine\sherpa\onnxruntime.dll" goto engine_missing
+if not exist "%~dp0models\sense-voice\model.int8.onnx" goto model_missing
+if not exist "%~dp0models\sense-voice\tokens.txt" goto model_missing
+if not exist "%~dp0models\sense-voice\silero_vad.onnx" goto model_missing
+start "" "%~dp0listen.exe" --engine sensevoice --sherpa-lib "%~dp0engine\sherpa" --sensevoice-model "%~dp0models\sense-voice\model.int8.onnx" --sensevoice-tokens "%~dp0models\sense-voice\tokens.txt" --sensevoice-vad "%~dp0models\sense-voice\silero_vad.onnx" --runtime "%~dp0runtime" --glossary "%~dp0glossary.txt"
 exit /b 0
 
 :engine_missing
 echo The local recognition engine is incomplete.
-echo Expected engine\whisper-cli.exe, engine\vad-speech-segments.exe and their adjacent DLLs.
+echo Expected engine\sherpa\sherpa-onnx-c-api.dll, engine\sherpa\onnxruntime.dll and their provider DLL.
 pause
 exit /b 1
 
 :model_missing
-echo The local speech models are not prepared.
-echo Put ggml-small.bin and ggml-silero-v5.1.2.bin into the models folder, then run this file again.
-echo See README.md for the model sources and SHA-256 values.
+echo The local SenseVoice q8 model files are not prepared.
+echo Put model.int8.onnx, tokens.txt and silero_vad.onnx into the models\sense-voice folder,
+echo then run this file again. See README.md for the model sources and SHA-256 values.
 pause
 exit /b 1
