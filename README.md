@@ -94,7 +94,7 @@ Rust | re
 
 ## Windows 交付包（现状）
 
-`scripts\package-listen.ps1` 生成的 `dist\Listen-0.1.0\` 日常默认是**已通过验收的云端路径**：`启动 Listen.cmd` 使用 `runtime-cloud\` 和固定阿里云型号；`启动 Listen 本地备用.cmd` 是明确标注的本地 whisper.cpp 备用。包内 README/CLOUD-TRIAL 说明首次凭据配置、`bl.cmd` 免费保护、费用与数据边界；`manifest.json` 记录 `default_mode=cloud` 和固定厂商/型号/地域。把交付包引擎换成 SenseVoice 运行库与 q8 模型仍属 ticket **#23**；本文不声称 SenseVoice 已在交付包内，开发构建与真机验证都以 SenseVoice 为显式本地引擎。
+`scripts\package-listen.ps1` 生成的 `dist\Listen-0.1.0\` 日常默认是**已通过验收的云端路径**：`启动 Listen.cmd` 使用 `runtime-cloud\` 和固定阿里云型号；`启动 Listen 本地备用.cmd` 是明确标注的本地 **SenseVoice q8（sherpa-onnx）** 备用，包内为 `engine\sherpa\` 运行库与 `models\sense-voice\` 的 q8 模型，不再包含 whisper.cpp 的模型或运行库。包内 README/CLOUD-TRIAL 说明首次凭据配置、`bl.cmd` 免费保护、费用与数据边界；`manifest.json` 记录 `default_mode=cloud`、固定厂商/型号/地域以及 `engine_source`/`engine_files`；`THIRD-PARTY-NOTICES.md` 与 `licenses\` 带 FunASR/SenseVoice、sherpa-onnx、ONNX Runtime 的署名与许可证原文。换包验收记录见 [docs/issue-23-verification.md](docs/issue-23-verification.md)。
 
 ## 路径与本地数据
 
@@ -119,9 +119,9 @@ Rust | re
 
 ## 署名与许可
 
-- **SenseVoiceSmall 模型权重**来自 FunASR / SenseVoice 项目，使用 **FunASR MODEL_LICENSE**。本机文件在 `.tools\models\sense-voice\`（`model.int8.onnx`、`tokens.txt`、`silero_vad.onnx`）。发布或交付时必须保留该署名与许可证说明（ticket #23 的交付包要求）。
-- **sherpa-onnx** 与 **onnxruntime** 按其各自许可证分发；本机运行库在 `.tools\sherpa-onnx\sherpa-onnx-v2.0.1-win-x64-shared-MT-Release\lib\`（`sherpa-onnx-c-api.dll`、`onnxruntime.dll`）。交付包必须同时带上它们各自的许可证文本。
-- whisper.cpp 及其模型仅在显式回退时使用，仍受其各自许可证约束。
+- **SenseVoiceSmall 模型权重**来自 FunASR / SenseVoice 项目，使用 **FunASR MODEL_LICENSE**。本机文件在 `.tools\models\sense-voice\`（`model.int8.onnx`、`tokens.txt`、`silero_vad.onnx`）。交付包把该署名与许可证原文放进 `THIRD-PARTY-NOTICES.md` 与 `licenses\`（ticket #23）。
+- **sherpa-onnx** 与 **onnxruntime** 按其各自许可证分发；本机运行库在 `.tools\sherpa-onnx\sherpa-onnx-v2.0.1-win-x64-shared-MT-Release\lib\`（`sherpa-onnx-c-api.dll`、`onnxruntime.dll`）。交付包同时带上它们各自的许可证文本。
+- whisper.cpp 及其模型仅在显式回退时使用，仍受其各自许可证约束；交付包自 #23 起不再包含它们。
 
 ## 测试与范围
 
@@ -138,4 +138,4 @@ cargo test --test sense_voice_quality -- --ignored --nocapture
 
 行为测试的主接缝是 `Application` 边界：用假播放设备、假识别器、假目标输入框和假精修端口驱动开始/停止/重试/清理/精修，只断言用户可见的状态、文本、交付结果和保留音频。真引擎测试默认 `#[ignore]`。桌面验收不再依赖旧窗口类名或控件 ID：`--control` + `runtime\status.txt` + `runtime\panel.txt` + `runtime\current-result.txt` 覆盖面板的可观察行为；`scripts\verify-panel.ps1` 把控制通道验收与窗口级自检分开报告，细节见 [issue #20 验证记录](docs/issue-20-verification.md)。
 
-已建立的约束：只采集默认多媒体渲染端点，不打开麦克风；默认通信端点或单独路由到其它设备的声音不在范围内；播放设备切换/移除会中断采集并保留已收到内容；不建立会议历史；不自动发送。仍不受支持或未验证：分发安装器、多用户、自动更新、macOS/Linux、GPU/CUDA 加速、词级时间戳、会议摘要/翻译、术语表自动学习，以及任意第三方编辑器/浏览器扩展输入区的无条件可写。交付包引擎替换（#23）与基于真实腾讯会议语料的启用闸门（#22）仍在进行中。
+已建立的约束：只采集默认多媒体渲染端点，不打开麦克风；默认通信端点或单独路由到其它设备的声音不在范围内；播放设备切换/移除会中断采集并保留已收到内容；不建立会议历史；不自动发送。仍不受支持或未验证：分发安装器、多用户、自动更新、macOS/Linux、GPU/CUDA 加速、词级时间戳、会议摘要/翻译、术语表自动学习，以及任意第三方编辑器/浏览器扩展输入区的无条件可写。交付包引擎替换（#23）已完成，见 [docs/issue-23-verification.md](docs/issue-23-verification.md)；基于真实腾讯会议语料的启用闸门（#22）见 [docs/issue-22-verification.md](docs/issue-22-verification.md)。

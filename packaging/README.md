@@ -15,11 +15,13 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 | `listen.exe` | 正式应用 |
 | `libunwind.dll` | gnullvm 运行库，必须与 `listen.exe` 同目录 |
 | `启动 Listen.cmd` | **日常默认**；云端识别，固定阿里云北京型号，用 `runtime-cloud\` |
-| `启动 Listen 本地备用.cmd` | **显式本地备用**；用包内 whisper.cpp 引擎/模型和 `runtime\` |
+| `启动 Listen 本地备用.cmd` | **显式本地备用**；用包内 SenseVoice q8 引擎/模型和 `runtime\` |
 | `scripts\configure-cloud-trial.ps1` | 本机凭据配置助手；隐藏输入，写入 Windows Credential Manager |
 | `CLOUD-TRIAL.md` | 云端默认的配置、费用、数据与失败行为说明 |
-| `engine\` | whisper.cpp v1.8.2 CPU 引擎及实际需要的 VC++ 运行库 DLL（本地备用） |
-| `models\` | 可选的本地备用模型；没有模型时按下文准备 |
+| `engine\sherpa\` | SenseVoice 运行库：sherpa-onnx C API、ONNX Runtime 及其 provider DLL（本地备用） |
+| `models\` | 可选的本地备用模型（`models\sense-voice\`）；没有模型时按下文准备 |
+| `THIRD-PARTY-NOTICES.md` | 第三方署名与许可证索引；`licenses\` 内是上游许可证原文 |
+| `licenses\` | FunASR MODEL_LICENSE、sherpa-onnx（Apache 2.0）、ONNX Runtime（MIT）原文 |
 | `glossary.txt` | 本地术语表，两个启动器都显式使用它 |
 | `README.md`、`VERSION.txt`、`manifest.json` | 使用说明、版本、每个文件的大小与 SHA-256 |
 
@@ -50,11 +52,11 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 
 需要或想用本机识别时：
 
-1. 如果 `models\` 为空，先按下面“模型准备”放入两个模型文件。
+1. 如果 `models\sense-voice\` 为空，先按下面“模型准备”放入三个模型文件。
 2. 关闭正在运行的 Listen，双击 **`启动 Listen 本地备用.cmd`**。
 3. 状态胶囊就绪后，操作与云端相同；`runtime\status.txt` 的 `recognition_mode=local`、`backend=` 和面板会写明本机引擎，不发送音频。
 
-这是**新的**本机识别采集，不是云端失败后的自动降级。`runtime-cloud\` 里尚未完成的云端录音不会被本地模式读取；下次打开默认启动器时仍会继续云端恢复。切换识别来源请显式关闭并重新启动，不要同时开两个实例。等价的命令行选择是 `listen.exe --engine sensevoice`（或 `--engine <whisper-cli.exe>` 加 `--model`/`--vad-model`），打包脚本与验证脚本也按这个显式参数区分两个启动器。
+这是**新的**本机识别采集，不是云端失败后的自动降级。`runtime-cloud\` 里尚未完成的云端录音不会被本地模式读取；下次打开默认启动器时仍会继续云端恢复。切换识别来源请显式关闭并重新启动，不要同时开两个实例。等价的命令行选择是 `listen.exe --engine sensevoice --sherpa-lib <包内 engine\sherpa> --sensevoice-model <…model.int8.onnx> --sensevoice-tokens <…tokens.txt> --sensevoice-vad <…silero_vad.onnx> --runtime <…runtime>`；**必须显式传全部引擎与模型路径**，否则应用会从 `listen.exe` 向上查找含 `.tools` 的祖先目录，可能加载到开发目录里的文件而不是包内文件。打包脚本与验证脚本也按这组显式参数区分两个启动器。
 
 ## 费用与免费额度
 
@@ -70,35 +72,37 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 
 ## 模型准备（本地备用不包含模型时）
 
-把下面两个文件放入本目录的 `models\`，文件名必须保持一致：
+把下面三个文件放入本目录的 `models\sense-voice\`，文件名必须保持一致：
 
 | 文件 | 放置位置 | 字节数 | SHA-256 |
 | --- | --- | ---: | --- |
-| `ggml-small.bin` | `models\ggml-small.bin` | 487601967 | `1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b` |
-| `ggml-silero-v5.1.2.bin` | `models\ggml-silero-v5.1.2.bin` | 885098 | `29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf` |
+| `model.int8.onnx` | `models\sense-voice\model.int8.onnx` | 239233841 | `c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51` |
+| `tokens.txt` | `models\sense-voice\tokens.txt` | 315894 | `f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc` |
+| `silero_vad.onnx` | `models\sense-voice\silero_vad.onnx` | 643854 | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` |
 
 来源：
 
-- Whisper 多语言 small（F16）：<https://huggingface.co/ggerganov/whisper.cpp/tree/5359861c739e955e79d9a303bcbc70fb988958b1>
-- Silero VAD v5.1.2：<https://huggingface.co/ggml-org/whisper-vad/tree/9ffd54a1e1ee413ddf265af9913beaf518d1639b>
+- SenseVoiceSmall q8（sherpa-onnx 的 int8 ONNX 转换，`model.int8.onnx` + `tokens.txt`）：<https://k2-fsa.github.io/sherpa/onnx/sense-voice/pretrained.html>
+- Silero VAD（`silero_vad.onnx`，sherpa-onnx 的 VAD 模型）：<https://k2-fsa.github.io/sherpa/onnx/vad/index.html>
 
 下载后可用 PowerShell 校验：
 
 ```powershell
-Get-FileHash .\models\ggml-small.bin -Algorithm SHA256
-Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
+Get-FileHash .\models\sense-voice\model.int8.onnx -Algorithm SHA256
+Get-FileHash .\models\sense-voice\tokens.txt -Algorithm SHA256
+Get-FileHash .\models\sense-voice\silero_vad.onnx -Algorithm SHA256
 ```
 
-两个模型都准备好后重新启动本地备用。模型只从本目录读取，不需要联网；本地识别全程在本机 CPU 上完成。本包没有配置 `DEEPSEEK_API_KEY`，因此面板里的“精修”不可用，两种识别来源都不受影响。
+三个文件都准备好后重新启动本地备用。模型只从本目录读取，不需要联网；本地识别全程在本机 CPU 上完成，**要求 CPU 支持 AVX2**。本包没有配置 `DEEPSEEK_API_KEY`，因此面板里的“精修”不可用，两种识别来源都不受影响。模型权重使用 FunASR MODEL_LICENSE，署名与许可证原文见 `THIRD-PARTY-NOTICES.md` 与 `licenses\`。
 
 ## 缺少文件时会怎样
 
 - **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：两个启动器都会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
 - **缺少 `scripts\configure-cloud-trial.ps1` 或 `CLOUD-TRIAL.md`**：默认云端启动器明确提示缺少该文件，不静默启动。
-- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：本地备用启动器只检查前两个程序文件是否存在并给出提示；如果相邻 DLL 缺失，`listen.exe` 启动后进入失败状态，写明 `backend is unavailable; check its adjacent DLLs`。
-- **缺少本地模型、模型为空或不是 ggml 格式**：本地备用状态为失败，写明 `Local model is unavailable (...)` 或 `Local model is not a whisper.cpp ggml model`。补齐模型后重新启动即可。云端默认不需要本地模型。
+- **缺少 `engine\sherpa\sherpa-onnx-c-api.dll` 或 `engine\sherpa\onnxruntime.dll`**：本地备用启动器直接提示引擎不完整并暂停，不静默启动；如果两个 DLL 不在同一目录，`listen.exe` 启动后进入失败状态。
+- **缺少 `models\sense-voice\` 下的模型文件**：本地备用状态为失败，写明 `The local SenseVoice model is missing: ...` 一类的具体文件。补齐三个文件后重新启动即可。云端默认不需要本地模型。
 - **默认多媒体播放设备不可用**：开始采集时进入失败状态，写明无法选择默认多媒体渲染端点；不会打开麦克风，也不会自动改用其他设备。
-- 包内 `engine\` 已放入引擎实际需要的 `whisper.dll`、`ggml.dll`、`ggml-cpu.dll`、`ggml-base.dll`、`vad-speech-segments.exe` 以及 Microsoft VC++ 运行库 DLL；`SDL2.dll`、`whisper-server.exe` 等无关程序没有打包。
+- 包内 `engine\sherpa\` 只放 SenseVoice 实际加载的三个运行库（`sherpa-onnx-c-api.dll`、`onnxruntime.dll`、`onnxruntime_providers_shared.dll`；ONNX Runtime 为 MT/静态 CRT 构建，不需要额外 VC++ 运行库 DLL）；`models\sense-voice\` 只放上面三个模型文件。示例程序、其他模型和无关引擎都没有打包。
 
 ## 采集范围与行为
 
@@ -132,7 +136,7 @@ Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
 - **Codex 桌面端等没有专门适配**：如果它不通过标准可写 Value 模式暴露输入区，Listen 不会猜测控件或注入发送，结果会进入展开结果面板。没有按应用白名单/黑名单分流。
 - UIA 读取、检查和写入不是跨进程原子事务；在最后检查和写入之间发生的并发编辑仍可能造成“可能已部分写入”的提示。失败后只做诊断读回，不自动重试、不回滚。
 - 目标有长度上限时会截断。Listen 会检测稳定前缀，明确报告“只保存了 N/M 个字符，不是完整交付”，并在展开结果面板保留完整结果；不会把截断报告成成功。
-- 本地备用引擎为 CPU 识别；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。云端准确率数字只对应验收时的固定 20 段语料，不等于对所有会议内容的保证。
+- 本地备用引擎为 SenseVoice q8（sherpa-onnx，CPU，**要求 AVX2**）；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。云端准确率数字只对应验收时的固定 20 段语料，不等于对所有会议内容的保证。
 - 测试中的 10 分钟/60 分钟只是验证样例，**不是产品时长上限**，也不是延迟或准确率 SLA。
 - 尚未覆盖：所有第三方编辑器/浏览器扩展输入区、物理拔插耳机、蓝牙免提/立体声切换、会议软件独占模式、其他 Windows 版本、真实会议录音的分段边界质量。不要把它理解为“任意控件无条件可写”或“任意会议逐字零错误”。
 
@@ -166,11 +170,21 @@ Rust | re
 
 确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理音频保留在自己的运行目录，不用本地模式冒充处理。
 
+## 署名与许可
+
+本包分发三类第三方组件；完整索引、来源 URL 与许可证原文的 SHA-256 见 **`THIRD-PARTY-NOTICES.md`**，上游许可证原文在 `licenses\`：
+
+- **SenseVoiceSmall 模型权重**（`models\sense-voice\`）来自 **FunASR / SenseVoice** 项目，使用 **FunASR MODEL_LICENSE**（FunASR Model Open Source License Agreement v1.1，版权 (C) [2023-2028] [Alibaba Group]）。原文：`licenses\FunASR-MODEL_LICENSE.txt`。该许可证 2.2 条要求注明出处与作者信息并保留模型名称，因此本 README、`VERSION.txt` 和 `THIRD-PARTY-NOTICES.md` 都保留 “SenseVoiceSmall / FunASR” 署名。
+- **sherpa-onnx**（`engine\sherpa\sherpa-onnx-c-api.dll`）按 **Apache License, Version 2.0** 分发。原文：`licenses\sherpa-onnx-LICENSE.txt`。
+- **ONNX Runtime**（`engine\sherpa\onnxruntime.dll`、`onnxruntime_providers_shared.dll`）按 **MIT License** 分发（版权 Microsoft Corporation）。原文：`licenses\onnxruntime-LICENSE.txt`。
+
+本包**不包含** whisper.cpp 的模型或运行库；本地识别只使用上面这套 SenseVoice 组件。第三方许可证原文只做逐字分发，不改写条款；如与上游仓库不一致，以上游仓库为准。
+
 ## 版本与验证
 
 - 版本：0.1.0（见 `VERSION.txt`）
 - 默认：阿里云百炼 Model Studio / `qwen-audio-3.1-asr-flash-message` / `cn-beijing`，单厂商
-- 显式本地备用：whisper.cpp v1.8.2 CPU（SenseVoice 换包见 ticket #23，未包含在本包）
+- 显式本地备用：SenseVoice q8（sherpa-onnx C API 常驻应用进程，CPU，要求 AVX2）
 - 源码：<https://github.com/xiaolin624/listen>
-- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交、是否包含模型、`default_mode=cloud` 和固定厂商/型号/地域。
-- 验收证据：`docs/issue-40-acceptance-20261121.md`（2026-11-21，同一 20 段真实音频，20/20 交付、最慢 844 ms、95.86% 对比 75.39%）。费用、数据条款与未覆盖项见 `CLOUD-TRIAL.md`；本包不声称现金账单已对账或零留存。
+- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交、是否包含模型、`default_mode=cloud`、固定厂商/型号/地域、`engine_source` 与 `engine_files`。
+- 验收证据：`docs/issue-40-acceptance-20261121.md`（2026-11-21，同一 20 段真实音频，20/20 交付、最慢 844 ms、95.86% 对比 75.39%）。费用、数据条款与未覆盖项见 `CLOUD-TRIAL.md`；本包不声称现金账单已对账或零留存。换引擎到 SenseVoice 的交付包验收记录见仓库 `docs/issue-23-verification.md`（ticket #23）。

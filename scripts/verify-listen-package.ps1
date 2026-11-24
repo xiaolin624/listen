@@ -62,6 +62,9 @@ if ([string]$manifest.cloud_trial.configure -ne 'scripts/configure-cloud-trial.p
     throw 'The packaged cloud-trial configuration path is missing from the manifest.'
 }
 
+# The delivered local engine is SenseVoice q8 through sherpa-onnx: two pinned native
+# libraries plus the provider bridge that ships beside them, and three pinned model
+# files. whisper.cpp and its ggml models are deliberately absent (#23).
 $required = @(
     'listen.exe',
     'libunwind.dll',
@@ -69,16 +72,21 @@ $required = @(
     'CLOUD-TRIAL.md',
     'glossary.txt',
     'VERSION.txt',
+    'THIRD-PARTY-NOTICES.md',
     'scripts\configure-cloud-trial.ps1',
-    'engine\whisper-cli.exe',
-    'engine\whisper.dll',
-    'engine\ggml.dll',
-    'engine\ggml-cpu.dll',
-    'engine\ggml-base.dll',
-    'engine\vad-speech-segments.exe'
+    'licenses\FunASR-MODEL_LICENSE.txt',
+    'licenses\sherpa-onnx-LICENSE.txt',
+    'licenses\onnxruntime-LICENSE.txt',
+    'engine\sherpa\sherpa-onnx-c-api.dll',
+    'engine\sherpa\onnxruntime.dll',
+    'engine\sherpa\onnxruntime_providers_shared.dll'
 )
 if ($manifest.included_models) {
-    $required += @('models\ggml-small.bin', 'models\ggml-silero-v5.1.2.bin')
+    $required += @(
+        'models\sense-voice\model.int8.onnx',
+        'models\sense-voice\tokens.txt',
+        'models\sense-voice\silero_vad.onnx'
+    )
 }
 else {
     $required += 'models\README.txt'
@@ -86,6 +94,40 @@ else {
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $PackageRoot $_) -PathType Leaf) })
 if ($missing.Count -gt 0) {
     throw ('Package files are missing: ' + ($missing -join ', '))
+}
+
+# Enumerate the package once: the stale-engine check, the size check and the content
+# scan all read the same list.
+$packageFiles = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force)
+$packageTotalBytes = [long]0
+foreach ($file in $packageFiles) { $packageTotalBytes += $file.Length }
+
+# Whisper must not be delivered any more. Match by file name anywhere in the tree so a
+# leftover engine directory cannot satisfy the SenseVoice requirement while the old
+# whisper model or runtime is still shipped.
+$staleEngineFiles = @($packageFiles |
+        Where-Object { $_.Name -match '(?i)^(whisper|ggml)' } |
+        ForEach-Object { $_.FullName.Substring($PackageRoot.Length + 1) })
+if ($staleEngineFiles.Count -gt 0) {
+    throw ('The package still contains whisper.cpp engine or model files: ' + ($staleEngineFiles -join ', '))
+}
+$staleEngineDirectories = @($packageFiles | ForEach-Object {
+        $segments = $_.FullName.Substring($PackageRoot.Length + 1) -split '\\'
+        if ($segments.Count -gt 1) { $segments[0..($segments.Count - 2)] }
+    } | Where-Object { $_ -match '(?i)whisper|ggml' } | Sort-Object -Unique)
+if ($staleEngineDirectories.Count -gt 0) {
+    throw ('The package still contains a whisper-specific directory: ' + ($staleEngineDirectories -join ', '))
+}
+
+# "About 260 MB" is an acceptance criterion, so the with-models package has to stay
+# inside a band that both the old whisper package (~494 MB) and a model-less package
+# (~25 MB) fail.
+if ($manifest.included_models) {
+    $minimumBytes = 245000000
+    $maximumBytes = 285000000
+    if ($packageTotalBytes -lt $minimumBytes -or $packageTotalBytes -gt $maximumBytes) {
+        throw ('The package size is outside the accepted local-model band (' + $packageTotalBytes + ' bytes; expected ' + $minimumBytes + '-' + $maximumBytes + ').')
+    }
 }
 
 # Exactly two launchers: the daily cloud default and the explicitly labelled local
@@ -115,10 +157,24 @@ if ($defaultLauncher.Text -match '--engine') {
 if ($defaultLauncher.Text -match '--cloud-trial') {
     throw 'The default launcher must not pass --cloud-trial; the packaged binary default itself must select the accepted cloud path.'
 }
-foreach ($phrase in @('listen.exe', '--engine', '--model', '--vad-model', '--runtime', '--glossary')) {
+foreach ($phrase in @('listen.exe', '--engine', '--sherpa-lib', '--sensevoice-model', '--sensevoice-tokens', '--sensevoice-vad', '--runtime', '--glossary')) {
     if ($localLauncher.Text.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The local fallback launcher does not pass: ' + $phrase)
     }
+}
+# The local launcher must select SenseVoice explicitly and must not keep the whisper
+# arguments: the SenseVoice engine ignores --model/--vad-model, so a stale launcher
+# would look correct while pointing at files the package no longer ships.
+if ($localLauncher.Text -notmatch '(?i)--engine\s+"?sensevoice') {
+    throw 'The local fallback launcher does not select the SenseVoice engine explicitly.'
+}
+foreach ($staleArgument in @('--model', '--vad-model')) {
+    if ($localLauncher.Text -match ('(^|\s)' + [regex]::Escape($staleArgument) + '(\s|$)')) {
+        throw ('The local fallback launcher still passes the whisper-only argument: ' + $staleArgument)
+    }
+}
+if ($localLauncher.Text -match '(?i)whisper|ggml') {
+    throw 'The local fallback launcher still mentions a whisper.cpp engine or model.'
 }
 if ($localLauncher.Text -notmatch '--runtime\s+"%~dp0runtime"') {
     throw 'The local fallback launcher does not use the packaged local runtime directory.'
@@ -129,10 +185,30 @@ if ($localLauncher.Text -match '--cloud-trial') {
 if ([string]$manifest.local_fallback.launcher -ne $localLauncher.File.Name) {
     throw 'The manifest local fallback launcher does not name the packaged local launcher.'
 }
-foreach ($phrase in @('whisper')) {
-    if ([string]$manifest.local_fallback.engine -notmatch $phrase -or [string]$manifest.local_fallback.runtime -ne 'runtime') {
-        throw 'The manifest local fallback engine/runtime is missing or inconsistent.'
+if ([string]$manifest.local_fallback.runtime -ne 'runtime') {
+    throw 'The manifest local fallback runtime is missing or inconsistent.'
+}
+foreach ($phrase in @('SenseVoice', 'sherpa-onnx')) {
+    if ([string]$manifest.local_fallback.engine -notmatch $phrase) {
+        throw ('The manifest local fallback engine does not name: ' + $phrase)
     }
+}
+foreach ($phrase in @('SenseVoice', 'sherpa-onnx')) {
+    if ([string]$manifest.engine_source -notmatch $phrase) {
+        throw ('The manifest engine_source does not name: ' + $phrase)
+    }
+}
+if ([string]$manifest.engine_source -match '(?i)whisper') {
+    throw 'The manifest still declares whisper.cpp as the delivered engine.'
+}
+$manifestEngineFiles = @($manifest.engine_files)
+foreach ($expectedEngineFile in @('sherpa-onnx-c-api.dll', 'onnxruntime.dll')) {
+    if ($manifestEngineFiles -notcontains $expectedEngineFile) {
+        throw ('The manifest engine_files does not list: ' + $expectedEngineFile)
+    }
+}
+foreach ($staleEngineFile in @($manifestEngineFiles | Where-Object { $_ -match '(?i)whisper|ggml' })) {
+    throw ('The manifest engine_files still lists a whisper.cpp file: ' + $staleEngineFile)
 }
 
 # The machine-local configuration surface is a real helper, not a stub.
@@ -144,9 +220,31 @@ foreach ($phrase in @('Listen/CloudTrial/Alibaba/cn-beijing', 'SecureString', 'L
 }
 
 $readme = [IO.File]::ReadAllText((Join-Path $PackageRoot 'README.md'))
-foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'runtime-cloud', 'whisper.cpp', '--engine', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
+foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'runtime-cloud', 'SenseVoice', 'FunASR', 'sherpa-onnx', 'MODEL_LICENSE', 'THIRD-PARTY-NOTICES.md', '--engine', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
     if ($readme.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The packaged README does not explain: ' + $phrase)
+    }
+}
+
+# Attribution and licences ship inside the package: the FunASR/SenseVoice notice plus
+# the upstream licence texts, not only links to them.
+$notices = [IO.File]::ReadAllText((Join-Path $PackageRoot 'THIRD-PARTY-NOTICES.md'))
+foreach ($phrase in @('FunASR', 'SenseVoice', 'MODEL_LICENSE', 'sherpa-onnx', 'onnxruntime', 'Apache License', 'MIT License', 'licenses\FunASR-MODEL_LICENSE.txt', 'licenses\sherpa-onnx-LICENSE.txt', 'licenses\onnxruntime-LICENSE.txt')) {
+    if ($notices.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        throw ('The third-party notices do not record: ' + $phrase)
+    }
+}
+$licenseTexts = [ordered]@{
+    'licenses\FunASR-MODEL_LICENSE.txt' = @('FunASR Model Open Source License Agreement', 'Alibaba Group', '2.2 Restrictions')
+    'licenses\sherpa-onnx-LICENSE.txt'  = @('Apache License', 'Version 2.0')
+    'licenses\onnxruntime-LICENSE.txt'  = @('MIT License', 'Microsoft Corporation')
+}
+foreach ($licensePath in $licenseTexts.Keys) {
+    $licenseText = [IO.File]::ReadAllText((Join-Path $PackageRoot $licensePath))
+    foreach ($phrase in $licenseTexts[$licensePath]) {
+        if ($licenseText.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw ('The delivered licence text is not the expected upstream notice: ' + $licensePath + ' (' + $phrase + ')')
+        }
     }
 }
 $cloudGuide = [IO.File]::ReadAllText((Join-Path $PackageRoot 'CLOUD-TRIAL.md'))
@@ -157,7 +255,7 @@ foreach ($phrase in @('qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configu
 }
 
 $versionText = [IO.File]::ReadAllText((Join-Path $PackageRoot 'VERSION.txt'))
-foreach ($phrase in @('Daily default: cloud', 'Local fallback (explicit only)', 'Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
+foreach ($phrase in @('Daily default: cloud', 'Local fallback (explicit only)', 'SenseVoice', 'sherpa-onnx', 'Alibaba Model Studio', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing')) {
     if ($versionText.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The packaged VERSION.txt does not record: ' + $phrase)
     }
@@ -193,7 +291,7 @@ $hostTestPatterns = @(
 # binaries may skip the byte scan, and the manifest hash check still verifies their
 # content. Any other file over the limit is a package error, so a large log renamed
 # as an arbitrary file cannot bypass key detection.
-$contentScanAllowlist = @('models\ggml-small.bin')
+$contentScanAllowlist = @('engine\sherpa\onnxruntime.dll', 'models\sense-voice\model.int8.onnx')
 function Read-Latin1([string]$Path) {
     return [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
 }
@@ -213,7 +311,6 @@ finally {
 }
 
 $scannedFiles = 0
-$packageFiles = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force)
 foreach ($file in $packageFiles) {
     $relative = $file.FullName.Substring($PackageRoot.Length + 1)
     $segments = $relative -split '\\'
@@ -272,6 +369,28 @@ if (-not $SkipHash) {
         }
         $hashesVerified++
     }
+}
+
+# Independent of the manifest: the files the application pins by SHA-256 must be the
+# exact builds it accepts, so re-packing a wrong DLL or model cannot pass verification.
+# The expected values are copied from app\listen\src\sensevoice.rs, not from the
+# manifest this script is checking.
+$pinnedHashes = [ordered]@{
+    'engine\sherpa\sherpa-onnx-c-api.dll' = '0965A6E4C0254DA2BEFF489CF7A8AAFFAF7DC94F90B43B3E66448B8CAB4177EA'
+    'engine\sherpa\onnxruntime.dll'       = '7F66F939A881BAF4F46A2216496798EDF4A1429878B646D12674AA62F27D8A25'
+}
+if ($manifest.included_models) {
+    $pinnedHashes['models\sense-voice\model.int8.onnx'] = 'C71F0CE00BEC95B07744E116345E33D8CBBE08CEF896382CF907BF4B51A2CD51'
+    $pinnedHashes['models\sense-voice\tokens.txt'] = 'F449EB28DC567533D7FA59BE34E2ABCA8784F771850C78A47FB731A31429A1DC'
+    $pinnedHashes['models\sense-voice\silero_vad.onnx'] = '9E2449E1087496D8D4CABA907F23E0BD3F78D91FA552479BB9C23AC09CBB1FD6'
+}
+$pinnedVerified = 0
+foreach ($pinnedPath in $pinnedHashes.Keys) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $PackageRoot $pinnedPath) -Algorithm SHA256).Hash
+    if ($actual -ne $pinnedHashes[$pinnedPath]) {
+        throw ('The packaged engine file is not the pinned build: ' + $pinnedPath + ' (' + $actual + ')')
+    }
+    $pinnedVerified++
 }
 
 $existing = @(Get-Process -Name listen -ErrorAction SilentlyContinue)
@@ -407,13 +526,20 @@ function Get-StatusField([string]$Status, [string]$Name) {
     return ''
 }
 
-$engine = Join-Path $PackageRoot 'engine\whisper-cli.exe'
-$model = Join-Path $PackageRoot 'models\ggml-small.bin'
-$vad = Join-Path $PackageRoot 'models\ggml-silero-v5.1.2.bin'
+# Every engine path is passed explicitly. root() walks up from the packaged exe to the
+# first ancestor that owns .tools, so a package unpacked inside a developer checkout
+# would otherwise load the checkout's engine and model and pass while the package
+# itself is broken.
+$sherpaLib = Join-Path $PackageRoot 'engine\sherpa'
+$senseVoiceModel = Join-Path $PackageRoot 'models\sense-voice\model.int8.onnx'
+$senseVoiceTokens = Join-Path $PackageRoot 'models\sense-voice\tokens.txt'
+$senseVoiceVad = Join-Path $PackageRoot 'models\sense-voice\silero_vad.onnx'
 $localArguments = @(
-    '--engine', (ConvertTo-QuotedWindowsPath $engine),
-    '--model', (ConvertTo-QuotedWindowsPath $model),
-    '--vad-model', (ConvertTo-QuotedWindowsPath $vad),
+    '--engine', 'sensevoice',
+    '--sherpa-lib', (ConvertTo-QuotedWindowsPath $sherpaLib),
+    '--sensevoice-model', (ConvertTo-QuotedWindowsPath $senseVoiceModel),
+    '--sensevoice-tokens', (ConvertTo-QuotedWindowsPath $senseVoiceTokens),
+    '--sensevoice-vad', (ConvertTo-QuotedWindowsPath $senseVoiceVad),
     '--runtime', (ConvertTo-QuotedWindowsPath $Runtime),
     '--hidden'
 )
@@ -431,12 +557,13 @@ if ($manifest.included_models) {
     }
     if (-not $localBackend) { throw 'The local fallback did not report a recognition backend.' }
     if ($localBackend -match '(?i)Cloud trial') { throw 'The local fallback launch reported a cloud backend.' }
+    if ($localBackend -notmatch '(?i)SenseVoice') { throw 'The local fallback backend does not name the delivered SenseVoice engine.' }
 }
 else {
     if ($localPhase -ne 'Failure') {
         throw ('The package without models did not report the expected failure:' + [Environment]::NewLine + $local.status)
     }
-    if ($localDetail -notmatch 'Local model is unavailable|Local whisper\.cpp executable is missing') {
+    if ($localDetail -notmatch 'The local (SenseVoice model|SenseVoice tokens|Silero VAD model|sherpa-onnx C API library|onnxruntime library) is missing|The local SenseVoice engine is unavailable') {
         throw ('The missing-model failure is not explicit:' + [Environment]::NewLine + $local.status)
     }
 }
@@ -546,8 +673,13 @@ $summary = [ordered]@{
     cloud_trial_model        = [string]$manifest.cloud_trial.model
     cloud_trial_region       = [string]$manifest.cloud_trial.region
     local_fallback_launcher  = [string]$manifest.local_fallback.launcher
+    local_fallback_engine    = [string]$manifest.local_fallback.engine
+    engine_source            = [string]$manifest.engine_source
+    package_bytes            = $packageTotalBytes
     files_checked            = $required.Count
     hashes_verified          = $hashesVerified
+    pinned_hashes_verified   = $pinnedVerified
+    third_party_notices      = $true
     launchers_checked        = $launcherInfo.Count
     scanned_files            = $scannedFiles
     secret_guard_self_test   = $true
