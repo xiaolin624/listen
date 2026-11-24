@@ -62,6 +62,11 @@ Get-FileHash .\licenses\sherpa-onnx-LICENSE.txt -Algorithm SHA256
 Get-FileHash .\licenses\onnxruntime-LICENSE.txt -Algorithm SHA256
 ```
 
+上表数值对应**以 LF 换行保存**的字节（本包内就是这一形式）。本仓库配置了
+`core.autocrlf=true`，从 Git 重新检出后这些 `.txt` 在工作树里会变成 CRLF，字节数与哈希随之
+不同——只有行尾不同，条款文字不变。如果你用检出后的工作树重新打包，请以**包内文件**重新计算
+哈希，不要拿上表去核对 CRLF 版本。
+
 ## 5. 已移除的组件
 
 whisper.cpp 引擎（`whisper-cli.exe`、`whisper.dll`、`ggml*.dll`、`vad-speech-segments.exe`）

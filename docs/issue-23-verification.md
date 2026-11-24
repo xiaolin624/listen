@@ -240,6 +240,10 @@
   版权行均为 `Copyright (c) Microsoft Corporation`；上游某些历史版本写 `2018 Microsoft
   Corporation`。差异只在版权行年份，MIT 正文一致。这一点写进了
   `THIRD-PARTY-NOTICES.md`，不冒充“逐字节等于上游 main”。
+- 上述三个哈希对应**LF 换行**的文本（包内就是这一形式，已复核：5306/11358/1073 B 且 CR=0）。
+  仓库配置 `core.autocrlf=true`，重新检出后这些 `.txt` 在工作树里是 CRLF，字节与哈希会不同
+  （只差行尾）；用检出后的工作树重新打包时，应以包内文件重新计算哈希。`THIRD-PARTY-NOTICES.md`
+  里也写了同一句提醒。
 
 ### 6.3 验证脚本断言
 
