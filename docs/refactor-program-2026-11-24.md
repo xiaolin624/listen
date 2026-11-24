@@ -48,6 +48,7 @@
 
 1. `glossary::tests::correcting_hundreds_of_terms_stays_in_the_millisecond_range`（100 ms 预算）：负载下 108–138 ms 失败，空闲时 40–50 ms。
 2. `storage_bounds::deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_resurrect_it`（10 s 等待）：W4 期间并发构建下 `timed out waiting for segment 2's stop-time draft`，单跑 0.27–0.31 s 通过。
+3. `backfill_timing::an_older_segment_never_delays_a_newer_segments_save_or_delivery`（10 s 截止）：88% 负载下 `both deliveries were not confirmed in time`，单跑 5/5 通过（0.32–0.34 s）。
 
 规矩：**不要为这两条把断言改松**；若真的改了阈值，必须同时记录改前/改后的实测分布。
 
