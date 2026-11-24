@@ -42,6 +42,15 @@
 1. **`Delivery::None`**：`refine_note` 把它当"已替换目标中的转写"，`summary` 当"本次没有向任何目标写入文字"，`headline` 当"已完成"；`pending_results` / `deletable` / `auto_open` 又把它排除。三处断言互斥。
 2. **等待段数**：`panel::segments_note` 排除最新段，`status.txt` 的 `waiting_segments` 统计全部；单段采集中两者显示不同的数字。
 
+## 已知负载敏感测试（不要当回归追）
+
+本机在**并发跑另一个 worktree 的构建/测试**时，下列测试会假红；单独跑或机器空闲时全绿。判定方法：单跑 3 次 + 机器空闲时全量复跑。
+
+1. `glossary::tests::correcting_hundreds_of_terms_stays_in_the_millisecond_range`（100 ms 预算）：负载下 108–138 ms 失败，空闲时 40–50 ms。
+2. `storage_bounds::deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_resurrect_it`（10 s 等待）：W4 期间并发构建下 `timed out waiting for segment 2's stop-time draft`，单跑 0.27–0.31 s 通过。
+
+规矩：**不要为这两条把断言改松**；若真的改了阈值，必须同时记录改前/改后的实测分布。
+
 ## 评审证据摘要（供后续波次复核，不必重跑）
 
 - `lib.rs` 3752 行；`impl Application` 2407 行 / 66 方法 / 29 字段；`Snapshot` 18 字段。
