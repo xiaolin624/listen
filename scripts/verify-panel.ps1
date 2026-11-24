@@ -31,11 +31,28 @@
 # Example:
 #   pwsh -File scripts\verify-panel.ps1
 #   pwsh -File scripts\verify-panel.ps1 -Exe <listen.exe> -Runtime <dir> -Evidence <dir>
+#   pwsh -File scripts\verify-panel.ps1 -PackageRoot <extracted package> -Runtime <dir> -Evidence <dir>
+#
+# Engine selection (issue #24). Listen's shipped default is cloud trial, so a desktop
+# acceptance run must name the local engine explicitly (see verify-capsule.ps1 for the
+# full table): -Engine sensevoice|whisper|<whisper-cli path>, -PackageRoot <dir> for a
+# shipped package layout, or -SherpaLib/-SenseVoiceModel/-SenseVoiceTokens/-SenseVoiceVad
+# for explicit SenseVoice paths. Without any of them the application keeps its own
+# default (cloud trial), which is only useful to prove the cloud failure path.
 
 param(
     [string]$Exe = '',
     [string]$Runtime = '',
     [string]$Evidence = '',
+    [string]$Engine = '',
+    [string]$Model = '',
+    [string]$VadModel = '',
+    [string]$PackageRoot = '',
+    [string]$SherpaLib = '',
+    [string]$SenseVoiceModel = '',
+    [string]$SenseVoiceTokens = '',
+    [string]$SenseVoiceVad = '',
+    [string]$SenseVoiceLanguage = '',
     [string]$AudioClip = '',
     [int]$TimeoutSeconds = 120
 )
@@ -50,6 +67,35 @@ try {
     if ($LASTEXITCODE -eq 0 -and $commonGit) { $sharedRoot = Split-Path $commonGit -Parent }
 } catch { }
 $artifacts = Join-Path $sharedRoot '.artifacts'
+# A shipped package carries listen.exe, engine\sherpa and models\sense-voice side by
+# side. Pointing -PackageRoot at it fills in the exe and the four SenseVoice paths, so
+# one run proves the delivered bytes rather than files borrowed from the repository.
+if ($PackageRoot) {
+    $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
+    if (-not (Test-Path -LiteralPath $PackageRoot -PathType Container)) { throw "The package root is missing: $PackageRoot" }
+    if (-not $Exe) { $Exe = Join-Path $PackageRoot 'listen.exe' }
+    if (-not $SherpaLib) { $SherpaLib = Join-Path $PackageRoot 'engine\sherpa' }
+    if (-not $SenseVoiceModel) { $SenseVoiceModel = Join-Path $PackageRoot 'models\sense-voice\model.int8.onnx' }
+    if (-not $SenseVoiceTokens) { $SenseVoiceTokens = Join-Path $PackageRoot 'models\sense-voice\tokens.txt' }
+    if (-not $SenseVoiceVad) { $SenseVoiceVad = Join-Path $PackageRoot 'models\sense-voice\silero_vad.onnx' }
+}
+$senseVoicePaths = @(@($SherpaLib, $SenseVoiceModel, $SenseVoiceTokens, $SenseVoiceVad) | Where-Object { $_ })
+# The engine keyword is a name, not a path: turning 'sensevoice' into an absolute path
+# (the pre-#24 behaviour) makes the application treat it as a whisper CLI path.
+$engineKind = ''
+if ($Engine) {
+    switch ($Engine.Trim().ToLowerInvariant()) {
+        'sensevoice' { $engineKind = 'sensevoice' }
+        'sense-voice' { $engineKind = 'sensevoice' }
+        'sense_voice' { $engineKind = 'sensevoice' }
+        'whisper' { $engineKind = 'whisper' }
+        default { $engineKind = 'whisper-cli' }
+    }
+}
+elseif ($senseVoicePaths) { $engineKind = 'sensevoice' }
+if ($engineKind -ne 'sensevoice' -and $senseVoicePaths.Count -gt 0) {
+    throw 'The SenseVoice paths need the local SenseVoice engine: drop -Engine, or pass -Engine sensevoice.'
+}
 if (-not $Exe) { $Exe = Join-Path $artifacts 'cargo-target\release\listen.exe' }
 if (-not $Runtime) { $Runtime = Join-Path $artifacts 'issue-20\runtime' }
 if (-not $Evidence) { $Evidence = Join-Path $artifacts 'issue-20' }
@@ -61,6 +107,10 @@ $Exe = [IO.Path]::GetFullPath($Exe)
 $Runtime = [IO.Path]::GetFullPath($Runtime)
 $Evidence = [IO.Path]::GetFullPath($Evidence)
 $FailureRuntime = [IO.Path]::GetFullPath((Join-Path $Evidence 'runtime-failure'))
+if ($SherpaLib) { $SherpaLib = [IO.Path]::GetFullPath($SherpaLib) }
+if ($SenseVoiceModel) { $SenseVoiceModel = [IO.Path]::GetFullPath($SenseVoiceModel) }
+if ($SenseVoiceTokens) { $SenseVoiceTokens = [IO.Path]::GetFullPath($SenseVoiceTokens) }
+if ($SenseVoiceVad) { $SenseVoiceVad = [IO.Path]::GetFullPath($SenseVoiceVad) }
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "listen.exe is missing: $Exe" }
 New-Item -ItemType Directory -Force -Path $Runtime, $Evidence, $FailureRuntime | Out-Null
 $statusPath = Join-Path $Runtime 'status.txt'
@@ -408,6 +458,20 @@ function Invoke-Control([string]$Command) {
 
 function Start-Listen([string]$RunDirectory, [string[]]$Extra = @()) {
     $arguments = @('--runtime', (ConvertTo-QuotedWindowsPath $RunDirectory), '--hidden')
+    switch ($engineKind) {
+        'sensevoice' {
+            $arguments += @('--engine', 'sensevoice')
+            if ($SherpaLib) { $arguments += @('--sherpa-lib', (ConvertTo-QuotedWindowsPath $SherpaLib)) }
+            if ($SenseVoiceModel) { $arguments += @('--sensevoice-model', (ConvertTo-QuotedWindowsPath $SenseVoiceModel)) }
+            if ($SenseVoiceTokens) { $arguments += @('--sensevoice-tokens', (ConvertTo-QuotedWindowsPath $SenseVoiceTokens)) }
+            if ($SenseVoiceVad) { $arguments += @('--sensevoice-vad', (ConvertTo-QuotedWindowsPath $SenseVoiceVad)) }
+            if ($SenseVoiceLanguage) { $arguments += @('--sensevoice-language', $SenseVoiceLanguage) }
+        }
+        'whisper' { $arguments += @('--engine', 'whisper') }
+        'whisper-cli' { $arguments += @('--engine', (ConvertTo-QuotedWindowsPath $Engine)) }
+    }
+    if ($Model) { $arguments += @('--model', (ConvertTo-QuotedWindowsPath $Model)) }
+    if ($VadModel) { $arguments += @('--vad-model', (ConvertTo-QuotedWindowsPath $VadModel)) }
     $arguments += $Extra
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Exe
@@ -415,6 +479,20 @@ function Start-Listen([string]$RunDirectory, [string[]]$Extra = @()) {
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     return [Diagnostics.Process]::Start($info)
+}
+
+function Get-EngineProvenance([Diagnostics.Process]$Process) {
+    # Which engine files the running process actually loaded. The panel window is not
+    # an oracle for this; the loaded module paths are.
+    $modules = @()
+    try { $modules = @($Process.Modules | ForEach-Object { $_.FileName }) } catch { }
+    return [ordered]@{
+        kind = $(if ($engineKind) { $engineKind } else { 'application default (cloud trial)' })
+        requested = $Engine
+        package_root = $PackageRoot
+        sherpa_lib = $SherpaLib
+        engine_modules = @($modules | Where-Object { $_ -match '(?i)\\(sherpa-onnx-c-api|onnxruntime|onnxruntime_providers_shared|whisper)\.dll$' })
+    }
 }
 
 function Stop-Listen([Diagnostics.Process]$Process) {
@@ -510,6 +588,9 @@ $summary = [ordered]@{
     runtime = $Runtime
     failure_runtime = $FailureRuntime
     audio_clip = $AudioClip
+    engine_request = $Engine
+    engine_kind = $(if ($engineKind) { $engineKind } else { 'application default (cloud trial)' })
+    package_root = $PackageRoot
     mode = 'acceptance = control channel only; ui_self_checks = window diagnostics (not acceptance)'
     acceptance = @{}
     ui_self_checks = @{}
@@ -540,6 +621,26 @@ try {
     $panelText = Read-Text $panelPath
     Check ($panelText.Contains((Get-StatusValue $status 'detail'))) 'panel.txt contains the human-readable detail from status.txt'
     Check ($panelText.Length -gt (Get-StatusValue $status 'detail').Length) 'panel.txt has a result section after the status detail'
+
+    # --- engine provenance (acceptance) ------------------------------------
+    # The local engine must be the one that was asked for, and it must have loaded its
+    # native files from the paths that were named, so a package run proves the packaged
+    # bytes. The panel window says nothing about this.
+    $provenance = Get-EngineProvenance $listen
+    $summary.engine = $provenance
+    $recognitionMode = Get-StatusValue $status 'recognition_mode'
+    $backendNote = Get-StatusValue $status 'backend'
+    if ($engineKind) {
+        Check ($recognitionMode -eq 'local') "status.txt reports a local recognition mode ($recognitionMode)"
+    }
+    if ($engineKind -eq 'sensevoice') {
+        Check ($backendNote -match 'SenseVoice q8') "status.txt reports the resident SenseVoice backend ($backendNote)"
+    }
+    if ($engineKind -eq 'sensevoice' -and $SherpaLib) {
+        $loaded = @($provenance.engine_modules | Where-Object { $_ -match '(?i)\\sherpa-onnx-c-api\.dll$' })
+        $expected = Join-Path $SherpaLib 'sherpa-onnx-c-api.dll'
+        Check (($loaded.Count -eq 1) -and ($loaded[0] -eq $expected)) "the running process loaded sherpa-onnx from $expected ($(@($provenance.engine_modules) -join '; '))"
+    }
 
     # REMOVAL CHECK - the only legacy-window assertion in this script. It proves
     # issue #20 deleted the old detail window; it is not an acceptance oracle and
@@ -839,7 +940,10 @@ try {
     # read the reason. The panel must NOT auto-open on Failure.
     $brokenModel = Join-Path $FailureRuntime 'missing-model.onnx'
     Remove-Item -LiteralPath $brokenModel -ErrorAction SilentlyContinue
-    $listen = Start-Listen $FailureRuntime @('--sensevoice-model', (ConvertTo-QuotedWindowsPath $brokenModel))
+    $savedModel = $SenseVoiceModel
+    $SenseVoiceModel = $brokenModel
+    try { $listen = Start-Listen $FailureRuntime }
+    finally { $SenseVoiceModel = $savedModel }
     $failureStatusPath = Join-Path $FailureRuntime 'status.txt'
     $failurePanelPath = Join-Path $FailureRuntime 'panel.txt'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)

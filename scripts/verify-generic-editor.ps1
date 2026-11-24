@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][ValidateSet('plain', 'rich')][string]$Target,
     [ValidateSet('normal', 'rebuild', 'readonly')][string]$Scenario = 'normal',
     [string]$ToolsRoot = '',
