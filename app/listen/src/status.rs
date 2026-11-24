@@ -69,6 +69,21 @@ impl FactsKey {
     }
 }
 
+/// Whether the report's inputs changed, and the whole file therefore has to be
+/// generated again.
+///
+/// The comparison is the values' own `PartialEq`, never a hand-written list of
+/// fields: the complete [`Snapshot`] on one side, and `FactsKey` — a field-for-field
+/// copy of [`HostFacts`] and [`WindowFacts`] — on the other. A field added to any of
+/// the three inputs is compared the moment it exists, so a new input cannot be
+/// silently left out of the rewrite decision.
+pub fn report_inputs_differ(
+    previous: Option<(&Snapshot, &FactsKey)>,
+    current: (&Snapshot, &FactsKey),
+) -> bool {
+    previous != Some(current)
+}
+
 /// The complete `runtime\status.txt` text for one snapshot.
 ///
 /// This is the one place the machine-readable contract is serialized. The key set,
@@ -232,8 +247,8 @@ pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_
 mod tests {
     use super::*;
     use listen::{
-        Delivery, Notice, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot,
-        Timing, UsageSummary,
+        CaptureEndpoint, Delivery, Notice, Phase, Preparation, Refine, SegmentState,
+        SegmentSummary, Snapshot, Timing, UsageSummary,
         recognition::{RecognitionMode, SessionState},
         streaming::CaptureProgress,
     };
@@ -458,6 +473,122 @@ mod tests {
                 "a changed window fact must be a new key: {changed:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_change_in_the_snapshot_host_facts_or_window_facts_requires_a_new_report() {
+        let base = snapshot();
+        let base_host = host();
+        let base_window = window();
+        let base_facts = FactsKey::of(&base_host, &base_window);
+        assert!(
+            !report_inputs_differ(Some((&base, &base_facts)), (&base, &base_facts)),
+            "identical inputs are the same report"
+        );
+
+        // One changed value from each of the three inputs. The value comparison
+        // decides a new report, and the text really differs, so the file is rewritten.
+        let mut changed_snapshot = snapshot();
+        changed_snapshot.detail = "a different sentence".into();
+        assert!(
+            report_inputs_differ(Some((&base, &base_facts)), (&changed_snapshot, &base_facts)),
+            "the whole snapshot is part of the comparison"
+        );
+        assert_ne!(
+            report(&base, &base_host, &base_window),
+            report(&changed_snapshot, &base_host, &base_window),
+            "a changed snapshot value writes new status text"
+        );
+
+        let changed_host = HostFacts {
+            glossary: "glossary.txt",
+            ..base_host
+        };
+        let changed_host_facts = FactsKey::of(&changed_host, &base_window);
+        assert!(
+            report_inputs_differ(Some((&base, &base_facts)), (&base, &changed_host_facts)),
+            "every host fact is in the comparison"
+        );
+        assert_ne!(
+            report(&base, &base_host, &base_window),
+            report(&base, &changed_host, &base_window),
+            "a changed host fact writes new status text"
+        );
+
+        let changed_window = WindowFacts {
+            capsule: "Failure",
+            ..base_window
+        };
+        let changed_window_facts = FactsKey::of(&base_host, &changed_window);
+        assert!(
+            report_inputs_differ(Some((&base, &base_facts)), (&base, &changed_window_facts)),
+            "every window fact is in the comparison"
+        );
+        assert_ne!(
+            report(&base, &base_host, &base_window),
+            report(&base, &base_host, &changed_window),
+            "a changed window fact writes new status text"
+        );
+    }
+
+    /// The hand-written field list missed exactly these three values before F6
+    /// (`endpoint`, `mode`, `current_sequence`), so they get an explicit regression
+    /// test on the value comparison.
+    #[test]
+    fn the_fields_the_hand_written_comparison_missed_now_change_the_report() {
+        let base = snapshot();
+        let base_facts = FactsKey::of(&host(), &window());
+
+        let mut with_endpoint = snapshot();
+        with_endpoint.endpoint = Some(CaptureEndpoint {
+            role: "multimedia".into(),
+            id: "endpoint-id".into(),
+            name: "Speakers".into(),
+        });
+        assert!(report_inputs_differ(
+            Some((&base, &base_facts)),
+            (&with_endpoint, &base_facts)
+        ));
+        assert_ne!(
+            report(&base, &host(), &window()),
+            report(&with_endpoint, &host(), &window())
+        );
+
+        let mut cloud = snapshot();
+        cloud.mode = RecognitionMode::CloudTrial;
+        assert!(report_inputs_differ(
+            Some((&base, &base_facts)),
+            (&cloud, &base_facts)
+        ));
+        assert_ne!(
+            report(&base, &host(), &window()),
+            report(&cloud, &host(), &window())
+        );
+
+        let pending = |sequence: u64| SegmentSummary {
+            sequence,
+            state: SegmentState::Result,
+            detail: String::new(),
+            text: "待取结果".into(),
+            delivery: Some(Delivery::Fallback),
+            usage: None,
+        };
+        let mut without_identity = snapshot();
+        without_identity.segments = (1..=3).map(pending).collect();
+        let mut with_identity = without_identity.clone();
+        with_identity.current_sequence = Some(2);
+        assert!(report_inputs_differ(
+            Some((&without_identity, &base_facts)),
+            (&with_identity, &base_facts)
+        ));
+        assert!(
+            report(&without_identity, &host(), &window()).contains("\npending_results=3\n"),
+            "all three results are pending without an identity"
+        );
+        assert!(
+            report(&with_identity, &host(), &window()).contains("\npending_results=2\n"),
+            "the current result is excluded by its sequence"
+        );
     }
 
     /// Every emitted line is `key=value`; `detail` is kept to one line in these

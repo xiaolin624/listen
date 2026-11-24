@@ -53,7 +53,7 @@ use segments::{Change, SegmentStore};
 use storage::Storage;
 use streaming::{CaptureProgress, SegmentStream};
 use target_write::{AppendValue, TargetWriteSession, WriteRule, Written};
-use transition::{Cause, Context, Notes, Partial, Record, Transition};
+use transition::{Cause, Context, Notes, Partial, Record, RecordRequest, Transition};
 
 pub type AppResult<T> = Result<T, String>;
 
@@ -476,9 +476,9 @@ pub enum SegmentState {
     /// The segment ended without a complete result.
     ///
     /// `Default` is only the zero value used when a record is assembled field by
-    /// field (and the fallback for a state name this version does not know); it is
-    /// the most conservative state, so such a record is never resumed or retried
-    /// automatically.
+    /// field. It is no longer a fallback for an unknown `segments.json` spelling: an
+    /// unrecognized state makes that index unreadable and the store reports the
+    /// degradation instead of guessing (ADR 0005).
     #[default]
     Failed,
 }
@@ -555,7 +555,7 @@ impl SegmentSummary {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
     /// Whether first-use model preparation is pending, finished or failed. This
@@ -1083,6 +1083,17 @@ enum RefineOutcome {
     },
 }
 
+/// Replace `current-result.txt` with the complete refined text, durably.
+///
+/// Both refine outcomes (a fallback with no target at all, and a confirmed target
+/// rewrite) go through this one call. The restart scan reads `current-result.txt`
+/// directly, so a crash or a refused replace must leave either the old file or the
+/// new one — never a truncated file. `durable::atomic_write` already serves the two
+/// other writers of this file.
+fn save_current_result(path: &Path, text: &str) -> std::io::Result<()> {
+    durable::atomic_write(path, text.as_bytes())
+}
+
 /// Run one refine and, when it is safe, replace only the appended transcript. This
 /// function is the whole backfill safety boundary:
 ///
@@ -1119,7 +1130,7 @@ fn refine_delivery(
     let Some(memory) = memory else {
         // Nothing was ever appended (the result was a fallback), so there is no
         // target to protect: the refined text simply becomes the current result.
-        return match fs::write(&current_result, &refined) {
+        return match save_current_result(&current_result, &refined) {
             Ok(()) => RefineOutcome::Applied {
                 refined,
                 note: "There was no writable target input to replace, so the refined text became the current result and is shown in the panel; nothing was written to any control.".into(),
@@ -1174,7 +1185,7 @@ fn refine_delivery(
     match attempt.outcome {
         Written::Confirmed { .. } => {
             let mut note = "The refined text replaced the appended transcript in the original target and was read back in full; review and send it manually.".to_string();
-            if let Err(error) = fs::write(&current_result, &refined) {
+            if let Err(error) = save_current_result(&current_result, &refined) {
                 note.push_str(&format!(
                     " The refined text is the current result here, but it could not be saved to current-result.txt ({error})."
                 ));
@@ -1981,7 +1992,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Silent,
-                    record: Record::Status,
+                    record: RecordRequest::Status,
                     preparation_changed: false,
                 });
             }
@@ -2006,7 +2017,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Restated { line: &line },
-                    record: Record::Status,
+                    record: RecordRequest::Status,
                     preparation_changed: false,
                 });
                 self.segments[index].retained_paths = resume.audio.retained.clone();
@@ -2546,7 +2557,7 @@ impl Application {
             stopped: Some(true),
             finalizing: None,
             cause: Cause::Stopped { detail: &detail },
-            record: Record::Status,
+            record: RecordRequest::Status,
             preparation_changed: false,
         });
         self.capture_stop_draft(index);
@@ -2647,7 +2658,7 @@ impl Application {
                     cause: Cause::Stopped {
                         detail: "Retrying recognition on the retained audio; the speech is not replayed.",
                     },
-                    record: Record::Status,
+                    record: RecordRequest::Status,
                     preparation_changed: false,
                 });
                 self.refresh_recovery_snapshot();
@@ -2691,7 +2702,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Restated { line: CLEANED },
-                    record: Record::Remove,
+                    record: RecordRequest::Remove,
                     preparation_changed: false,
                 });
                 self.refresh_recovery_snapshot();
@@ -2712,7 +2723,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Restated { line: &line },
-                    record: Record::Status,
+                    record: RecordRequest::Status,
                     preparation_changed: false,
                 });
                 self.refresh_recovery_snapshot();
@@ -2903,7 +2914,7 @@ impl Application {
             stopped: Some(true),
             finalizing: None,
             cause: Cause::Stopped { detail: reason },
-            record: Record::Status,
+            record: RecordRequest::Status,
             preparation_changed: false,
         });
         // A storage stop is still a stop: a later late result is judged against the
@@ -3113,7 +3124,7 @@ impl Application {
         }
         match decision.record {
             Record::Keep => {}
-            Record::Status | Record::StatusIfChanged => self.persist_segment(index),
+            Record::Status => self.persist_segment(index),
             Record::Remove => self.remove_segment_record(index),
             Record::Delivered => {
                 if let Cause::Delivered { text, delivery, .. } = &transition.cause {
@@ -3181,7 +3192,7 @@ impl Application {
                 detail: &status.detail,
                 session: status.state,
             },
-            record: Record::StatusIfChanged,
+            record: RecordRequest::StatusIfChanged,
             preparation_changed,
         });
         if stop_now {
@@ -3218,7 +3229,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Stable,
-                    record: Record::Keep,
+                    record: RecordRequest::Keep,
                     preparation_changed: false,
                 });
             }
@@ -3231,7 +3242,7 @@ impl Application {
                     stopped: None,
                     finalizing: None,
                     cause: Cause::Completed,
-                    record: Record::Keep,
+                    record: RecordRequest::Keep,
                     preparation_changed: false,
                 });
                 self.finish_recognition(index, result);
@@ -3403,7 +3414,7 @@ impl Application {
                 description: &description,
             },
             // A no-speech segment has no result to keep, so its record goes.
-            record: Record::Remove,
+            record: RecordRequest::Remove,
             preparation_changed: false,
         });
         self.segments[index].timing = timing.clone();
@@ -3516,9 +3527,9 @@ impl Application {
                 text: &delivered.text,
             },
             record: if keep_record {
-                Record::Delivered
+                RecordRequest::Delivered
             } else {
-                Record::Remove
+                RecordRequest::Remove
             },
             preparation_changed: false,
         });
@@ -3536,7 +3547,7 @@ impl Application {
                     previous: &previous,
                     error,
                 },
-                record: Record::Status,
+                record: RecordRequest::Status,
                 preparation_changed: false,
             });
         }
@@ -3617,7 +3628,7 @@ impl Application {
                 advice: advice.as_deref(),
                 summary: summary.as_deref(),
             },
-            record: Record::Status,
+            record: RecordRequest::Status,
             preparation_changed: false,
         });
         self.segments[index].retained_paths = paths;
@@ -3944,4 +3955,101 @@ pub(crate) fn audio_paths(directory: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod atomic_current_result_tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct Runtime(PathBuf);
+    impl Runtime {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "listen-current-result-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Runtime {
+        fn drop(&mut self) {
+            // A read-only fixture must not stop the harness from cleaning up.
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    if let Ok(metadata) = fs::metadata(entry.path()) {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_readonly(false);
+                        let _ = fs::set_permissions(entry.path(), permissions);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every directory entry except the one complete result file itself: a failed
+    /// replace must leave no `current-result.<id>.tmp` behind.
+    fn leftovers(directory: &Path) -> Vec<String> {
+        fs::read_dir(directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "current-result.txt")
+            .collect()
+    }
+
+    /// F2: both refine paths now call `save_current_result`, which replaces the file
+    /// through `durable::atomic_write`. A refused replace (the destination is
+    /// read-only, exactly the Windows case `MoveFileExW` rejects) leaves the previous
+    /// complete result in place and no temporary next to it; once the file is
+    /// writable again the next write lands completely. Old `fs::write` truncated the
+    /// destination as soon as it was opened; this path never does.
+    #[test]
+    fn a_refused_current_result_replace_keeps_the_previous_file_and_leaves_no_temporary() {
+        let runtime = Runtime::new();
+        let path = runtime.0.join("current-result.txt");
+        fs::write(&path, "the result before the refine").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let error = save_current_result(&path, "the refined text that must not half-land")
+            .expect_err("a read-only destination refuses the replace");
+        assert!(!error.to_string().is_empty());
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the result before the refine",
+            "the previous complete result is untouched, not truncated"
+        );
+        let temporary = leftovers(&runtime.0);
+        assert!(
+            temporary.is_empty(),
+            "a refused replace leaves no temporary behind: {temporary:?}"
+        );
+
+        // The same repair a user would apply lets the next replace land completely.
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        save_current_result(&path, "the refined text").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the refined text",
+            "the next write replaces the whole file"
+        );
+        assert!(leftovers(&runtime.0).is_empty());
+    }
 }

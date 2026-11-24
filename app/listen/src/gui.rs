@@ -66,6 +66,8 @@ struct Ui {
     /// the window keeps its settings and position for the session.
     panel: Option<Panel>,
     runtime: PathBuf,
+    /// The whole last snapshot, compared through `Snapshot`'s own `PartialEq`; no
+    /// field of it is listed here or at the comparison site.
     last: Option<Snapshot>,
     /// Last `status.txt` contents, so `panel_visible`/`panel_error` changes are
     /// persisted even when the application snapshot itself did not change.
@@ -381,29 +383,6 @@ impl Ui {
                 panel.apply(&state);
             }
 
-            let changed = self.last.as_ref().is_none_or(|last| {
-                last.phase != state.phase
-                    || last.preparation != state.preparation
-                    || last.recognition != state.recognition
-                    || last.detail != state.detail
-                    || last.text != state.text
-                    || last.retained_audio != state.retained_audio
-                    || last.delivery != state.delivery
-                    || last.retry_available != state.retry_available
-                    || last.endpoint != state.endpoint
-                    || last.backend != state.backend
-                    || last.mode != state.mode
-                    || last.timing != state.timing
-                    || last.refine != state.refine
-                    || last.refined_text != state.refined_text
-                    || last.notice != state.notice
-                    || last.usage != state.usage
-                    || last.segments != state.segments
-                    // Two captures can produce identical text and delivery, so the
-                    // current result's identity is compared as its own fact.
-                    || last.current_sequence != state.current_sequence
-                    || last.storage != state.storage
-            });
             let phase_changed = self
                 .last
                 .as_ref()
@@ -428,13 +407,18 @@ impl Ui {
                 capture_excluded: self.capsule.capture_excluded(),
             };
             // `status.txt` is a pure function of the snapshot plus the facts outside
-            // it, so the whole file is regenerated only when one of those inputs
-            // changed. The snapshot fields the report reads are all in the `changed`
-            // comparison above; `FactsKey` covers the rest. Before this, the 68-key
-            // string was formatted and compared on every 100 ms tick (#49).
+            // it. The rewrite decision compares those three values themselves — the
+            // whole `Snapshot` and the `FactsKey` that owns copies of `HostFacts` and
+            // `WindowFacts` — so a new snapshot field can never be left out of the
+            // comparison the way a hand-written field list could. The 68-key string
+            // is only formatted when one of them changed, and only written when the
+            // text itself changed (#49, F6).
             let facts = status::FactsKey::of(&host, &window);
             let mut regenerated = false;
-            if changed || self.last_facts.as_ref() != Some(&facts) {
+            if status::report_inputs_differ(
+                self.last.as_ref().zip(self.last_facts.as_ref()),
+                (&state, &facts),
+            ) {
                 let status = status::report(&state, &host, &window);
                 self.last_facts = Some(facts);
                 regenerated = true;
@@ -443,7 +427,7 @@ impl Ui {
                     self.last_status = status;
                 }
             }
-            if !changed && !regenerated {
+            if !regenerated {
                 return;
             }
             if self.tray {

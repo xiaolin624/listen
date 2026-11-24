@@ -245,18 +245,42 @@ enum Standing {
     Fixed(Phase, SessionState),
 }
 
-/// How the durable record follows the transition.
+/// What the caller asks the durable record to do, before the transition rules run.
+///
+/// This is an **input**, not the write itself: [`decide`] turns it into a [`Record`],
+/// the only value `Application::apply` executes. Keeping the two stages as separate
+/// types is what keeps `Status` and `StatusIfChanged` from becoming two names for the
+/// same write at the application point.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Record {
+pub(crate) enum RecordRequest {
     /// Nothing durable changed.
     #[default]
     Keep,
-    /// Write the state line unconditionally.
+    /// Write the state line unconditionally (its detail may have moved while the
+    /// durable state itself did not).
     Status,
     /// Write the state line only when the durable state itself changed. A live
     /// adapter's progress tick is the common case: its sentence moves every tick and
     /// must not rewrite `segments.json` for it.
     StatusIfChanged,
+    /// Write the complete delivered fact (text, delivery and the line).
+    Delivered,
+    /// The segment has nothing pending any more; drop its record.
+    Remove,
+}
+
+/// What the one application point actually does with the durable record.
+///
+/// This is the **output** of [`decide`]: the conditional request was resolved into
+/// one of these four writes, so `Application::apply` has one arm per real write and
+/// no two variants that do the same thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Record {
+    /// Nothing durable changed.
+    #[default]
+    Keep,
+    /// Write the state line.
+    Status,
     /// Write the complete delivered fact (text, delivery and the line).
     Delivered,
     /// The segment has nothing pending any more; drop its record.
@@ -276,7 +300,9 @@ pub(crate) struct Transition<'a> {
     pub stopped: Option<bool>,
     pub finalizing: Option<bool>,
     pub cause: Cause<'a>,
-    pub record: Record,
+    /// What this transition asks the durable record to do; [`decide`] resolves it
+    /// into a [`Record`] using the frozen rules.
+    pub record: RecordRequest,
     /// The user asked for a 术语表 reload and it changed in this tick. A progress tick
     /// may then refresh a stopped segment's sentence.
     pub preparation_changed: bool,
@@ -333,9 +359,11 @@ pub(crate) fn state_for_status(current: SegmentState, session: SessionState) -> 
 pub(crate) fn decide(transition: &Transition<'_>, lines: &Lines, context: &Context) -> Decision {
     let mut decision = Decision {
         record: match transition.record {
-            Record::StatusIfChanged if context.state_changed => Record::Status,
-            Record::StatusIfChanged => Record::Keep,
-            other => other,
+            RecordRequest::StatusIfChanged if !context.state_changed => Record::Keep,
+            RecordRequest::StatusIfChanged | RecordRequest::Status => Record::Status,
+            RecordRequest::Keep => Record::Keep,
+            RecordRequest::Delivered => Record::Delivered,
+            RecordRequest::Remove => Record::Remove,
         },
         state_changed: context.state_changed,
         ..Decision::default()
@@ -448,7 +476,7 @@ mod tests {
                 text: "第一行",
             },
             preparation_changed: false,
-            record: Record::Remove,
+            record: RecordRequest::Remove,
         };
         let lines = delivered_lines();
         let decision = decide(&transition, &lines, &Context::default());
@@ -639,7 +667,7 @@ mod tests {
             finalizing: None,
             preparation_changed: false,
             cause: progress,
-            record: Record::StatusIfChanged,
+            record: RecordRequest::StatusIfChanged,
         };
         let unchanged = decide(&conditional, &lines, &Context::default());
         assert_eq!(unchanged.record, Record::Keep);
@@ -687,7 +715,7 @@ mod tests {
             finalizing: None,
             preparation_changed: false,
             cause,
-            record: Record::Keep,
+            record: RecordRequest::Keep,
         }
     }
 }

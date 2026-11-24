@@ -114,11 +114,17 @@ impl Segment {
     }
 }
 
-/// The frozen spelling of a state in `segments.json`. An unrecognized name loads as
-/// the most conservative state instead of making the whole index unusable.
+/// The frozen spelling of a state in `segments.json`.
+///
+/// An unrecognized name makes the whole index unreadable instead of being guessed
+/// into a conservative-looking state: `open_versioned` reports the degradation, the
+/// file is left byte-for-byte as it is, and the store refuses every write until the
+/// user repairs or removes the record (ADR 0005). Recovery can still adopt durable
+/// text and audio from the runtime directory as orphans, exactly as it does for an
+/// index this version cannot read at all.
 mod state_name {
     use super::SegmentState;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(
         state: &SegmentState,
@@ -131,14 +137,24 @@ mod state_name {
         deserializer: D,
     ) -> Result<SegmentState, D::Error> {
         let name = String::deserialize(deserializer)?;
-        Ok(SegmentState::from_name(&name).unwrap_or(SegmentState::Failed))
+        SegmentState::from_name(&name).ok_or_else(|| {
+            D::Error::custom(format!(
+                "unknown segment state {name:?}; this version understands \
+                 capturing, waiting_for_network, processing, result, no_speech and failed, \
+                 so the stored spelling is left unchanged instead of being guessed"
+            ))
+        })
     }
 }
 
 /// The frozen spelling of a resolved delivery decision in `segments.json`.
+///
+/// Like [`super::DeliveryState::from_name`] on the `delivery.json` side, an unknown
+/// spelling is never guessed into a safer-looking state: it makes this index
+/// unreadable and is reported and left as stored.
 mod delivery_name {
     use super::{Delivery, DeliveryState};
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(
         delivery: &Option<Delivery>,
@@ -154,9 +170,17 @@ mod delivery_name {
         deserializer: D,
     ) -> Result<Option<Delivery>, D::Error> {
         let name = Option::<String>::deserialize(deserializer)?;
-        Ok(name.map(|name| {
-            DeliveryState::from_name(&name).map_or(Delivery::Uncertain, Delivery::from)
-        }))
+        match name {
+            None => Ok(None),
+            Some(name) => match DeliveryState::from_name(&name) {
+                Some(state) => Ok(Some(Delivery::from(state))),
+                None => Err(D::Error::custom(format!(
+                    "unknown delivery {name:?}; this version understands appended, fallback \
+                     and uncertain, plus the legacy pending/started names (read as uncertain), \
+                     so the stored spelling is left unchanged instead of being guessed"
+                ))),
+            },
+        }
     }
 }
 
@@ -696,6 +720,105 @@ mod tests {
             fs::read_to_string(&index).unwrap(),
             future,
             "a degraded store never writes"
+        );
+    }
+
+    #[test]
+    fn an_unknown_state_spelling_is_reported_and_never_written_back() {
+        let runtime = Runtime::new();
+        let index = runtime.0.join(INDEX_FILE);
+        let stored = r#"{"version":1,"next_sequence":3,"current_sequence":1,"segments":[{"sequence":1,"directory":"session-1","state":"archived","detail":"kept exactly as stored","text_file":null,"text_chars":0,"delivery":null,"usage":null,"glossary_terms":[],"updated_utc":1.0}]}"#;
+        fs::write(&index, stored).unwrap();
+
+        let mut store = SegmentStore::open(&runtime.0);
+        let problem = store
+            .problem()
+            .expect("an unknown state spelling must be reported");
+        assert!(
+            problem.contains("archived"),
+            "the degradation names the exact spelling: {problem}"
+        );
+
+        // Any write path is refused while the record is degraded: `begin` asks the
+        // store to persist, gets the one problem line, and the file keeps its bytes.
+        let (_, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-new", "capturing", &[]));
+        assert!(
+            error.is_some(),
+            "the degraded record must report the refusal"
+        );
+        assert_eq!(
+            fs::read_to_string(&index).unwrap(),
+            stored,
+            "an unknown spelling is never guessed into `failed` and written back"
+        );
+    }
+
+    #[test]
+    fn an_unknown_delivery_spelling_is_reported_and_never_written_back() {
+        let runtime = Runtime::new();
+        let index = runtime.0.join(INDEX_FILE);
+        let stored = r#"{"version":1,"next_sequence":2,"segments":[{"sequence":1,"directory":"session-1","state":"result","detail":"kept exactly as stored","text_file":null,"text_chars":0,"delivery":"maybe","usage":null,"glossary_terms":[],"updated_utc":1.0}]}"#;
+        fs::write(&index, stored).unwrap();
+
+        let mut store = SegmentStore::open(&runtime.0);
+        let problem = store
+            .problem()
+            .expect("an unknown delivery spelling must be reported");
+        assert!(
+            problem.contains("maybe"),
+            "the degradation names the exact spelling: {problem}"
+        );
+
+        let (_, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-new", "capturing", &[]));
+        assert!(
+            error.is_some(),
+            "the degraded record must report the refusal"
+        );
+        assert_eq!(
+            fs::read_to_string(&index).unwrap(),
+            stored,
+            "an unknown spelling is never guessed into `uncertain` and written back"
+        );
+    }
+
+    #[test]
+    fn a_hand_repaired_index_with_a_known_spelling_loads_and_writes_again() {
+        let runtime = Runtime::new();
+        let index = runtime.0.join(INDEX_FILE);
+        let unknown = r#"{"version":1,"next_sequence":2,"segments":[{"sequence":1,"directory":"session-1","state":"archived","detail":"kept exactly as stored","text_file":null,"text_chars":0,"delivery":null,"usage":null,"glossary_terms":[],"updated_utc":1.0}]}"#;
+        fs::write(&index, unknown).unwrap();
+        assert!(
+            SegmentStore::open(&runtime.0).problem().is_some(),
+            "the hand edit starts from the degraded record"
+        );
+
+        // The user edits the one spelling by hand. Reopening is enough: the file is
+        // the only authority, and nothing about the unknown value survives in memory.
+        let repaired = unknown.replace(r#""state":"archived""#, r#""state":"failed""#);
+        fs::write(&index, &repaired).unwrap();
+        let mut store = SegmentStore::open(&runtime.0);
+        assert!(store.problem().is_none(), "{:?}", store.problem());
+        assert_eq!(store.records().len(), 1);
+        assert_eq!(store.records()[0].state, SegmentState::Failed);
+
+        store
+            .apply(Change::Status {
+                sequence: 1,
+                state: SegmentState::Failed,
+                detail: "repaired by hand".into(),
+            })
+            .applied();
+        let written = fs::read_to_string(&index).unwrap();
+        assert!(
+            written.contains(r#""detail":"repaired by hand""#),
+            "the repaired store writes again: {written}"
+        );
+        assert_eq!(
+            SegmentStore::open(&runtime.0).records()[0].detail,
+            "repaired by hand",
+            "the write is the same durable record a restart reads"
         );
     }
 
