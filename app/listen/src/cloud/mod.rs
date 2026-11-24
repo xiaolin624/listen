@@ -17,7 +17,6 @@ use crate::{
         SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
     },
 };
-pub(crate) use budget::atomic_write as persist_result;
 pub use budget::{Attempt, LedgerSnapshot, TrialLedger, Usage};
 #[cfg(windows)]
 pub use credentials::{CREDENTIAL_TARGET, LocalCredentials, local_settings};
@@ -1271,22 +1270,7 @@ fn segment_name(directory: &std::path::Path) -> AppResult<String> {
 }
 
 fn task_id() -> AppResult<String> {
-    #[cfg(windows)]
-    {
-        let guid = unsafe { windows::Win32::System::Com::CoCreateGuid() }
-            .map_err(|_| "Cannot create cloud task identity")?;
-        Ok(format!("{guid:?}"))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(format!(
-            "{:032x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos()
-        ))
-    }
+    crate::durable::unique_id().map_err(|_| "Cannot create cloud task identity".to_string())
 }
 fn provider_failure(code: Option<&str>) -> CloudError {
     match code {

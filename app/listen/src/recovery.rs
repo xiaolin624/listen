@@ -17,9 +17,9 @@
 
 use crate::{
     Delivery, SegmentState,
-    delivery::DeliveryState,
-    recognition::SegmentUsage,
-    segments::{SegmentRecord, SegmentStore},
+    delivery::{DeliveryState, recovered_delivery},
+    durable::now_utc,
+    segments::{Segment, SegmentStore},
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -66,26 +66,30 @@ pub(crate) struct RecoveredAudio {
     pub retained: Vec<PathBuf>,
 }
 
-/// One segment the previous process left behind, as the application rebuilds it.
+/// One segment the previous process left behind, as the application rebuilds it:
+/// the authoritative facts plus what only the startup scan can know (the audio it
+/// validated, the paths it kept, and the recovery sentence that must survive every
+/// later status refresh).
 pub(crate) struct RecoveredSegment {
-    pub sequence: u64,
-    pub directory: Option<PathBuf>,
-    pub state: SegmentState,
-    pub detail: String,
-    pub text: Option<String>,
-    pub delivery: Option<Delivery>,
-    pub usage: Option<SegmentUsage>,
-    pub glossary_terms: Vec<String>,
+    pub facts: Segment,
     pub audio: Option<RecoveredAudio>,
     pub retained_paths: Vec<PathBuf>,
-    /// Whether this process should process the recording again automatically.
-    pub resumable: bool,
-    /// Whether the complete text is durably readable, so the audio may be released.
-    pub release_audio: bool,
+    /// The validated capture directory whose received audio may be released because
+    /// the complete text is durably readable. `None` keeps every recording.
+    pub release: Option<PathBuf>,
     /// The recovery fact that must survive every later status refresh: a recovered
     /// segment's recording is not re-recorded, its old target is not reused, and an
     /// incomplete recording is never presented as a complete one.
     pub note: Option<String>,
+}
+
+impl RecoveredSegment {
+    /// Whether this process should process the recording again automatically. Only a
+    /// validated recording whose segment is still in flight qualifies; a failure is
+    /// never retried because that would spend money without the user asking.
+    pub fn resumable(&self) -> bool {
+        self.audio.is_some() && self.facts.state == SegmentState::Processing
+    }
 }
 
 /// The persistent sentence beside a recovered segment's own progress detail. The
@@ -118,6 +122,9 @@ pub(crate) struct OrphanText {
     sequence: u64,
     name: String,
     text: String,
+    /// The durable delivery decision for this capture order, when a record still
+    /// proves one. A confirmed 精修 append survives its drained index entry here.
+    delivery: Option<DeliveryState>,
 }
 
 /// A capture directory the index does not describe. Its original capture order was
@@ -152,118 +159,111 @@ impl Plan {
     /// segments with their own durable records, and return the warnings the user
     /// must see. `terms` is the current 术语表: a lost index also lost the
     /// capture-time snapshot, and the detail says so.
-    pub fn adopt(
-        &mut self,
-        runtime: &Path,
-        store: &mut SegmentStore,
-        terms: &[String],
-    ) -> Vec<String> {
+    pub fn adopt(&mut self, store: &mut SegmentStore, terms: &[String]) -> Vec<String> {
         let mut warnings = Vec::new();
         for orphan in std::mem::take(&mut self.orphan_texts) {
-            let detail = format!(
-                "{RECOVERED_TEXT_DETAIL} The segment index did not describe this saved result, so its delivery state is unknown; it is kept in the panel and is never written again automatically."
+            // A delivery record for this capture order is still the authority even
+            // when the index entry it belonged to is gone: a confirmed 精修 append
+            // must be read as confirmed, not reported as never written (#44, W3).
+            let delivery = recovered_delivery(orphan.delivery);
+            let note = Some(
+                "Recovered after Listen restarted from a complete text the segment index did not describe; it stays in the panel and is never written to any old target."
+                    .to_string(),
             );
-            let delivery = Delivery::Uncertain;
-            self.segments.push(RecoveredSegment {
+            let facts = Segment {
                 sequence: orphan.sequence,
-                directory: None,
                 state: SegmentState::Result,
-                detail: detail.clone(),
-                text: Some(orphan.text.clone()),
-                delivery: Some(delivery),
-                usage: None,
-                glossary_terms: terms.to_vec(),
-                audio: None,
-                retained_paths: Vec::new(),
-                resumable: false,
-                release_audio: false,
-                note: Some(
-                    "Recovered after Listen restarted from a complete text the segment index did not describe; it stays in the panel and is never written to any old target."
-                        .to_string(),
-                ),
-            });
-            let record = SegmentRecord {
-                sequence: orphan.sequence,
-                directory: String::new(),
-                state: SegmentState::Result.name().to_owned(),
-                detail,
+                detail: adopted_text_detail(delivery),
                 text_file: Some(orphan.name),
                 text_chars: orphan.text.chars().count(),
-                delivery: Some(DeliveryState::Uncertain.name().into()),
-                usage: None,
+                text: Some(orphan.text),
+                delivery: Some(delivery),
                 glossary_terms: terms.to_vec(),
-                updated_utc: crate::durable::now_utc(),
+                updated_utc: now_utc(),
+                ..Segment::default()
             };
-            if let Some(error) = store.upsert(record) {
+            if let Some(error) = store.adopt(facts.clone()) {
                 warnings.push(error);
             }
+            self.segments.push(RecoveredSegment {
+                facts,
+                audio: None,
+                retained_paths: Vec::new(),
+                release: None,
+                note,
+            });
         }
         for orphan in std::mem::take(&mut self.orphan_directories) {
-            let sequence = store.allocate();
             let audio_problem = orphan
                 .audio
                 .as_ref()
                 .and_then(|audio| audio.problem.clone());
-            let (state, detail, delivery, resumable) = match &orphan.audio {
-                Some(_) => {
-                    let mut detail = ORPHAN_RESUMED_DETAIL.to_string();
-                    if let Some(problem) = &audio_problem {
-                        detail.push_str(&incomplete_note(problem));
+            let (_, facts, error) = store.begin(|sequence| {
+                let (state, detail) = match &orphan.audio {
+                    Some(_) => {
+                        let mut detail = ORPHAN_RESUMED_DETAIL.to_string();
+                        if let Some(problem) = &audio_problem {
+                            detail.push_str(&incomplete_note(problem));
+                        }
+                        (SegmentState::Processing, detail)
                     }
-                    (SegmentState::Processing, detail, None, true)
-                }
-                None => (
-                    SegmentState::Failed,
-                    format!(
-                        "Segment {sequence} was found in the runtime directory but not in the segment index, and no readable audio was found. Nothing was deleted; delete this segment explicitly if it is no longer needed."
+                    None => (
+                        SegmentState::Failed,
+                        format!(
+                            "Segment {sequence} was found in the runtime directory but not in the segment index, and no readable audio was found. Nothing was deleted; delete this segment explicitly if it is no longer needed."
+                        ),
                     ),
-                    None,
-                    false,
-                ),
-            };
-            self.segments.push(RecoveredSegment {
-                sequence,
-                directory: Some(runtime.join(&orphan.name)),
-                state,
-                detail: detail.clone(),
-                text: None,
-                delivery,
-                usage: None,
-                glossary_terms: terms.to_vec(),
-                audio: orphan.audio,
-                retained_paths: orphan.retained,
-                resumable,
-                release_audio: false,
-                note: resumable.then(|| recovery_note(audio_problem.as_deref())),
+                };
+                Segment {
+                    sequence,
+                    directory: orphan.name.clone(),
+                    state,
+                    detail,
+                    glossary_terms: terms.to_vec(),
+                    updated_utc: now_utc(),
+                    ..Segment::default()
+                }
             });
-            let record = SegmentRecord {
-                sequence,
-                directory: orphan.name,
-                state: state.name().to_owned(),
-                detail,
-                text_file: None,
-                text_chars: 0,
-                delivery: None,
-                usage: None,
-                glossary_terms: terms.to_vec(),
-                updated_utc: crate::durable::now_utc(),
-            };
-            if let Some(error) = store.upsert(record) {
+            if let Some(error) = error {
                 warnings.push(error);
             }
+            let note = (facts.state == SegmentState::Processing)
+                .then(|| recovery_note(audio_problem.as_deref()));
+            self.segments.push(RecoveredSegment {
+                facts,
+                audio: orphan.audio,
+                retained_paths: orphan.retained,
+                release: None,
+                note,
+            });
         }
         if self.segments.iter().any(|segment| {
-            segment.detail.starts_with(ORPHAN_RESUMED_DETAIL)
-                || segment.detail.contains("not in the segment index")
+            segment.facts.detail.starts_with(ORPHAN_RESUMED_DETAIL)
+                || segment.facts.detail.contains("not in the segment index")
         }) {
             self.problems.push(
                 "The segment index did not describe every leftover capture; those segments were recovered from the runtime directory and are listed after the recorded ones."
                     .into(),
             );
         }
-        self.segments.sort_by_key(|segment| segment.sequence);
+        self.segments.sort_by_key(|segment| segment.facts.sequence);
         warnings
     }
+}
+
+/// The one readable sentence for an adopted complete text the index did not
+/// describe. Only a proven decision is stated as one.
+fn adopted_text_detail(delivery: Delivery) -> String {
+    let kept = "The segment index did not describe this saved result, so its record is rebuilt here; it is kept in the panel and is never written again automatically.";
+    let mut detail = RECOVERED_TEXT_DETAIL.to_string();
+    match delivery {
+        Delivery::Appended => detail.push_str(RECOVERED_APPENDED_NOTE),
+        Delivery::Uncertain => detail.push_str(UNKNOWN_DELIVERY_NOTE),
+        Delivery::Fallback => {}
+    }
+    detail.push(' ');
+    detail.push_str(kept);
+    detail
 }
 
 /// One recording that is processed again, with the capture-time terms.
@@ -296,16 +296,16 @@ impl Recovery {
         let mut resumed = 0;
         let mut texts = 0;
         for segment in segments {
-            if segment.resumable {
+            if segment.resumable() {
                 if let Some(audio) = segment.audio.clone() {
                     resumed += 1;
                     self.queue.push_back(Resume {
-                        sequence: segment.sequence,
+                        sequence: segment.facts.sequence,
                         audio,
-                        glossary_terms: segment.glossary_terms,
+                        glossary_terms: segment.facts.glossary_terms,
                     });
                 }
-            } else if segment.text.is_some() {
+            } else if segment.facts.text.is_some() {
                 texts += 1;
             }
         }
@@ -394,10 +394,10 @@ fn plural(count: usize) -> &'static str {
 /// nothing was written.
 pub(crate) fn plan(
     runtime: &Path,
-    records: &[SegmentRecord],
+    records: &[Segment],
     deliveries: &BTreeMap<u64, DeliveryState>,
 ) -> Plan {
-    let mut sorted: Vec<&SegmentRecord> = records.iter().collect();
+    let mut sorted: Vec<&Segment> = records.iter().collect();
     sorted.sort_by_key(|record| record.sequence);
     let mut segments = Vec::new();
     let mut problems = Vec::new();
@@ -429,28 +429,29 @@ pub(crate) fn plan(
                 .map(crate::audio_paths)
                 .unwrap_or_default(),
         };
-        let delivery_state = deliveries.get(&sequence).copied();
-        let recorded_delivery = record
-            .delivery
-            .as_deref()
-            .and_then(DeliveryState::from_name);
-        let delivery = delivery_state.or(recorded_delivery);
+        // The live delivery record is the authority; the index's own delivery field
+        // is only the fallback for when the ledger no longer has the entry.
+        let delivery = match deliveries.get(&sequence).copied() {
+            Some(state) => recovered_delivery(Some(state)),
+            None => record.delivery.unwrap_or(Delivery::Uncertain),
+        };
         let text_is_some = text.is_some();
         let audio_problem = audio.as_ref().and_then(|audio| audio.problem.clone());
-        let resumable_state = matches!(
-            record.state.as_str(),
-            "capturing" | "waiting_for_network" | "processing"
-        );
-        let (state, detail, delivery, resumable, release_audio) = match text.as_ref() {
+        let resumable_state = record.state.in_flight();
+        let (state, detail, delivery, release) = match text.as_ref() {
             Some(_) => {
-                let delivery = recovered_delivery(delivery);
                 let mut detail = RECOVERED_TEXT_DETAIL.to_string();
                 if delivery == Delivery::Appended {
                     detail.push_str(RECOVERED_APPENDED_NOTE);
                 } else if delivery == Delivery::Uncertain {
                     detail.push_str(UNKNOWN_DELIVERY_NOTE);
                 }
-                (SegmentState::Result, detail, Some(delivery), false, true)
+                (
+                    SegmentState::Result,
+                    detail,
+                    Some(delivery),
+                    directory.clone(),
+                )
             }
             None => match audio.as_ref() {
                 Some(audio) if resumable_state => {
@@ -458,29 +459,30 @@ pub(crate) fn plan(
                     if let Some(problem) = &audio.problem {
                         detail.push_str(&incomplete_note(problem));
                     }
-                    (SegmentState::Processing, detail, None, true, false)
+                    (SegmentState::Processing, detail, None, None)
                 }
                 Some(audio) => {
                     // The recording is recoverable but the segment is not in flight:
                     // a failure stays a failure. It is never retried automatically
                     // because that would spend money without the user asking.
-                    let mut detail = if record.state == "no_speech" {
+                    let mut detail = if record.state == SegmentState::NoSpeech {
                         "The previous session recorded no speech for this segment, but its audio is still kept on this machine.".to_string()
                     } else {
                         format!(
                             "The previous session ended with this segment recorded as '{}'. {} The recording is kept on this machine.",
-                            record.state, record.detail
+                            record.state.name(),
+                            record.detail
                         )
                     };
                     if let Some(problem) = &audio.problem {
                         detail.push_str(&incomplete_note(problem));
                     }
-                    let state = if record.state == "no_speech" {
+                    let state = if record.state == SegmentState::NoSpeech {
                         SegmentState::NoSpeech
                     } else {
                         SegmentState::Failed
                     };
-                    (state, detail, None, false, false)
+                    (state, detail, None, None)
                 }
                 None if directory.is_some() => {
                     // A directory with nothing processable in it. Do not delete it:
@@ -489,10 +491,10 @@ pub(crate) fn plan(
                         "Segment {sequence} was recovered from the previous Listen session, but no readable audio and no complete text were found. Nothing was deleted; delete this segment explicitly if it is no longer needed."
                     );
                     problems.push(detail.clone());
-                    (SegmentState::Failed, detail, None, false, false)
+                    (SegmentState::Failed, detail, None, None)
                 }
                 None => {
-                    let delivered = matches!(delivery, Some(DeliveryState::Appended));
+                    let delivered = delivery == Delivery::Appended;
                     let detail = if delivered {
                         // The crash landed between deleting this segment's text and
                         // dropping its index entry. The result was already delivered
@@ -500,7 +502,7 @@ pub(crate) fn plan(
                         format!(
                             "Segment {sequence}'s complete result was already delivered to its target by the previous session, and no pending recording or separate text copy was left. Nothing is pending for this segment."
                         )
-                    } else if record.state == "failed" {
+                    } else if record.state == SegmentState::Failed {
                         format!(
                             "Segment {sequence} failed in the previous Listen session; {}. No pending recording or complete text was left to recover.",
                             record.detail
@@ -516,10 +518,11 @@ pub(crate) fn plan(
                         SegmentState::Failed
                     };
                     let delivery = delivered.then_some(Delivery::Appended);
-                    (state, detail, delivery, false, false)
+                    (state, detail, delivery, None)
                 }
             },
         };
+        let resumable = audio.is_some() && state == SegmentState::Processing;
         let note = if text_is_some {
             Some(
                 "Recovered after Listen restarted; this complete result stays in the panel and is never written to the old target automatically."
@@ -530,19 +533,26 @@ pub(crate) fn plan(
         } else {
             None
         };
+        // Rebuild the facts from the record and override only what the scan
+        // decided. Every other durable fact (the capture directory, the term
+        // snapshot, the cost, the delivery pointer) is carried by the record, so a
+        // field added to `Segment` reaches recovery without being listed here.
+        let mut facts = record.clone();
+        facts.state = state;
+        facts.detail = detail;
+        if text.is_some() {
+            // A readable complete text is the durable copy: the record points at the
+            // one file name the naming convention owns.
+            facts.text_file = Some(SegmentStore::text_name(sequence));
+            facts.text_chars = text.as_ref().map(|text| text.chars().count()).unwrap_or(0);
+        }
+        facts.delivery = delivery;
+        facts.text = text;
         segments.push(RecoveredSegment {
-            sequence,
-            directory,
-            state,
-            detail,
-            text,
-            delivery,
-            usage: record.usage.clone(),
-            glossary_terms: record.glossary_terms.clone(),
+            facts,
             audio,
             retained_paths,
-            resumable,
-            release_audio,
+            release,
             note,
         });
     }
@@ -550,7 +560,7 @@ pub(crate) fn plan(
     // index write was lost, or a recording whose index entry never landed. They are
     // recovered instead of being treated as orphans on disk.
     let (orphan_texts, orphan_directories) =
-        scan_orphans(runtime, &known_sequences, &known_directories);
+        scan_orphans(runtime, &known_sequences, &known_directories, deliveries);
     Plan {
         segments,
         orphan_texts,
@@ -559,27 +569,12 @@ pub(crate) fn plan(
     }
 }
 
-/// A recovered result's delivery state. Only an explicit `fallback` record proves
-/// that nothing was written. A `pending` record can hide a write whose `started`
-/// marker could not be saved, and a missing record (never written, pruned, or an
-/// unreadable ledger) proves nothing at all, so both are reported as uncertain
-/// instead of claiming a panel-only fallback.
-fn recovered_delivery(state: Option<DeliveryState>) -> Delivery {
-    match state {
-        Some(DeliveryState::Appended) => Delivery::Appended,
-        Some(DeliveryState::Fallback) => Delivery::Fallback,
-        Some(DeliveryState::Pending)
-        | Some(DeliveryState::Started)
-        | Some(DeliveryState::Uncertain)
-        | None => Delivery::Uncertain,
-    }
-}
-
 /// Every complete text file and capture directory the index did not describe.
 fn scan_orphans(
     runtime: &Path,
     known_sequences: &[u64],
     known_directories: &[String],
+    deliveries: &BTreeMap<u64, DeliveryState>,
 ) -> (Vec<OrphanText>, Vec<OrphanDirectory>) {
     let Ok(entries) = fs::read_dir(runtime) else {
         return (Vec::new(), Vec::new());
@@ -619,6 +614,9 @@ fn scan_orphans(
             sequence,
             name,
             text,
+            // A drained index entry can leave this complete text behind (a confirmed
+            // 精修 writes it again). The delivery record still knows what happened.
+            delivery: deliveries.get(&sequence).copied(),
         });
     }
     texts.sort_by_key(|orphan| orphan.sequence);
@@ -635,7 +633,7 @@ pub(crate) fn incomplete_note(problem: &str) -> String {
 }
 
 /// The complete text this segment already owns, if it is readable.
-fn read_text(runtime: &Path, record: &SegmentRecord) -> Option<String> {
+fn read_text(runtime: &Path, record: &Segment) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     if let Some(name) = &record.text_file {
         candidates.push(name.clone());
@@ -659,7 +657,7 @@ fn read_text(runtime: &Path, record: &SegmentRecord) -> Option<String> {
 /// A directory field from the index is only usable when it is one plain name
 /// inside the runtime directory. A corrupted index must never make recovery read
 /// or delete something outside it.
-fn safe_directory(runtime: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn safe_directory(runtime: &Path, name: &str) -> Option<PathBuf> {
     if name.is_empty()
         || name.contains(['/', '\\'])
         || !name.starts_with(SESSION_PREFIX)

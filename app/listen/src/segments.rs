@@ -2,8 +2,14 @@
 //!
 //! Every start/stop is an independent segment: its audio stays in a session
 //! directory, its complete text and its state/usage are recorded separately, and a
-//! later segment never overwrites an earlier one. This module owns the on-disk
-//! shape only; the application decides what a segment means.
+//! later segment never overwrites an earlier one.
+//!
+//! This module owns the on-disk shape **and** the one way it changes. [`Segment`] is
+//! the authoritative representation of one segment: `segments.json` is that value
+//! serialized (the frozen version-1 shape), the panel's summary is a projection of
+//! it, and a restart scan rebuilds it from the index plus the text file. Runtime-only
+//! state (a live recognition handle, a bound target, `Instant`s) belongs to the
+//! application's own session, never here: a scan result must stay read-only.
 //!
 //! Layout in the runtime directory (all files, so `session_directories` style checks
 //! on the audio lifecycle still mean what they meant):
@@ -18,11 +24,19 @@
 //! `segments.json` is replaced atomically only after the text is on disk, so an
 //! interrupted save can lose the index entry but never the complete text file it
 //! already wrote.
+//!
+//! # The one write path
+//!
+//! `SegmentStore` exposes named changes ([`Change`]) instead of a mutable record.
+//! The caller says *what happened*; the store decides whether the index has to be
+//! written, never writes while the record is degraded, and reports a write failure
+//! exactly once. There is no `record_mut`: a caller cannot leave the index
+//! half-updated by forgetting the persist, and cannot re-report the same failure.
 
 use crate::{
-    AppResult,
-    cloud::persist_result,
-    durable::{VersionedRecord, now_utc, open_versioned},
+    AppResult, Delivery, SegmentState,
+    delivery::DeliveryState,
+    durable::{VersionedRecord, atomic_write, now_utc, open_versioned},
     recognition::SegmentUsage,
 };
 use serde::{Deserialize, Serialize};
@@ -38,17 +52,24 @@ const INDEX_FILE: &str = "segments.json";
 const TEXT_PREFIX: &str = "segment-";
 const TEXT_SUFFIX: &str = ".txt";
 
-/// One segment as it must survive a process restart: where its audio is, what
-/// state it reached, where its complete text is, and what it may cost.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One segment's authoritative facts: everything that must survive a process
+/// restart, in one place.
+///
+/// The on-disk shape is this value's `Serialize` (version 1, unchanged since #33):
+/// `text_file`/`text_chars` are the durable pointers to the complete text, `text` is
+/// that text once this process has read or produced it. A new durable field is added
+/// here and nowhere else; only a field the panel shows also needs the one projection
+/// ([`crate::SegmentSummary::of`]).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SegmentRecord {
+pub(crate) struct Segment {
     pub sequence: u64,
-    /// The runtime session directory name that holds this segment's audio.
+    /// The runtime session directory *name* that holds this segment's audio.
     pub directory: String,
     /// The stable spelling of the user-visible state (`capturing`,
     /// `waiting_for_network`, `processing`, `result`, `no_speech`, `failed`).
-    pub state: String,
+    #[serde(with = "state_name")]
+    pub state: SegmentState,
     /// The user-readable state line, without a credential or vendor error body.
     pub detail: String,
     /// The complete text file name inside the runtime directory, once saved.
@@ -57,7 +78,8 @@ pub struct SegmentRecord {
     /// A delivery decision, once one exists: `appended`, `fallback` or `uncertain`.
     /// Never a guess; the durable delivery record remains the authority for
     /// `pending`/`started` writes.
-    pub delivery: Option<String>,
+    #[serde(with = "delivery_name")]
+    pub delivery: Option<Delivery>,
     /// What the engine recorded for this segment's paid requests, if anything.
     pub usage: Option<SegmentUsage>,
     /// The fixed 术语表 snapshot of this capture, as canonical terms. A segment
@@ -67,6 +89,201 @@ pub struct SegmentRecord {
     #[serde(default)]
     pub glossary_terms: Vec<String>,
     pub updated_utc: f64,
+    /// The complete text itself, once this process has it. It is not stored in
+    /// `segments.json`; the text file above is the durable copy.
+    #[serde(skip)]
+    pub text: Option<String>,
+}
+
+impl Segment {
+    /// A capture that just started: its first durable record.
+    pub fn capturing(
+        sequence: u64,
+        directory: &str,
+        detail: &str,
+        glossary_terms: &[String],
+    ) -> Self {
+        Self {
+            sequence,
+            directory: directory.into(),
+            state: SegmentState::Capturing,
+            detail: detail.into(),
+            glossary_terms: glossary_terms.to_vec(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The frozen spelling of a state in `segments.json`. An unrecognized name loads as
+/// the most conservative state instead of making the whole index unusable.
+mod state_name {
+    use super::SegmentState;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        state: &SegmentState,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(state.name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<SegmentState, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(SegmentState::from_name(&name).unwrap_or(SegmentState::Failed))
+    }
+}
+
+/// The frozen spelling of a resolved delivery decision in `segments.json`.
+mod delivery_name {
+    use super::{Delivery, DeliveryState};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        delivery: &Option<Delivery>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match delivery {
+            Some(delivery) => serializer.serialize_some(DeliveryState::from(*delivery).name()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Delivery>, D::Error> {
+        let name = Option::<String>::deserialize(deserializer)?;
+        Ok(name.map(|name| {
+            DeliveryState::from_name(&name).map_or(Delivery::Uncertain, Delivery::from)
+        }))
+    }
+}
+
+/// One named change to one segment's durable record. The caller says what happened;
+/// the store decides whether that needs a write.
+#[derive(Clone, Debug)]
+pub(crate) enum Change {
+    /// This segment's own state line changed (`state` + `detail`).
+    Status {
+        sequence: u64,
+        state: SegmentState,
+        detail: String,
+    },
+    /// The complete text was saved as this segment's own text file; `current` says
+    /// the text is also the current result (`current-result.txt`). The record stores
+    /// where the text is, not its content: the content is this process's own and is
+    /// set where the application obtains it (a delivery, a failure, a 精修 or a
+    /// recovery scan).
+    Text {
+        sequence: u64,
+        chars: usize,
+        current: bool,
+    },
+    /// What the engine metered for this segment's paid requests.
+    Usage { sequence: u64, usage: SegmentUsage },
+    /// Restart recovery rebuilt this segment from the files on disk. Only the parts
+    /// that could be rebuilt are written; the rest keeps what the index said.
+    Recovered {
+        sequence: u64,
+        state: SegmentState,
+        detail: String,
+        text: Option<String>,
+        delivery: Option<Delivery>,
+    },
+    /// The capture-time term snapshot a lost index entry did not describe.
+    GlossaryTerms { sequence: u64, terms: Vec<String> },
+    /// A finished delivery: the outcome, its detail, the complete text and where the
+    /// text is.
+    Delivered {
+        sequence: u64,
+        state: SegmentState,
+        detail: String,
+        text: String,
+        delivery: Delivery,
+    },
+    /// Which capture owns `current-result.txt`, for an index that did not record it.
+    CurrentResult { sequence: u64 },
+}
+
+impl Change {
+    /// The capture order this change names.
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Status { sequence, .. }
+            | Self::Text { sequence, .. }
+            | Self::Usage { sequence, .. }
+            | Self::Recovered { sequence, .. }
+            | Self::GlossaryTerms { sequence, .. }
+            | Self::Delivered { sequence, .. }
+            | Self::CurrentResult { sequence } => *sequence,
+        }
+    }
+
+    /// The capture order that must become the current result, if this change says so.
+    fn current_result(&self) -> Option<u64> {
+        match self {
+            Self::Text {
+                sequence,
+                current: true,
+                ..
+            }
+            | Self::CurrentResult { sequence } => Some(*sequence),
+            _ => None,
+        }
+    }
+
+    /// Write this change into one segment's facts. `updated_utc` is the store's
+    /// business, so the same change can be applied to the application's copy too.
+    pub fn write(&self, record: &mut Segment) {
+        match self {
+            Self::Status { state, detail, .. } => {
+                record.state = *state;
+                record.detail = detail.clone();
+            }
+            Self::Text {
+                sequence, chars, ..
+            } => {
+                record.text_file = Some(SegmentStore::text_name(*sequence));
+                record.text_chars = *chars;
+            }
+            Self::Usage { usage, .. } => record.usage = Some(usage.clone()),
+            Self::Recovered {
+                state,
+                detail,
+                text,
+                delivery,
+                ..
+            } => {
+                record.state = *state;
+                record.detail = detail.clone();
+                if let Some(text) = text {
+                    record.text_file = Some(SegmentStore::text_name(record.sequence));
+                    record.text_chars = text.chars().count();
+                    record.text = Some(text.clone());
+                }
+                if let Some(delivery) = delivery {
+                    record.delivery = Some(*delivery);
+                }
+            }
+            Self::GlossaryTerms { terms, .. } => record.glossary_terms = terms.clone(),
+            Self::Delivered {
+                state,
+                detail,
+                text,
+                delivery,
+                ..
+            } => {
+                record.state = *state;
+                record.detail = detail.clone();
+                record.delivery = Some(*delivery);
+                record.text_file = Some(SegmentStore::text_name(record.sequence));
+                record.text_chars = text.chars().count();
+                record.text = Some(text.clone());
+            }
+            Self::CurrentResult { .. } => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -80,7 +297,7 @@ struct Index {
     /// An index written before this field existed loads as `0`.
     #[serde(default)]
     current_sequence: u64,
-    segments: Vec<SegmentRecord>,
+    segments: Vec<Segment>,
 }
 
 impl VersionedRecord for Index {
@@ -92,16 +309,20 @@ impl VersionedRecord for Index {
 }
 
 /// The runtime-directory segment store. It is used from the application thread
-/// only, so index writes are naturally serialized; workers only touch their own
-/// text file through [`SegmentStore::write_text`].
+/// only, so index writes are naturally serialized; workers only read their own text
+/// file through [`SegmentStore::write_text`].
 pub(crate) struct SegmentStore {
     runtime: PathBuf,
     next_sequence: u64,
     current_sequence: u64,
-    segments: Vec<SegmentRecord>,
+    segments: Vec<Segment>,
     /// Why the stored index could not be used, if it could not. The segments are
     /// still captured; only the durable record is degraded and says so.
     problem: Option<String>,
+    /// Whether a record problem was already handed to the caller. The store reports
+    /// a degraded or failing index once; every later change is still applied in
+    /// memory and stays silent, exactly like the single problem line the panel shows.
+    reported: bool,
 }
 
 impl SegmentStore {
@@ -134,6 +355,7 @@ impl SegmentStore {
             current_sequence,
             segments,
             problem,
+            reported: false,
         }
     }
 
@@ -148,14 +370,8 @@ impl SegmentStore {
         self.current_sequence
     }
 
-    /// Record which capture owns the current result. The caller persists separately
-    /// so the text, the current-result copy and this order land together.
-    pub fn set_current_sequence(&mut self, sequence: u64) {
-        self.current_sequence = sequence;
-    }
-
-    /// Every stored record, oldest capture order first.
-    pub fn records(&self) -> &[SegmentRecord] {
+    /// Every stored segment, oldest capture order first.
+    pub fn records(&self) -> &[Segment] {
         &self.segments
     }
 
@@ -179,90 +395,68 @@ impl SegmentStore {
         Self::text_sequence(name).is_some()
     }
 
-    /// The next capture order that no record and no saved text owns. Recovery
-    /// uses it for a recording whose index entry was lost; a new capture uses it
-    /// through [`SegmentStore::begin`], so neither can reuse a sequence.
-    pub fn allocate(&mut self) -> u64 {
+    /// Start one durable segment: allocate the next capture order no record and no
+    /// saved text owns, build its facts and write them. The sequence, the stored
+    /// facts and any record problem are returned; the in-memory capture is never
+    /// lost to a storage problem.
+    pub fn begin(&mut self, build: impl FnOnce(u64) -> Segment) -> (u64, Segment, Option<String>) {
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);
-        sequence
+        let segment = build(sequence);
+        self.segments.push(segment.clone());
+        (sequence, segment, self.persist())
     }
 
-    /// Allocate the next capture order and start its durable record. The sequence
-    /// is returned even when the record cannot be written, so the in-memory capture
-    /// is never lost to a storage problem.
-    pub fn begin(
-        &mut self,
-        directory: &Path,
-        detail: &str,
-        glossary_terms: &[String],
-    ) -> (u64, Option<String>) {
-        let sequence = self.allocate();
-        self.segments.push(SegmentRecord {
-            sequence,
-            directory: directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_owned(),
-            state: "capturing".into(),
-            detail: detail.into(),
-            text_file: None,
-            text_chars: 0,
-            delivery: None,
-            usage: None,
-            glossary_terms: glossary_terms.to_vec(),
-            updated_utc: now_utc(),
-        });
-        let error = self.persist().err();
-        (sequence, error)
-    }
-
-    /// Add or replace one record that recovery reconstructed from files on disk.
-    /// A record the index never described (an interrupted index save, a corrupt
-    /// index) keeps its own stable capture order and is never merged into another
-    /// segment. Returns why the index could not be written, if it could not.
-    pub fn upsert(&mut self, record: SegmentRecord) -> Option<String> {
-        self.next_sequence = self.next_sequence.max(record.sequence.saturating_add(1));
+    /// Adopt one segment the startup scan rebuilt. A record the index never
+    /// described (an interrupted index save, a corrupt index) keeps its own stable
+    /// capture order and is never merged into another segment.
+    pub fn adopt(&mut self, segment: Segment) -> Option<String> {
+        self.next_sequence = self.next_sequence.max(segment.sequence.saturating_add(1));
         match self
             .segments
             .iter_mut()
-            .find(|stored| stored.sequence == record.sequence)
+            .find(|stored| stored.sequence == segment.sequence)
         {
-            Some(stored) => *stored = record,
-            None => self.segments.push(record),
+            Some(stored) => *stored = segment,
+            None => self.segments.push(segment),
         }
-        self.persist().err()
+        self.persist()
     }
 
-    /// The record of one capture order, if it is still stored.
-    pub fn record_mut(&mut self, sequence: u64) -> Option<&mut SegmentRecord> {
-        self.segments
+    /// Apply one named change. Nothing is written when the change leaves the record
+    /// as it was, and nothing is written at all while the record is degraded; a
+    /// write failure is returned once and never repeated.
+    pub fn apply(&mut self, change: Change) -> Option<String> {
+        let mut changed = false;
+        if let Some(record) = self
+            .segments
             .iter_mut()
-            .find(|record| record.sequence == sequence)
-    }
-
-    /// Replace the stored index with the current records.
-    pub fn persist(&mut self) -> AppResult<()> {
-        if let Some(problem) = &self.problem {
-            return Err(problem.clone());
+            .find(|record| record.sequence == change.sequence())
+        {
+            let before = record.clone();
+            change.write(record);
+            if *record != before {
+                record.updated_utc = now_utc();
+                changed = true;
+            }
         }
-        let index = Index {
-            version: STORE_VERSION,
-            next_sequence: self.next_sequence,
-            current_sequence: self.current_sequence,
-            segments: self.segments.clone(),
-        };
-        let bytes = serde_json::to_vec(&index).map_err(|error| error.to_string())?;
-        persist_result(&self.runtime.join(INDEX_FILE), &bytes)
-            .map_err(|error| format!("Could not save the multi-segment record: {error}"))
+        if let Some(sequence) = change.current_result()
+            && self.current_sequence != sequence
+        {
+            self.current_sequence = sequence;
+            changed = true;
+        }
+        if !changed {
+            return None;
+        }
+        self.persist()
     }
 
     /// Write one segment's complete text. This is the reliable per-segment save;
     /// the caller must not release that segment's audio before it succeeds.
     pub fn write_text(&self, sequence: u64, text: &str) -> AppResult<String> {
         let name = Self::text_name(sequence);
-        persist_result(&self.runtime.join(&name), text.as_bytes()).map_err(|error| {
+        atomic_write(&self.runtime.join(&name), text.as_bytes()).map_err(|error| {
             format!("Could not save segment {sequence}'s complete result: {error}")
         })?;
         Ok(name)
@@ -271,14 +465,49 @@ impl SegmentStore {
     /// Forget one drained segment and its text file. Only called after the result
     /// was safely delivered (appended) or explicitly cleaned; a pending result is
     /// never removed by the application on its own.
-    pub fn remove(&mut self, sequence: u64) -> AppResult<()> {
-        if let Some(record) = self.record_mut(sequence) {
-            if let Some(name) = record.text_file.clone() {
-                let _ = fs::remove_file(self.runtime.join(name));
-            }
+    pub fn remove(&mut self, sequence: u64) -> Option<String> {
+        if let Some(name) = self
+            .segments
+            .iter()
+            .find(|record| record.sequence == sequence)
+            .and_then(|record| record.text_file.as_deref())
+            .filter(|name| Path::new(name).components().count() == 1)
+        {
+            let _ = fs::remove_file(self.runtime.join(name));
         }
         self.segments.retain(|record| record.sequence != sequence);
         self.persist()
+    }
+
+    /// Replace the stored index with the current records. The one place that writes
+    /// `segments.json`.
+    fn persist(&mut self) -> Option<String> {
+        if let Some(problem) = &self.problem {
+            return self.report(problem.clone());
+        }
+        let index = Index {
+            version: STORE_VERSION,
+            next_sequence: self.next_sequence,
+            current_sequence: self.current_sequence,
+            segments: self.segments.clone(),
+        };
+        let bytes = match serde_json::to_vec(&index) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.report(error.to_string()),
+        };
+        match atomic_write(&self.runtime.join(INDEX_FILE), &bytes) {
+            Ok(()) => None,
+            Err(error) => self.report(format!("Could not save the multi-segment record: {error}")),
+        }
+    }
+
+    /// Hand one record problem to the caller, at most once per process.
+    fn report(&mut self, error: String) -> Option<String> {
+        if self.reported {
+            return None;
+        }
+        self.reported = true;
+        Some(error)
     }
 }
 
@@ -299,7 +528,9 @@ fn highest_saved_sequence(runtime: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Delivery, SegmentState, SegmentSummary};
     use std::{
+        collections::BTreeMap,
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -327,29 +558,61 @@ mod tests {
         }
     }
 
+    fn usage(requests: u32) -> SegmentUsage {
+        SegmentUsage {
+            provider: "Alibaba Model Studio".into(),
+            model: "controlled".into(),
+            region: "cn-beijing".into(),
+            requests,
+            estimated_nanoyuan: None,
+            unknown: true,
+        }
+    }
+
+    /// `apply` returns the one problem worth reporting; `None` means the change was
+    /// stored (or was already the record's state).
+    trait Applied {
+        fn applied(self);
+    }
+    impl Applied for Option<String> {
+        fn applied(self) {
+            assert!(self.is_none(), "the record is writable: {self:?}");
+        }
+    }
+
     #[test]
     fn a_saved_index_keeps_capture_order_text_files_and_usage() {
         let runtime = Runtime::new();
         let mut store = SegmentStore::open(&runtime.0);
         let terms = vec!["DeepSeek Harness".to_string(), "WASAPI".to_string()];
-        let (first, error) = store.begin(&runtime.0.join("session-1"), "capturing", &terms);
+        let (first, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-1", "capturing", &terms));
         assert!(error.is_none());
         let text = store.write_text(first, "第一段完整结果。").unwrap();
-        let record = store.record_mut(first).unwrap();
-        record.state = "result".into();
-        record.text_file = Some(text.clone());
-        record.text_chars = "第一段完整结果。".chars().count();
-        record.delivery = Some("fallback".into());
-        record.usage = Some(SegmentUsage {
-            provider: "Alibaba Model Studio".into(),
-            model: "controlled".into(),
-            region: "cn-beijing".into(),
-            requests: 2,
-            estimated_nanoyuan: None,
-            unknown: true,
-        });
-        store.persist().unwrap();
-        let (second, error) = store.begin(&runtime.0.join("session-2"), "capturing", &terms);
+        store
+            .apply(Change::Text {
+                sequence: first,
+                chars: "第一段完整结果。".chars().count(),
+                current: false,
+            })
+            .applied();
+        store
+            .apply(Change::Delivered {
+                sequence: first,
+                state: SegmentState::Result,
+                detail: "stopped".into(),
+                text: "第一段完整结果。".into(),
+                delivery: Delivery::Fallback,
+            })
+            .applied();
+        store
+            .apply(Change::Usage {
+                sequence: first,
+                usage: usage(2),
+            })
+            .applied();
+        let (second, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-2", "capturing", &terms));
         assert!(error.is_none());
         assert_eq!((first, second), (1, 2));
 
@@ -357,8 +620,8 @@ mod tests {
         let records = reopened.records();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].sequence, 1);
-        assert_eq!(records[0].state, "result");
-        assert_eq!(records[0].delivery.as_deref(), Some("fallback"));
+        assert_eq!(records[0].state, SegmentState::Result);
+        assert_eq!(records[0].delivery, Some(Delivery::Fallback));
         assert_eq!(records[0].text_file.as_deref(), Some(text.as_str()));
         assert_eq!(
             records[0].usage.as_ref().map(|usage| usage.requests),
@@ -378,7 +641,8 @@ mod tests {
         // No index, only a complete text file left by an interrupted run.
         fs::write(runtime.0.join(SegmentStore::text_name(7)), "旧的待取结果").unwrap();
         let mut store = SegmentStore::open(&runtime.0);
-        let (sequence, _) = store.begin(&runtime.0.join("session-new"), "capturing", &[]);
+        let (sequence, _, _) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-new", "capturing", &[]));
         assert_eq!(
             sequence, 8,
             "an existing text file must never be overwritten"
@@ -396,13 +660,76 @@ mod tests {
         fs::write(&index, r#"{"version":99,"next_sequence":4,"segments":[]}"#).unwrap();
         let mut store = SegmentStore::open(&runtime.0);
         assert!(store.problem().is_some(), "{:?}", store.problem());
-        let (sequence, error) = store.begin(&runtime.0.join("session-new"), "capturing", &[]);
+        let (sequence, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-new", "capturing", &[]));
         assert_eq!(sequence, 1);
         assert!(error.is_some(), "the degraded record must be reported");
         assert_eq!(
             fs::read_to_string(&index).unwrap(),
             r#"{"version":99,"next_sequence":4,"segments":[]}"#,
             "a future index is not silently downgraded"
+        );
+    }
+
+    #[test]
+    fn a_degraded_index_is_never_rewritten_and_reports_the_degradation_once() {
+        let runtime = Runtime::new();
+        let index = runtime.0.join(INDEX_FILE);
+        let future = r#"{"version":99,"next_sequence":4,"segments":[]}"#;
+        fs::write(&index, future).unwrap();
+        let mut store = SegmentStore::open(&runtime.0);
+        let (sequence, _, first) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-1", "capturing", &[]));
+        assert!(first.is_some(), "the degradation is reported once");
+        let second = store.apply(Change::Status {
+            sequence,
+            state: SegmentState::Processing,
+            detail: "stopped".into(),
+        });
+        assert!(second.is_none(), "the same problem is never reported twice");
+        assert_eq!(
+            store.records()[0].state,
+            SegmentState::Processing,
+            "a degraded record still applies in memory"
+        );
+        assert_eq!(
+            fs::read_to_string(&index).unwrap(),
+            future,
+            "a degraded store never writes"
+        );
+    }
+
+    #[test]
+    fn a_failed_index_write_is_reported_once_and_the_change_is_kept() {
+        let runtime = Runtime::new();
+        let mut store = SegmentStore::open(&runtime.0);
+        let (sequence, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-1", "capturing", &[]));
+        assert!(error.is_none());
+        // Make the index unwritable as a file: the atomic replace cannot land, while
+        // every other part of the store keeps working.
+        let index = runtime.0.join(INDEX_FILE);
+        fs::remove_file(&index).unwrap();
+        fs::create_dir(&index).unwrap();
+        let first = store.apply(Change::Status {
+            sequence,
+            state: SegmentState::Processing,
+            detail: "stopped".into(),
+        });
+        assert!(first.is_some(), "a failed write is reported");
+        let second = store.apply(Change::Status {
+            sequence,
+            state: SegmentState::Result,
+            detail: "done".into(),
+        });
+        assert!(
+            second.is_none(),
+            "the same write failure is never reported twice"
+        );
+        assert_eq!(
+            store.records()[0].state,
+            SegmentState::Result,
+            "the in-memory record keeps every change"
         );
     }
 
@@ -419,5 +746,187 @@ mod tests {
         assert!(store.problem().is_none(), "{:?}", store.problem());
         assert_eq!(store.records().len(), 1);
         assert!(store.records()[0].glossary_terms.is_empty());
+        assert_eq!(store.records()[0].state, SegmentState::Processing);
+        assert_eq!(store.records()[0].delivery, None);
+    }
+
+    #[test]
+    fn the_stored_index_keeps_its_frozen_version_1_shape() {
+        // The on-disk shape is a compatibility decision (ADR 0005): every key and
+        // every value spelling below is what an older Listen reads. This literal is
+        // an independent statement of the format, not a copy of the writer.
+        let runtime = Runtime::new();
+        let mut store = SegmentStore::open(&runtime.0);
+        let (sequence, _, error) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-42", "capturing", &[]));
+        assert!(error.is_none());
+        store.write_text(sequence, "固化的结果").unwrap();
+        store
+            .apply(Change::Delivered {
+                sequence,
+                state: SegmentState::Result,
+                detail: "stopped".into(),
+                text: "固化的结果".into(),
+                delivery: Delivery::Fallback,
+            })
+            .applied();
+        store
+            .apply(Change::Usage {
+                sequence,
+                usage: SegmentUsage {
+                    provider: "Alibaba Model Studio".into(),
+                    model: "controlled".into(),
+                    region: "cn-beijing".into(),
+                    requests: 2,
+                    estimated_nanoyuan: None,
+                    unknown: true,
+                },
+            })
+            .applied();
+        store
+            .apply(Change::GlossaryTerms {
+                sequence,
+                terms: vec!["WASAPI".into()],
+            })
+            .applied();
+
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.0.join(INDEX_FILE)).unwrap()).unwrap();
+        // The update time is wall-clock; the format only requires the key to be a
+        // number. Every other key and spelling is compared against the literal below.
+        assert!(stored["segments"][0]["updated_utc"].is_f64(), "{stored}");
+        stored["segments"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_utc");
+        assert_eq!(
+            stored,
+            serde_json::json!({
+                "version": 1,
+                "next_sequence": 2,
+                "current_sequence": 0,
+                "segments": [{
+                    "sequence": 1,
+                    "directory": "session-42",
+                    "state": "result",
+                    "detail": "stopped",
+                    "text_file": "segment-00000001.txt",
+                    "text_chars": 5,
+                    "delivery": "fallback",
+                    "usage": {
+                        "provider": "Alibaba Model Studio",
+                        "model": "controlled",
+                        "region": "cn-beijing",
+                        "requests": 2,
+                        "estimated_nanoyuan": null,
+                        "unknown": true,
+                    },
+                    "glossary_terms": ["WASAPI"],
+                }],
+            }),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn every_fact_reaches_the_index_the_panel_and_a_restart_scan() {
+        // The four directions of the one authoritative representation: into the
+        // index, out of it, projected to the panel, and rebuilt by a restart scan.
+        // A field added to `Segment` is the only production edit these assertions
+        // ask for; every direction reads the same value.
+        let runtime = Runtime::new();
+        let mut store = SegmentStore::open(&runtime.0);
+        let terms = vec!["WASAPI".to_string()];
+        let (sequence, facts, _) =
+            store.begin(|sequence| Segment::capturing(sequence, "session-5", "capturing", &terms));
+        store.write_text(sequence, "完整结果").unwrap();
+        store
+            .apply(Change::Text {
+                sequence,
+                chars: "完整结果".chars().count(),
+                current: true,
+            })
+            .applied();
+        store
+            .apply(Change::Usage {
+                sequence,
+                usage: usage(3),
+            })
+            .applied();
+        store
+            .apply(Change::Status {
+                sequence,
+                state: SegmentState::Processing,
+                detail: "the result is being confirmed".into(),
+            })
+            .applied();
+        let stored = store.records()[0].clone();
+        assert_eq!(stored.sequence, facts.sequence);
+        assert_ne!(stored, facts, "the change must be visible in the record");
+
+        // Out of the index: a fresh store reads the same facts back.
+        let reopened = SegmentStore::open(&runtime.0);
+        let read_back = &reopened.records()[0];
+        assert_eq!(read_back.sequence, stored.sequence);
+        assert_eq!(read_back.directory, stored.directory);
+        assert_eq!(read_back.state, stored.state);
+        assert_eq!(read_back.detail, stored.detail);
+        assert_eq!(read_back.text_file, stored.text_file);
+        assert_eq!(read_back.text_chars, stored.text_chars);
+        assert_eq!(read_back.delivery, stored.delivery);
+        assert_eq!(read_back.usage, stored.usage);
+        assert_eq!(read_back.glossary_terms, stored.glossary_terms);
+        assert_eq!(
+            read_back.text, None,
+            "the text file is not read by opening the index"
+        );
+
+        // Projected to the panel.
+        let summary = SegmentSummary::of(&stored);
+        assert_eq!(summary.sequence, stored.sequence);
+        assert_eq!(summary.state, stored.state);
+        assert_eq!(summary.detail, stored.detail);
+        assert_eq!(summary.text, stored.text.clone().unwrap_or_default());
+        assert_eq!(summary.delivery, stored.delivery);
+        assert_eq!(summary.usage, stored.usage);
+
+        // Rebuilt from a restart scan: the facts the index records are the facts the
+        // scan rebuilds (the state line is the scan's own recovery sentence).
+        let plan = crate::recovery::plan(&runtime.0, reopened.records(), &BTreeMap::new());
+        let recovered = &plan.segments[0];
+        assert_eq!(recovered.facts.sequence, stored.sequence);
+        assert_eq!(recovered.facts.directory, stored.directory);
+        assert_eq!(recovered.facts.text, Some("完整结果".to_string()));
+        assert_eq!(recovered.facts.text_file, stored.text_file);
+        assert_eq!(recovered.facts.text_chars, stored.text_chars);
+        // The scan decides the delivery from the durable delivery record: nothing is
+        // proven here, so an unproven write stays uncertain instead of being read as
+        // "no delivery happened".
+        assert_eq!(recovered.facts.delivery, Some(Delivery::Uncertain));
+        assert_eq!(stored.delivery, None);
+        assert_eq!(recovered.facts.usage, stored.usage);
+        assert_eq!(recovered.facts.glossary_terms, stored.glossary_terms);
+    }
+
+    #[test]
+    fn removing_one_segment_never_reads_or_deletes_outside_the_runtime_directory() {
+        let runtime = Runtime::new();
+        fs::write(
+            runtime.0.join(INDEX_FILE),
+            r#"{"version":1,"next_sequence":2,"segments":[{"sequence":1,"directory":"","state":"result","detail":"x","text_file":"../outside.txt","text_chars":1,"delivery":"uncertain","usage":null,"updated_utc":1.0}]}"#,
+        )
+        .unwrap();
+        let outside = runtime.0.parent().unwrap().join("outside.txt");
+        fs::write(&outside, "must survive").unwrap();
+        let mut store = SegmentStore::open(&runtime.0);
+        assert!(store.problem().is_none(), "{:?}", store.problem());
+        store.remove(1);
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "must survive",
+            "a corrupt text pointer is never followed outside the runtime directory"
+        );
+        assert!(store.records().is_empty());
+        let _ = fs::remove_file(&outside);
     }
 }

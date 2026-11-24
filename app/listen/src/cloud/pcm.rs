@@ -131,7 +131,7 @@ impl PcmSpoolWriter {
         // its byte count always describes audio that is already readable.
         let committed = self.progress.committed.load(Ordering::Acquire);
         let marker = pcm_state(committed, true);
-        crate::cloud::persist_result(&self.path.with_file_name(PCM_STATE_FILE), marker.as_bytes())
+        crate::durable::atomic_write(&self.path.with_file_name(PCM_STATE_FILE), marker.as_bytes())
             .map_err(|e| format!("Cannot save the PCM end-of-recording marker: {e}"))?;
         Ok(CapturedAudio {
             path: self.path.clone(),
@@ -150,7 +150,7 @@ impl Drop for PcmSpoolWriter {
         // explicitly not a clean stop: a later process must mark it incomplete.
         let committed = self.progress.committed.load(Ordering::Acquire);
         let marker = pcm_state(committed, false);
-        let _ = crate::cloud::persist_result(
+        let _ = crate::durable::atomic_write(
             &self.path.with_file_name(PCM_STATE_FILE),
             marker.as_bytes(),
         );

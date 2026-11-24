@@ -1,12 +1,11 @@
 //! One ledger for the entire single-vendor trial, independently of runtime paths.
 //! Only verified Token bounds or checked free-only protection admit a task.
 use super::{AliSettings, CloudError, FreeOnlyPolicy, TrialCostPolicy, VerifiedBounds};
-use crate::usage::UsageSummary;
+use crate::{durable::atomic_write, usage::UsageSummary};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -143,6 +142,8 @@ impl TrialLedger {
     }
     fn write(&self, data: &Data) -> Result<(), CloudError> {
         let bytes = serde_json::to_vec_pretty(data).map_err(|_| CloudError::Ledger)?;
+        // The trial ledger is a durable record like any other: the same atomic
+        // replace, with the same sharing-conflict retry, owns it.
         atomic_write(&self.directory.join("ledger.json"), &bytes).map_err(|_| CloudError::Ledger)
     }
     pub fn snapshot(&self) -> Result<LedgerSnapshot, CloudError> {
@@ -449,78 +450,4 @@ fn summarize(attempts: &[Attempt], trial_cap_nanoyuan: u64) -> UsageSummary {
         .filter(|requests| **requests > 1)
         .count() as u64;
     summary
-}
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!(
-        "{}.tmp",
-        super::task_id().map_err(std::io::Error::other)?
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    let result = written.and_then(|()| replace_file(&temporary, path));
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
-}
-
-/// Replace the destination with the already synced temporary file.
-///
-/// On Windows `MoveFileExW(REPLACE_EXISTING)` can fail with a sharing violation
-/// while another process (or a reader that is still closing) holds the destination
-/// open. The delivery record and `current-result.txt` are read by a recovery scan
-/// and by the verification scripts, so a transient reader must not turn a proven
-/// append into a fail-closed "the delivery record could not be saved" error. The
-/// retry only repeats the atomic rename: the write and its `sync_all` already
-/// succeeded, and a failed rename never partially replaces the destination. Any
-/// error other than the two transient sharing codes is returned immediately.
-fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::{os::windows::ffi::OsStrExt, thread, time::Duration};
-        use windows::{
-            Win32::{
-                Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
-                Storage::FileSystem::{
-                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-                },
-            },
-            core::PCWSTR,
-        };
-        const ATTEMPTS: usize = 3;
-        const RETRY: Duration = Duration::from_millis(2);
-        let transient = |error: &windows::core::Error| {
-            let denied: windows::core::HRESULT = ERROR_ACCESS_DENIED.into();
-            let sharing: windows::core::HRESULT = ERROR_SHARING_VIOLATION.into();
-            let code = error.code();
-            code == denied || code == sharing
-        };
-        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        for attempt in 1..=ATTEMPTS {
-            let result = unsafe {
-                MoveFileExW(
-                    PCWSTR(source.as_ptr()),
-                    PCWSTR(destination.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            };
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) if attempt < ATTEMPTS && transient(&error) => {
-                    thread::sleep(RETRY);
-                }
-                Err(error) => return Err(std::io::Error::other(error)),
-            }
-        }
-        unreachable!("the bounded replace loop always returns")
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(temporary, path)
-    }
 }

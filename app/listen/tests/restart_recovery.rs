@@ -663,6 +663,64 @@ fn a_stale_pending_delivery_record_is_uncertain_not_reported_as_nothing_written(
 }
 
 #[test]
+fn a_confirmed_refine_on_a_drained_segment_is_read_after_a_restart_not_reported_as_never_written() {
+    let runtime = Runtime::new();
+    let registry = Arc::new(Registry::default());
+    let editor = Editor::new("用户草稿");
+    // The exact durable state W2 leaves after a confirmed 精修 on a segment that was
+    // already delivered: the confirmed append deleted the index entry and the text
+    // file, then the refine wrote the refined text again as this segment's complete
+    // text. The index no longer describes the segment, but `delivery.json` still
+    // proves the append.
+    fs::write(
+        runtime.app().join("segment-00000003.txt"),
+        "精修后的完整结果。",
+    )
+    .unwrap();
+    write_index(&runtime, 4, &[]);
+    write_delivery(&runtime, &[delivery_record(3, "appended")]);
+    let delivery_before = fs::read(runtime.app().join("delivery.json")).unwrap();
+
+    let mut app = application(&runtime, registry.clone(), Vec::new(), true)
+        .with_targets(Arc::new(Selection(editor.clone())));
+    let recovered = wait_for(&mut app, "the refined pending result", |snapshot| {
+        snapshot.segments.len() == 1
+    });
+    let segment = &recovered.segments[0];
+    assert_eq!(segment.sequence, 3);
+    assert_eq!(segment.text, "精修后的完整结果。");
+    assert_eq!(
+        segment.delivery,
+        Some(Delivery::Appended),
+        "the durable delivery record proves the append: {:?}",
+        segment
+    );
+    assert_eq!(recovered.delivery, Some(Delivery::Appended));
+    assert!(
+        segment.detail.contains("already appended"),
+        "the panel must not claim this result was never written: {:?}",
+        segment.detail
+    );
+    assert_eq!(
+        editor.draft(),
+        "用户草稿",
+        "recovery never writes the old target"
+    );
+    assert_eq!(
+        fs::read(runtime.app().join("delivery.json")).unwrap(),
+        delivery_before,
+        "recovery never rewrites the delivery record"
+    );
+    // The adopted record keeps the confirmed state, so the next restart reads the
+    // same fact from the index even if the delivery history is pruned later.
+    let index = stored_index(&runtime);
+    assert_eq!(
+        index["segments"][0]["delivery"], "appended",
+        "the adopted record keeps the proven append: {index}"
+    );
+}
+
+#[test]
 fn corrupt_state_does_not_hide_saved_results_or_lose_an_unindexed_recording() {
     let runtime = Runtime::new();
     let registry = Arc::new(Registry::default());

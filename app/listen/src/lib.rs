@@ -42,13 +42,12 @@ pub mod whisper;
 pub mod whisper_host;
 #[cfg(windows)]
 pub mod whisper_timing;
-use delivery::{DeliveryLedger, DeliveryState, LatePlan};
-use durable::now_utc;
+use delivery::{DeliveryLedger, LatePlan};
 use recognition::{
     LocalSessions, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
     SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
 };
-use segments::SegmentStore;
+use segments::{Change, SegmentStore};
 use storage::Storage;
 use streaming::{CaptureProgress, SegmentStream};
 use target_write::{AppendValue, TargetWriteSession, WriteRule, Written};
@@ -399,7 +398,7 @@ pub(crate) fn normalize_newlines(value: &str) -> String {
 /// different vocabulary from [`Phase`]: the phase describes the one operation the
 /// capsule shows, while every segment keeps its own place in the panel until the
 /// user takes its result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SegmentState {
     /// Playback is being captured for this segment.
     Capturing,
@@ -412,6 +411,12 @@ pub enum SegmentState {
     /// The segment completed without any speech.
     NoSpeech,
     /// The segment ended without a complete result.
+    ///
+    /// `Default` is only the zero value used when a record is assembled field by
+    /// field (and the fallback for a state name this version does not know); it is
+    /// the most conservative state, so such a record is never resumed or retried
+    /// automatically.
+    #[default]
     Failed,
 }
 
@@ -428,6 +433,20 @@ impl SegmentState {
         }
     }
 
+    /// Parse the one on-disk spelling. `None` means the record uses a name this
+    /// version does not know; the caller decides how conservative to be.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "capturing" => Some(Self::Capturing),
+            "waiting_for_network" => Some(Self::WaitingForNetwork),
+            "processing" => Some(Self::Processing),
+            "result" => Some(Self::Result),
+            "no_speech" => Some(Self::NoSpeech),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
     /// Whether this segment still occupies capture or recognition work.
     pub fn in_flight(self) -> bool {
         matches!(
@@ -441,6 +460,9 @@ impl SegmentState {
 /// complete text, delivery and what the engine metered. A later segment never
 /// replaces an earlier entry; [`Snapshot::text`] is only the newest complete
 /// result, so an older pending result stays readable in its own entry.
+///
+/// This is a **projection** of the one authoritative segment facts
+/// (`segments::Segment`); the panel never reads the record layer directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentSummary {
     /// 1-based capture order. Stable for the life of the segment.
@@ -454,6 +476,20 @@ pub struct SegmentSummary {
     /// What the recognition engine recorded for this segment's paid requests.
     /// `None` means the engine cannot meter it; it is never reported as zero.
     pub usage: Option<SegmentUsage>,
+}
+
+impl SegmentSummary {
+    /// The one panel projection of a segment's facts.
+    fn of(facts: &segments::Segment) -> Self {
+        Self {
+            sequence: facts.sequence,
+            state: facts.state,
+            detail: facts.detail.clone(),
+            text: facts.text.clone().unwrap_or_default(),
+            delivery: facts.delivery,
+            usage: facts.usage.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -691,11 +727,18 @@ fn delivery_worker(
 
 /// One start/stop segment. It owns its capture directory, its bound target and its
 /// own complete result; another segment never reads or writes them.
+///
+/// Everything that must survive a restart lives in [`segments::Segment`] — the one
+/// authoritative representation, which is also what `segments.json` stores. The
+/// fields below are this process's own: a live session handle, the bound target, the
+/// validated capture path and the elapsed-time bookkeeping. A restart scan never
+/// produces them.
 struct SegmentSession {
+    facts: segments::Segment,
     id: SessionId,
-    /// 1-based capture order; the newest segment is the one the capsule and phase
-    /// describe.
-    sequence: u64,
+    /// The validated runtime directory that holds this segment's audio. It is
+    /// resolved once from the durable directory *name* so a corrupt record can never
+    /// address (or delete) a path outside the runtime directory.
     directory: PathBuf,
     /// `None` once the session reported a terminal event; the handle is dropped so
     /// no further event from it can reach the application.
@@ -717,9 +760,7 @@ struct SegmentSession {
     retained: Option<RetainedCapture>,
     /// Audio paths kept on disk from a failed attempt, shown to the user.
     retained_paths: Vec<PathBuf>,
-    state: SegmentState,
     session_state: SessionState,
-    detail: String,
     /// Set only when the storage bounds stopped this segment's capture (#36). It is
     /// kept with the segment so a later progress detail cannot erase why capture
     /// stopped, and it is never mistaken for a network wait.
@@ -727,9 +768,6 @@ struct SegmentSession {
     endpoint: Option<CaptureEndpoint>,
     progress: CaptureProgress,
     capture_start_ms: Option<u64>,
-    text: Option<String>,
-    delivery: Option<Delivery>,
-    usage: Option<SegmentUsage>,
     timing: Timing,
     /// This segment was recovered from a previous process after a restart (#35).
     /// Its original target cannot be reused, so its result is always a late,
@@ -1366,7 +1404,7 @@ impl Application {
     fn current_segment_index(&self) -> Option<usize> {
         self.segments
             .iter()
-            .position(|segment| segment.sequence == self.current_sequence)
+            .position(|segment| segment.facts.sequence == self.current_sequence)
     }
 
     fn next_id(&mut self) -> SessionId {
@@ -1456,7 +1494,7 @@ impl Application {
             let Some(index) = self
                 .segments
                 .iter()
-                .position(|segment| segment.sequence == sequence)
+                .position(|segment| segment.facts.sequence == sequence)
             else {
                 continue;
             };
@@ -1466,16 +1504,7 @@ impl Application {
                 // from another process. It is never reported as zero.
                 continue;
             };
-            self.segments[index].usage = Some(usage.clone());
-            if let Some(record) = self.store.record_mut(sequence) {
-                record.usage = Some(usage);
-                record.updated_utc = now_utc();
-                if self.store.problem().is_none() {
-                    if let Err(error) = self.store.persist() {
-                        self.note_record_problem(error);
-                    }
-                }
-            }
+            self.record(Change::Usage { sequence, usage });
             self.segments_dirty = true;
         }
     }
@@ -1498,7 +1527,7 @@ impl Application {
         // was lost; it is resolved at the first poll, after the caller configured its
         // glossary, and the detail says the capture-time snapshot could not be kept.
         let mut problems = plan.problems.clone();
-        problems.extend(plan.adopt(&self.runtime, &mut self.store, &[]));
+        problems.extend(plan.adopt(&mut self.store, &[]));
         let mut recovered = plan.segments;
         let mut resumed = 0;
         let mut texts = 0;
@@ -1506,20 +1535,18 @@ impl Application {
             // A version-1 record from before the term snapshot existed cannot prove
             // which terms this capture used; the current file is used at the first
             // poll and the detail says so.
-            if segment.resumable && segment.glossary_terms.is_empty() {
-                segment.detail.push_str(" The fixed term snapshot of this segment was not recorded, so the current 术语表 is used when it is processed again.");
+            if segment.resumable() && segment.facts.glossary_terms.is_empty() {
+                segment.facts.detail.push_str(" The fixed term snapshot of this segment was not recorded, so the current 术语表 is used when it is processed again.");
             }
-            if segment.resumable {
+            if segment.resumable() {
                 resumed += 1;
-            } else if segment.text.is_some() {
+            } else if segment.facts.text.is_some() {
                 texts += 1;
             }
             // The complete text is durably readable, so the production audio is no
             // longer the only recovery basis. This is the crash window "the result
             // was saved but the audio was not cleaned yet".
-            if segment.release_audio
-                && let Some(directory) = &segment.directory
-            {
+            if let Some(directory) = &segment.release {
                 match fs::remove_dir_all(directory) {
                     Ok(()) => {
                         segment.retained_paths.clear();
@@ -1529,7 +1556,7 @@ impl Application {
                         segment.retained_paths = audio_paths(directory);
                         problems.push(format!(
                             "Segment {}'s complete text was recovered, but its temporary audio could not be released ({error}); the result is still complete and the remaining audio is kept.",
-                            segment.sequence
+                            segment.facts.sequence
                         ));
                     }
                 }
@@ -1537,24 +1564,15 @@ impl Application {
             let recovered_segment = self.recovered_segment(segment);
             // The durable record now says what recovery decided, so the next launch
             // repeats no work and the pending result keeps its own delivery state.
-            if let Some(record) = self.store.record_mut(segment.sequence) {
-                record.state = recovered_segment.state.name().to_owned();
-                record.detail = recovered_segment.detail.clone();
-                if let Some(text) = &recovered_segment.text {
-                    record.text_file = Some(SegmentStore::text_name(segment.sequence));
-                    record.text_chars = text.chars().count();
-                }
-                if let Some(delivery) = recovered_segment.delivery {
-                    record.delivery = Some(DeliveryState::from(delivery).name().into());
-                }
-                record.updated_utc = now_utc();
-            }
+            let change = Change::Recovered {
+                sequence: recovered_segment.facts.sequence,
+                state: recovered_segment.facts.state,
+                detail: recovered_segment.facts.detail.clone(),
+                text: recovered_segment.facts.text.clone(),
+                delivery: recovered_segment.facts.delivery,
+            };
             self.segments.push(recovered_segment);
-        }
-        if self.store.problem().is_none()
-            && let Err(error) = self.store.persist()
-        {
-            self.note_record_problem(error);
+            self.record(change);
         }
         // The newest recovered complete result is the current result, exactly as it
         // was before the restart. `text` is only the newest one; every older result
@@ -1590,7 +1608,7 @@ impl Application {
             } else if self
                 .segments
                 .last()
-                .is_some_and(|segment| segment.state == SegmentState::Failed)
+                .is_some_and(|segment| segment.facts.state == SegmentState::Failed)
             {
                 // An unfinished capture became a failure before the restart and
                 // there is nothing to process again: the newest segment is still a
@@ -1618,7 +1636,7 @@ impl Application {
     /// Rebuild one application segment from what the previous process left. It has
     /// no session handle and no usable target: a recovered result is panel-only.
     fn recovered_segment(&mut self, recovered: &recovery::RecoveredSegment) -> SegmentSession {
-        let session_state = match recovered.state {
+        let session_state = match recovered.facts.state {
             SegmentState::Processing => SessionState::AwaitingFinal,
             SegmentState::Failed => SessionState::Failed,
             SegmentState::NoSpeech | SegmentState::Result => SessionState::Complete,
@@ -1626,33 +1644,33 @@ impl Application {
                 SessionState::AwaitingFinal
             }
         };
+        let directory = recovered
+            .release
+            .clone()
+            .or_else(|| recovery::safe_directory(&self.runtime, &recovered.facts.directory))
+            .unwrap_or_default();
         SegmentSession {
+            facts: recovered.facts.clone(),
             id: SessionId(0),
-            sequence: recovered.sequence,
-            directory: recovered.directory.clone().unwrap_or_default(),
+            directory,
             handle: None,
             stopped: true,
-            terminal: !recovered.resumable,
+            terminal: !recovered.resumable(),
             // A draft read needs a live target; after a restart there is none, so
             // the delivery record already says the original target is unusable.
             stop_draft_requested: true,
             finalizing: false,
             stop_requested: None,
             retry_audio: None,
-            glossary: glossary::Glossary::from_canonical_terms(&recovered.glossary_terms),
+            glossary: glossary::Glossary::from_canonical_terms(&recovered.facts.glossary_terms),
             target: Err(recovery::NO_TARGET_AFTER_RESTART.into()),
             retained: None,
             retained_paths: recovered.retained_paths.clone(),
-            state: recovered.state,
             session_state,
-            detail: recovered.detail.clone(),
             storage_note: None,
             endpoint: None,
             progress: CaptureProgress::default(),
             capture_start_ms: None,
-            text: recovered.text.clone(),
-            delivery: recovered.delivery,
-            usage: recovered.usage.clone(),
             timing: Timing::default(),
             recovered: true,
             recovery_note: recovered.note.clone(),
@@ -1677,9 +1695,10 @@ impl Application {
                 .iter()
                 .filter_map(|segment| {
                     segment
+                        .facts
                         .text
                         .as_ref()
-                        .map(|text| (segment.sequence, text.clone()))
+                        .map(|text| (segment.facts.sequence, text.clone()))
                 })
                 .max_by_key(|(sequence, _)| *sequence);
             if let Some((sequence, text)) = newest {
@@ -1690,19 +1709,14 @@ impl Application {
             && let Some(sequence) = self
                 .segments
                 .iter()
-                .find(|segment| segment.text.as_deref() == Some(self.snapshot.text.as_str()))
-                .map(|segment| segment.sequence)
+                .find(|segment| segment.facts.text.as_deref() == Some(self.snapshot.text.as_str()))
+                .map(|segment| segment.facts.sequence)
         {
             // An index written before the order was recorded: the text itself
             // proves which capture produced it, so a resumed older segment cannot
             // claim the current result later.
             current_sequence = sequence;
-            self.store.set_current_sequence(sequence);
-            if self.store.problem().is_none()
-                && let Err(error) = self.store.persist()
-            {
-                self.note_record_problem(error);
-            }
+            self.record(Change::CurrentResult { sequence });
         }
         self.current_sequence = current_sequence;
         self.snapshot.delivery = self.recovered_current_delivery();
@@ -1711,8 +1725,8 @@ impl Application {
     fn recovered_current_delivery(&self) -> Option<Delivery> {
         self.segments
             .iter()
-            .find(|segment| segment.sequence == self.current_sequence)
-            .and_then(|segment| segment.delivery)
+            .find(|segment| segment.facts.sequence == self.current_sequence)
+            .and_then(|segment| segment.facts.delivery)
     }
 
     /// Process the next recovered recording, but only while no capture and no
@@ -1747,7 +1761,7 @@ impl Application {
         let Some(index) = self
             .segments
             .iter()
-            .position(|segment| segment.sequence == sequence)
+            .position(|segment| segment.facts.sequence == sequence)
         else {
             return;
         };
@@ -1766,17 +1780,8 @@ impl Application {
         };
         let recovered_glossary = glossary::Glossary::from_canonical_terms(&terms);
         self.segments[index].glossary = recovered_glossary.clone();
-        if let Some(record) = self.store.record_mut(sequence)
-            && record.glossary_terms.is_empty()
-            && !terms.is_empty()
-        {
-            record.glossary_terms = terms;
-            record.updated_utc = now_utc();
-            if self.store.problem().is_none()
-                && let Err(error) = self.store.persist()
-            {
-                self.note_record_problem(error);
-            }
+        if self.segments[index].facts.glossary_terms.is_empty() && !terms.is_empty() {
+            self.record(Change::GlossaryTerms { sequence, terms });
         }
         let audio = CapturedAudio {
             path: resume.audio.path.clone(),
@@ -1788,17 +1793,17 @@ impl Application {
             directory: self.segments[index].directory.clone(),
             glossary: recovered_glossary,
         };
-        let detail = self.segments[index].detail.clone();
+        let detail = self.segments[index].facts.detail.clone();
         match self.sessions.retry(request, audio) {
             Ok(handle) => {
                 let segment = &mut self.segments[index];
                 segment.id = id;
                 segment.handle = Some(handle);
-                segment.state = SegmentState::Processing;
+                segment.facts.state = SegmentState::Processing;
                 segment.session_state = SessionState::AwaitingFinal;
                 // The recovered/incomplete note stays until the adapter's own
                 // status says something more specific.
-                segment.detail = detail;
+                segment.facts.detail = detail;
                 self.persist_segment(index);
             }
             Err(error) => {
@@ -1807,16 +1812,17 @@ impl Application {
                 );
                 self.fail_segment(index, error, Timing::default());
                 self.segments[index]
+                    .facts
                     .detail
                     .push_str(recovery::KEPT_AFTER_FAILED_RESUME);
                 self.segments[index].retained_paths = resume.audio.retained.clone();
-                self.segments[index].state = SegmentState::Failed;
+                self.segments[index].facts.state = SegmentState::Failed;
                 self.segments[index].terminal = true;
                 self.persist_segment(index);
                 self.segments_dirty = true;
                 self.refresh_recovery_snapshot();
                 if index + 1 == self.segments.len() {
-                    self.snapshot.detail = self.segments[index].detail.clone();
+                    self.snapshot.detail = self.segments[index].facts.detail.clone();
                     if let Some(summary) = self.recovery.summary() {
                         let line = recovery::summary_detail(summary);
                         if !line.is_empty() {
@@ -1995,17 +2001,20 @@ impl Application {
         let Some(index) = self.current_segment_index() else {
             return;
         };
-        self.segments[index].text = Some(refined.clone());
-        let sequence = self.segments[index].sequence;
+        let sequence = self.segments[index].facts.sequence;
+        // The refined text replaces the segment's own complete text in the panel; the
+        // durable copy follows below, and its pointer is never invented for a file
+        // that was not written.
+        self.segments[index].facts.text = Some(refined.clone());
         if let Err(error) = self.store.write_text(sequence, &refined) {
             self.note_record_problem(error);
-        } else if let Some(record) = self.store.record_mut(sequence) {
-            record.text_chars = refined.chars().count();
-            record.updated_utc = now_utc();
-            if let Err(error) = self.store.persist() {
-                self.note_record_problem(error);
-            }
+            return;
         }
+        self.record(Change::Text {
+            sequence,
+            chars: refined.chars().count(),
+            current: false,
+        });
     }
 
     /// What the application is doing right now, phrased for refusal messages that
@@ -2242,11 +2251,18 @@ impl Application {
         match result {
             Ok((id, directory, handle, status, glossary)) => {
                 let terms: Vec<String> = glossary.canonical_terms().map(str::to_owned).collect();
-                let (sequence, record_error) = self.store.begin(&directory, &status.detail, &terms);
+                let directory_name = directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let (_, facts, record_error) = self.store.begin(|sequence| {
+                    segments::Segment::capturing(sequence, &directory_name, &status.detail, &terms)
+                });
                 let capture_start_ms = Some(elapsed_ms(start_requested));
                 let segment = SegmentSession {
+                    facts,
                     id,
-                    sequence,
                     directory,
                     handle: Some(handle),
                     stopped: false,
@@ -2259,16 +2275,11 @@ impl Application {
                     target: bound_target,
                     retained: None,
                     retained_paths: Vec::new(),
-                    state: SegmentState::Capturing,
                     session_state: status.state,
-                    detail: status.detail.clone(),
                     storage_note: None,
                     endpoint: status.endpoint.clone(),
                     progress: status.progress.clone(),
                     capture_start_ms,
-                    text: None,
-                    delivery: None,
-                    usage: None,
                     timing: Timing::default(),
                     recovered: false,
                     recovery_note: None,
@@ -2325,7 +2336,7 @@ impl Application {
             let segment = &mut self.segments[index];
             segment.stop_requested = Some(stop_requested);
             segment.stopped = true;
-            segment.state = SegmentState::Processing;
+            segment.facts.state = SegmentState::Processing;
             if let Some(handle) = segment.handle.as_mut() {
                 handle.stop();
             }
@@ -2333,7 +2344,7 @@ impl Application {
                 .handle
                 .as_ref()
                 .map(|handle| handle.status().detail)
-                .unwrap_or_else(|| segment.detail.clone())
+                .unwrap_or_else(|| segment.facts.detail.clone())
         };
         if index + 1 == self.segments.len() {
             self.snapshot.recognition = Some(SessionState::AwaitingFinal);
@@ -2362,7 +2373,7 @@ impl Application {
             return;
         }
         segment.stop_draft_requested = true;
-        let sequence = segment.sequence;
+        let sequence = segment.facts.sequence;
         match &segment.target {
             Ok(Some(target)) => {
                 let target = target.clone();
@@ -2415,7 +2426,7 @@ impl Application {
         // A capture that failed before Stop never read its draft. The first retry
         // records it now, once, before the retried result can be delivered: a later
         // read would describe a draft the user may already have edited.
-        let sequence = self.segments[index].sequence;
+        let sequence = self.segments[index].facts.sequence;
         if !self.delivery.has_baseline_attempt(sequence) {
             self.capture_stop_draft(index);
         }
@@ -2430,9 +2441,9 @@ impl Application {
                 segment.retry_audio = Some(audio);
                 segment.retained = None;
                 segment.retained_paths.clear();
-                segment.state = SegmentState::Processing;
+                segment.facts.state = SegmentState::Processing;
                 segment.session_state = SessionState::AwaitingFinal;
-                segment.detail =
+                segment.facts.detail =
                     "Retrying recognition on the retained audio; the speech is not replayed."
                         .into();
                 self.persist_segment(index);
@@ -2470,8 +2481,8 @@ impl Application {
             Ok(()) => {
                 self.segments[index].retained = None;
                 self.segments[index].retained_paths.clear();
-                self.segments[index].detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
-                self.delivery.forget(self.segments[index].sequence);
+                self.segments[index].facts.detail = "The temporarily retained audio from the failed capture was deleted at your request. It will not be retried, and the current result is unchanged.".into();
+                self.delivery.forget(self.segments[index].facts.sequence);
                 self.remove_segment_record(index);
                 self.refresh_recovery_snapshot();
                 if index + 1 == self.segments.len() {
@@ -2481,13 +2492,13 @@ impl Application {
                 }
             }
             Err(error) => {
-                self.segments[index].detail = format!(
+                self.segments[index].facts.detail = format!(
                     "The temporarily retained audio could not be deleted ({error}), so it is still available for a retry."
                 );
                 self.refresh_recovery_snapshot();
                 if index + 1 == self.segments.len() {
                     self.snapshot.retry_available = true;
-                    self.snapshot.detail = self.segments[index].detail.clone();
+                    self.snapshot.detail = self.segments[index].facts.detail.clone();
                 }
             }
         }
@@ -2503,7 +2514,7 @@ impl Application {
         let Some(index) = self
             .segments
             .iter()
-            .position(|segment| segment.sequence == sequence)
+            .position(|segment| segment.facts.sequence == sequence)
         else {
             self.snapshot.detail = format!(
                 "No segment {sequence} is recorded, so nothing was deleted. The current result and every other segment are unchanged."
@@ -2535,11 +2546,11 @@ impl Application {
             return;
         }
         let segment = &self.segments[index];
-        let pending_payload = segment.state.in_flight()
-            || segment.state == SegmentState::Failed
-            || (segment.state == SegmentState::Result
+        let pending_payload = segment.facts.state.in_flight()
+            || segment.facts.state == SegmentState::Failed
+            || (segment.facts.state == SegmentState::Result
                 && matches!(
-                    segment.delivery,
+                    segment.facts.delivery,
                     Some(Delivery::Fallback) | Some(Delivery::Uncertain)
                 ))
             || segment.retained.is_some()
@@ -2554,7 +2565,7 @@ impl Application {
         let text_name = SegmentStore::text_name(sequence);
         let primary = index + 1 == self.segments.len();
         let current = sequence == self.current_sequence;
-        let had_text = self.segments[index].text.is_some();
+        let had_text = self.segments[index].facts.text.is_some();
         // Stop this segment's later processing first, then close its event channel by
         // dropping the handle. A confirmation or failure already in flight can no
         // longer reach the application, so it cannot resurrect this segment.
@@ -2581,16 +2592,16 @@ impl Application {
             // Keep the segment and its durable record so the user can try again;
             // every other segment is still untouched. Its session is already gone,
             // so it must not keep claiming that it is still processing.
-            if self.segments[index].state.in_flight() {
-                self.segments[index].state = SegmentState::Failed;
+            if self.segments[index].facts.state.in_flight() {
+                self.segments[index].facts.state = SegmentState::Failed;
                 self.segments[index].session_state = SessionState::Failed;
             }
             self.segments[index].retained_paths = audio_paths(&directory);
-            self.segments[index].detail = format!(
+            self.segments[index].facts.detail = format!(
                 "Segment {sequence} could not be completely deleted: {problem}. Its record and remaining files are kept; every other segment is unchanged."
             );
             self.persist_segment(index);
-            self.snapshot.detail = self.segments[index].detail.clone();
+            self.snapshot.detail = self.segments[index].facts.detail.clone();
             self.refresh_recovery_snapshot();
             return;
         }
@@ -2599,7 +2610,7 @@ impl Application {
         // A deleted segment can never be processed again, so its background
         // recovery entry must not survive the delete.
         self.recovery.forget(sequence);
-        if let Err(error) = self.store.remove(sequence) {
+        if let Some(error) = self.store.remove(sequence) {
             self.note_record_problem(error);
         }
         // A deleted segment can never be retried, so its stop-time draft reference
@@ -2616,7 +2627,7 @@ impl Application {
                 "The deleted segment's result is no longer the current result. Other pending results stay in the expanded panel."
                     .into(),
             );
-            if let Err(error) = cloud::persist_result(&self.runtime.join("current-result.txt"), b"")
+            if let Err(error) = durable::atomic_write(&self.runtime.join("current-result.txt"), b"")
             {
                 self.note_record_problem(format!(
                     "Could not clear current-result.txt after deleting segment {sequence}: {error}"
@@ -2672,9 +2683,9 @@ impl Application {
             }
             segment.stopped = true;
             segment.stop_requested = Some(Instant::now());
-            segment.state = SegmentState::Processing;
+            segment.facts.state = SegmentState::Processing;
             segment.storage_note = Some(reason.to_string());
-            segment.detail = reason.to_string();
+            segment.facts.detail = reason.to_string();
             if let Some(handle) = segment.handle.as_mut() {
                 handle.stop();
             }
@@ -2819,7 +2830,7 @@ impl Application {
         preparation_changed: bool,
     ) {
         let primary = index + 1 == self.segments.len();
-        let previous_state = self.segments[index].state;
+        let previous_state = self.segments[index].facts.state;
         // A storage stop's reason is kept beside the adapters' own progress detail,
         // so a later status refresh cannot silently turn it back into a normal
         // capture message. The recovery fact is kept for the same reason (#35).
@@ -2835,7 +2846,7 @@ impl Application {
         {
             let segment = &mut self.segments[index];
             segment.session_state = status.state;
-            segment.detail = detail.clone();
+            segment.facts.detail = detail.clone();
             // A retry processes the already captured audio; keep that capture's
             // route/progress rather than reporting a new unidentified device.
             if segment.retry_audio.is_none() {
@@ -2843,10 +2854,10 @@ impl Application {
                 segment.endpoint = status.endpoint.clone();
             }
             if !matches!(
-                segment.state,
+                segment.facts.state,
                 SegmentState::Result | SegmentState::NoSpeech | SegmentState::Failed
             ) {
-                segment.state = match status.state {
+                segment.facts.state = match status.state {
                     SessionState::WaitingForNetwork => SegmentState::WaitingForNetwork,
                     SessionState::Capturing | SessionState::Stable => SegmentState::Capturing,
                     // A session reports `Complete`/`Failed` only once its terminal
@@ -2861,7 +2872,7 @@ impl Application {
             if status.state == SessionState::AwaitingFinal && !segment.stopped {
                 segment.stopped = true;
                 segment.stop_requested = Some(Instant::now());
-                segment.state = SegmentState::Processing;
+                segment.facts.state = SegmentState::Processing;
                 if primary {
                     self.snapshot.phase = Phase::Processing;
                 }
@@ -2873,7 +2884,7 @@ impl Application {
         if self.segments[index].stopped && !self.segments[index].stop_draft_requested {
             self.capture_stop_draft(index);
         }
-        let changed = self.segments[index].state != previous_state;
+        let changed = self.segments[index].facts.state != previous_state;
         if changed {
             self.segments_dirty = true;
             self.persist_segment(index);
@@ -2959,8 +2970,8 @@ impl Application {
                     retry_scope
                 };
                 if let Some(note) = note {
-                    self.segments[index].detail.push('\n');
-                    self.segments[index].detail.push_str(&note);
+                    self.segments[index].facts.detail.push('\n');
+                    self.segments[index].facts.detail.push_str(&note);
                     if primary {
                         self.snapshot.detail.push('\n');
                         self.snapshot.detail.push_str(&note);
@@ -2980,24 +2991,18 @@ impl Application {
         // full audio store never blocks saving text, and a text over its own bound
         // is a storage fault that keeps the audio as the recovery basis.
         self.storage.check_text_budget(&self.runtime, text)?;
-        let name = self.store.write_text(sequence, text)?;
-        // The durable index says which capture owns the current result, so a restart
-        // knows it even when an older segment's record is the only one left (#35).
+        self.store.write_text(sequence, text)?;
+        // The text file and the index entry that points at it land in one named
+        // change; the index also says which capture owns the current result, so a
+        // restart knows it even when an older segment's record is the only one left
+        // (#35).
+        self.record(Change::Text {
+            sequence,
+            chars: text.chars().count(),
+            current,
+        });
         if current {
-            self.store.set_current_sequence(sequence);
-        }
-        if let Some(record) = self.store.record_mut(sequence) {
-            record.text_file = Some(name);
-            record.text_chars = text.chars().count();
-            record.updated_utc = now_utc();
-            if self.store.problem().is_none() {
-                if let Err(error) = self.store.persist() {
-                    self.note_record_problem(error);
-                }
-            }
-        }
-        if current {
-            cloud::persist_result(&self.runtime.join("current-result.txt"), text.as_bytes())
+            durable::atomic_write(&self.runtime.join("current-result.txt"), text.as_bytes())
                 .map_err(|error| format!("Could not save the current result: {error}"))?;
         }
         // A complete result saved durably means storage is writable again.
@@ -3006,7 +3011,7 @@ impl Application {
     }
 
     fn finish_recognition(&mut self, index: usize, result: SessionResult) {
-        let sequence = self.segments[index].sequence;
+        let sequence = self.segments[index].facts.sequence;
         let directory = self.segments[index].directory.clone();
         let description = result.description.clone();
         // A result is late when the adapter had to recover it, and a recovered
@@ -3055,7 +3060,7 @@ impl Application {
                 self.snapshot.delivery = None;
                 self.snapshot.refined_text = None;
             }
-            self.segments[index].text = Some(text);
+            self.segments[index].facts.text = Some(text);
             self.segments[index].timing = timing.clone();
             if let Some(audio) = retry_audio {
                 self.segments[index].retained = Some(RetainedCapture { audio });
@@ -3105,14 +3110,14 @@ impl Application {
         let primary = index + 1 == self.segments.len();
         {
             let segment = &mut self.segments[index];
-            segment.state = SegmentState::NoSpeech;
+            segment.facts.state = SegmentState::NoSpeech;
             segment.session_state = SessionState::Complete;
-            segment.detail = format!(
+            segment.facts.detail = format!(
                 "No valid speech detected; nothing was delivered.\nPlayback: {description}"
             );
             if let Some(note) = &segment.recovery_note {
-                segment.detail.push('\n');
-                segment.detail.push_str(note);
+                segment.facts.detail.push('\n');
+                segment.facts.detail.push_str(note);
             }
             segment.timing = timing.clone();
         }
@@ -3151,11 +3156,11 @@ impl Application {
                 }
             }
         } else if let Err(error) = cleanup {
-            self.segments[index].detail = format!(
+            self.segments[index].facts.detail = format!(
                 "No valid speech detected, but this segment's temporary audio could not be cleaned: {error}"
             );
         }
-        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_segment_usage_pending(self.segments[index].facts.sequence);
         self.mark_usage_pending();
         self.refresh_recovery_snapshot();
     }
@@ -3181,7 +3186,7 @@ impl Application {
         let Some(index) = self
             .segments
             .iter()
-            .position(|segment| segment.sequence == delivered.sequence)
+            .position(|segment| segment.facts.sequence == delivered.sequence)
         else {
             return;
         };
@@ -3217,17 +3222,17 @@ impl Application {
         {
             let segment = &mut self.segments[index];
             segment.finalizing = false;
-            segment.state = SegmentState::Result;
             segment.session_state = SessionState::Complete;
-            segment.text = Some(delivered.text.clone());
-            segment.delivery = Some(delivery);
+            segment.facts.state = SegmentState::Result;
+            segment.facts.text = Some(delivered.text.clone());
+            segment.facts.delivery = Some(delivery);
             segment.timing = timing.clone();
-            segment.detail = detail.clone();
+            segment.facts.detail = detail.clone();
             // A recovered result keeps saying that it came back after a restart and
             // that an incomplete recording's text is not a passing transcript.
             if let Some(note) = &segment.recovery_note {
-                segment.detail.push('\n');
-                segment.detail.push_str(note);
+                segment.facts.detail.push('\n');
+                segment.facts.detail.push_str(note);
             }
         }
         let mut cleanup_error = None;
@@ -3238,24 +3243,22 @@ impl Application {
         // An uncertain write may have landed and is never retried; its complete text
         // must stay as a pending result (record + text file) across a restart, exactly
         // like a fallback. Only a confirmed append leaves nothing pending.
+        let (state, detail) = (
+            self.segments[index].facts.state,
+            self.segments[index].facts.detail.clone(),
+        );
         let keep_record =
             matches!(delivery, Delivery::Fallback | Delivery::Uncertain) || cleanup_error.is_some();
-        if let Some(record) = self.store.record_mut(delivered.sequence) {
-            record.state = self.segments[index].state.name().to_owned();
-            record.detail = self.segments[index].detail.clone();
-            record.text_file = Some(SegmentStore::text_name(delivered.sequence));
-            record.text_chars = delivered.text.chars().count();
-            record.delivery = Some(DeliveryState::from(delivery).name().into());
-            record.updated_utc = now_utc();
-            if self.store.problem().is_none() {
-                if let Err(error) = self.store.persist() {
-                    self.note_record_problem(error);
-                }
-            }
-        }
+        self.record(Change::Delivered {
+            sequence: delivered.sequence,
+            state,
+            detail: detail.clone(),
+            text: delivered.text.clone(),
+            delivery,
+        });
         if let Some(error) = &cleanup_error {
             self.segments[index].retained_paths = audio_paths(&delivered.directory);
-            self.segments[index].detail = format!(
+            self.segments[index].facts.detail = format!(
                 "{detail}\nThe temporary audio for this segment could not be cleaned ({error}); the result is still complete."
             );
             self.persist_segment(index);
@@ -3327,14 +3330,14 @@ impl Application {
         let detail = failure_detail(&error, &paths);
         {
             let segment = &mut self.segments[index];
-            segment.state = SegmentState::Failed;
+            segment.facts.state = SegmentState::Failed;
             segment.session_state = SessionState::Failed;
             segment.terminal = true;
             segment.retained_paths = paths.clone();
             segment.timing = timing.clone();
-            segment.detail = detail;
+            segment.facts.detail = detail;
             if let Some(partial) = &partial {
-                segment.detail.push_str(&format!(
+                segment.facts.detail.push_str(&format!(
                     ". The capture was interrupted, so this text is incomplete and kept with this segment: {}. This is not a completed transcription.",
                     partial.chars().count()
                 ));
@@ -3343,8 +3346,8 @@ impl Application {
             // and, when its recording was incomplete, that nothing here was a
             // complete recording.
             if let Some(note) = &segment.recovery_note {
-                segment.detail.push('\n');
-                segment.detail.push_str(note);
+                segment.facts.detail.push('\n');
+                segment.facts.detail.push_str(note);
             }
         }
         self.segments_dirty = true;
@@ -3356,43 +3359,47 @@ impl Application {
         }
         // A failed segment still has paid requests; its own cost is persisted at the
         // next safe point even though no result was produced.
-        self.mark_segment_usage_pending(self.segments[index].sequence);
+        self.mark_segment_usage_pending(self.segments[index].facts.sequence);
         self.mark_usage_pending();
         self.refresh_recovery_snapshot();
     }
 
-    /// Fill `segments.json` from the current segment state. Cheap enough to call on
-    /// every transition; the index is a small text document.
+    /// Apply one named change to one segment's durable record **and** to this
+    /// process's own copy of the same facts, so the two can never drift. Whether
+    /// that needs a write, and whether a write failure has to be reported, is the
+    /// store's decision.
+    fn record(&mut self, change: Change) {
+        if let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.facts.sequence == change.sequence())
+        {
+            change.write(&mut self.segments[index].facts);
+        }
+        if let Some(error) = self.store.apply(change) {
+            self.note_record_problem(error);
+        }
+    }
+
+    /// Write the segment's own state line to its durable record. Cheap enough to call
+    /// on every transition: the store skips the write when nothing changed.
     fn persist_segment(&mut self, index: usize) {
         let Some(segment) = self.segments.get(index) else {
             return;
         };
-        let sequence = segment.sequence;
-        let state = segment.state.name().to_owned();
-        let detail = segment.detail.clone();
-        let Some(record) = self.store.record_mut(sequence) else {
-            return;
+        let change = Change::Status {
+            sequence: segment.facts.sequence,
+            state: segment.facts.state,
+            detail: segment.facts.detail.clone(),
         };
-        if record.state == state && record.detail == detail {
-            return;
-        }
-        record.state = state;
-        record.detail = detail;
-        record.updated_utc = now_utc();
-        if self.store.problem().is_some() {
-            return;
-        }
-        if let Err(error) = self.store.persist() {
-            self.note_record_problem(error);
-        }
+        self.record(change);
     }
 
     fn remove_segment_record(&mut self, index: usize) {
         let Some(segment) = self.segments.get(index) else {
             return;
         };
-        let sequence = segment.sequence;
-        if let Err(error) = self.store.remove(sequence) {
+        if let Some(error) = self.store.remove(segment.facts.sequence) {
             self.note_record_problem(error);
         }
     }
@@ -3429,14 +3436,7 @@ impl Application {
         self.snapshot.segments = self
             .segments
             .iter()
-            .map(|segment| SegmentSummary {
-                sequence: segment.sequence,
-                state: segment.state,
-                detail: segment.detail.clone(),
-                text: segment.text.clone().unwrap_or_default(),
-                delivery: segment.delivery,
-                usage: segment.usage.clone(),
-            })
+            .map(|segment| SegmentSummary::of(&segment.facts))
             .collect();
     }
 

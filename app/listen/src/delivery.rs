@@ -47,8 +47,7 @@
 
 use crate::{
     AppResult, Delivery,
-    cloud::persist_result,
-    durable::{VersionedRecord, now_utc, open_versioned},
+    durable::{VersionedRecord, atomic_write, now_utc, open_versioned},
     normalize_newlines,
 };
 use serde::{Deserialize, Serialize};
@@ -188,6 +187,27 @@ impl From<Delivery> for DeliveryState {
             Delivery::Uncertain => Self::Uncertain,
         }
     }
+}
+
+impl From<DeliveryState> for Delivery {
+    fn from(state: DeliveryState) -> Self {
+        match state {
+            DeliveryState::Appended => Self::Appended,
+            DeliveryState::Fallback => Self::Fallback,
+            DeliveryState::Pending | DeliveryState::Started | DeliveryState::Uncertain => {
+                Self::Uncertain
+            }
+        }
+    }
+}
+
+/// A recovered result's delivery state, read from a durable record. Only an
+/// explicit `fallback` record proves that nothing was written. A `pending` record
+/// can hide a write whose `started` marker could not be saved, and a missing record
+/// (never written, pruned, or an unreadable ledger) proves nothing at all, so both
+/// are reported as uncertain instead of claiming a panel-only fallback.
+pub(crate) fn recovered_delivery(state: Option<DeliveryState>) -> Delivery {
+    state.map_or(Delivery::Uncertain, Delivery::from)
 }
 
 /// The durable delivery record, shared by the application thread and every
@@ -429,7 +449,7 @@ impl DeliveryLedger {
             record.updated_utc = now_utc();
         }
         let bytes = serialize_pruned(&mut data);
-        match persist_result(&self.runtime.join(FILE), &bytes) {
+        match atomic_write(&self.runtime.join(FILE), &bytes) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let reason = format!(
@@ -506,7 +526,7 @@ impl DeliveryLedger {
             return;
         }
         let bytes = serialize_pruned(data);
-        if let Err(error) = persist_result(&self.runtime.join(FILE), &bytes) {
+        if let Err(error) = atomic_write(&self.runtime.join(FILE), &bytes) {
             self.note(
                 data,
                 format!("the delivery record could not be saved ({error})"),
