@@ -70,6 +70,10 @@ struct Ui {
     /// Last `status.txt` contents, so `panel_visible`/`panel_error` changes are
     /// persisted even when the application snapshot itself did not change.
     last_status: String,
+    /// The facts outside the snapshot that `status::report` reads. Keeping the last
+    /// key lets the tick skip regenerating the whole file when nothing it reads
+    /// changed (#49).
+    last_facts: Option<status::FactsKey>,
     /// Last `panel.txt` contents. The file is the contract for automation.
     last_panel_text: String,
     /// The last fallback/failure the panel opened for, so a closed panel is not
@@ -232,6 +236,7 @@ pub fn run(config: Config) -> Result<(), String> {
             runtime: config.runtime().to_path_buf(),
             last: None,
             last_status: String::new(),
+            last_facts: None,
             last_panel_text: String::new(),
             last_auto_open: None,
             panel_error: None,
@@ -321,6 +326,14 @@ impl Ui {
     unsafe fn refresh(&mut self) {
         unsafe {
             self.app.poll();
+            // The poll above advances state only. The disk measurement is a
+            // separate, low-frequency action (#49): measuring it on every tick was
+            // what made the 10 ms stop path walk the whole runtime directory. One
+            // second keeps the panel and `status.txt` current — the values may come
+            // from the last measurement, and the bounds are nowhere near that
+            // resolution — while a running capture is stopped at most one second
+            // past the budget instead of at the exact byte.
+            self.app.measure_storage_if_due();
             let state = self.app.snapshot();
             // The poll is the only consumer of the session's final event and of a
             // finished delivery. While a stopped capture is being finalised, a
@@ -377,7 +390,9 @@ impl Ui {
                     || last.retained_audio != state.retained_audio
                     || last.delivery != state.delivery
                     || last.retry_available != state.retry_available
+                    || last.endpoint != state.endpoint
                     || last.backend != state.backend
+                    || last.mode != state.mode
                     || last.timing != state.timing
                     || last.refine != state.refine
                     || last.refined_text != state.refined_text
@@ -397,7 +412,7 @@ impl Ui {
             // The window facts the snapshot cannot know. Everything else the status
             // file says is derived by `status::report` from the snapshot, so the key
             // set, the key order and the conditional blocks live in one tested pure
-            // function instead of in this 100 ms poll.
+            // function instead of in this poll.
             let current_result = self.runtime.join("current-result.txt");
             let glossary = self.app.glossary_status();
             let host = status::HostFacts {
@@ -412,16 +427,23 @@ impl Ui {
                 startup_capsule_ms: self.capsule.startup_ms(),
                 capture_excluded: self.capsule.capture_excluded(),
             };
-            let status = status::report(&state, &host, &window);
-            // `status.txt` also changes when only the panel opened/closed or the
-            // panel window failed to create, which the snapshot comparison above
-            // cannot see.
-            let status_changed = status != self.last_status;
-            if status_changed {
-                let _ = fs::write(self.runtime.join("status.txt"), &status);
-                self.last_status = status;
+            // `status.txt` is a pure function of the snapshot plus the facts outside
+            // it, so the whole file is regenerated only when one of those inputs
+            // changed. The snapshot fields the report reads are all in the `changed`
+            // comparison above; `FactsKey` covers the rest. Before this, the 68-key
+            // string was formatted and compared on every 100 ms tick (#49).
+            let facts = status::FactsKey::of(&host, &window);
+            let mut regenerated = false;
+            if changed || self.last_facts.as_ref() != Some(&facts) {
+                let status = status::report(&state, &host, &window);
+                self.last_facts = Some(facts);
+                regenerated = true;
+                if status != self.last_status {
+                    let _ = fs::write(self.runtime.join("status.txt"), &status);
+                    self.last_status = status;
+                }
             }
-            if !changed && !status_changed {
+            if !changed && !regenerated {
                 return;
             }
             if self.tray {

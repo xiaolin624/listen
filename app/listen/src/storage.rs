@@ -19,6 +19,15 @@
 //! refuses a new capture and stops a running one, keeping everything already
 //! received instead of overwriting it.
 //!
+//! **Measuring is separate from deciding** (#49). [`MeasureBytes`] is the one
+//! runtime-directory walk and [`FreeSpace`] the one volume probe; the crate-private
+//! `Storage::status` is the pure judgement that turns a cached [`MeasuredBytes`]
+//! plus the policy into the published [`StorageStatus`]. `Application::poll` only
+//! advances state, so the 10 ms stop path never walks the runtime directory: the
+//! desktop caller asks for a low-frequency measurement
+//! ([`crate::Application::measure_storage_if_due`]), and the panel and `status.txt`
+//! read the last one.
+//!
 //! This module never deletes anything. An explicit per-segment delete is the
 //! application's decision (see `Application::dispatch(Control::DeleteSegment)`).
 
@@ -239,10 +248,40 @@ impl FreeSpace for DiskFreeSpace {
     }
 }
 
+/// The result of the one on-disk walk behind the storage bounds: pending capture
+/// audio across every segment and the saved complete text. It is plain data, so the
+/// published [`StorageStatus`] stays a pure function of a cached measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeasuredBytes {
+    pub pending_audio_bytes: u64,
+    pub text_bytes: u64,
+}
+
+/// The runtime-directory walk behind [`MeasuredBytes`]. Production reads the disk;
+/// tests inject a fake, so "a poll never measures" is a call count and storage
+/// conditions stay a state instead of a machine accident.
+pub trait MeasureBytes: Send + Sync {
+    fn measure(&self, runtime: &Path) -> MeasuredBytes;
+}
+
+/// The real walk: every `session-*` tree (recursively, whatever its files are)
+/// plus root-level capture files, and the saved text files beside them.
+pub struct DiskBytes;
+
+impl MeasureBytes for DiskBytes {
+    fn measure(&self, runtime: &Path) -> MeasuredBytes {
+        MeasuredBytes {
+            pending_audio_bytes: pending_audio_bytes(runtime),
+            text_bytes: text_bytes(runtime),
+        }
+    }
+}
+
 /// The application's storage policy plus the last fault it recorded.
 pub(crate) struct Storage {
     policy: StoragePolicy,
     free_space: Arc<dyn FreeSpace>,
+    bytes: Arc<dyn MeasureBytes>,
     fault: Option<String>,
 }
 
@@ -251,6 +290,7 @@ impl Storage {
         Self {
             policy: StoragePolicy::default(),
             free_space: Arc::new(DiskFreeSpace),
+            bytes: Arc::new(DiskBytes),
             fault: None,
         }
     }
@@ -261,6 +301,10 @@ impl Storage {
 
     pub fn set_free_space(&mut self, free_space: Arc<dyn FreeSpace>) {
         self.free_space = free_space;
+    }
+
+    pub fn set_measure(&mut self, bytes: Arc<dyn MeasureBytes>) {
+        self.bytes = bytes;
     }
 
     /// Record the last real storage write/save failure and return the user-facing
@@ -274,14 +318,27 @@ impl Storage {
         self.fault = None;
     }
 
-    pub fn status(&self, runtime: &Path) -> StorageStatus {
+    /// Measure the bounds now: one runtime-directory walk plus the free-space
+    /// probe. This is the one measurement the published status comes from, and no
+    /// `poll` asks for it (#49); the desktop caller asks for it explicitly or on a
+    /// low-frequency tick.
+    pub fn measure(&self, runtime: &Path) -> StorageStatus {
+        let bytes = self.bytes.measure(runtime);
+        let free_disk_bytes = self.free_space.free_bytes(runtime).ok();
+        self.status(bytes, free_disk_bytes)
+    }
+
+    /// The pure judgement: a cached measurement plus the policy become the
+    /// published status. It has no runtime path and performs no I/O, so a state-only
+    /// tick can read the last measurement without walking the directory (#49).
+    pub fn status(&self, bytes: MeasuredBytes, free_disk_bytes: Option<u64>) -> StorageStatus {
         StorageStatus {
-            pending_audio_bytes: pending_audio_bytes(runtime),
+            pending_audio_bytes: bytes.pending_audio_bytes,
             budget_bytes: self.policy.pending_audio_budget_bytes,
             warning_at_bytes: self.policy.warning_at_bytes(),
-            free_disk_bytes: self.free_space.free_bytes(runtime).ok(),
+            free_disk_bytes,
             free_disk_floor_bytes: self.policy.free_disk_floor_bytes,
-            text_bytes: text_bytes(runtime),
+            text_bytes: bytes.text_bytes,
             text_budget_bytes: self.policy.text_budget_bytes,
             fault: self.fault.clone(),
         }
@@ -290,6 +347,11 @@ impl Storage {
     /// Refuse to save one complete result when the **text** bound is already
     /// exceeded. This is a separate bound from the audio budget: it never stops a
     /// capture, and the captured audio is kept because the text is not durable.
+    ///
+    /// It measures the saved text itself instead of reading the cached status: the
+    /// bound is a write-time safety check (it decides whether *this* result may be
+    /// written), so it must not act on a value measured up to a tick earlier. It runs
+    /// once per saved result — not on a poll tick that saves nothing (#49).
     pub fn check_text_budget(&self, runtime: &Path, new_text: &str) -> Result<(), String> {
         let budget = self.policy.text_budget_bytes;
         let needed = text_bytes(runtime).saturating_add(new_text.len() as u64);

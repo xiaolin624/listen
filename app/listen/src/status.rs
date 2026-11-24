@@ -9,7 +9,7 @@
 
 use crate::{capsule::preparation_name, panel};
 use listen::{Refine, Snapshot, UsageSummary};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The facts only the running process knows: where its durable current-result
 /// mirror is, which 术语表 it resolved, and its own process id. They are inputs so
@@ -33,6 +33,40 @@ pub struct WindowFacts<'a> {
     pub capsule: &'a str,
     pub startup_capsule_ms: u64,
     pub capture_excluded: bool,
+}
+
+/// A cheap identity of the report's inputs that live outside the snapshot.
+///
+/// [`report`] is a pure function of the snapshot plus these facts, so a caller that
+/// already knows whether the snapshot changed can regenerate the whole file only
+/// when this key changed, instead of formatting every key on each poll (#49). The
+/// key owns copies so the caller can keep it between ticks; every fact either input
+/// carries is part of the comparison, so a changed fact can never be skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactsKey {
+    current_result_path: PathBuf,
+    glossary: String,
+    process_id: u32,
+    panel_visible: bool,
+    panel_error: String,
+    capsule: String,
+    startup_capsule_ms: u64,
+    capture_excluded: bool,
+}
+
+impl FactsKey {
+    pub fn of(host: &HostFacts<'_>, window: &WindowFacts<'_>) -> Self {
+        Self {
+            current_result_path: host.current_result_path.to_path_buf(),
+            glossary: host.glossary.to_owned(),
+            process_id: host.process_id,
+            panel_visible: window.panel_visible,
+            panel_error: window.panel_error.to_owned(),
+            capsule: window.capsule.to_owned(),
+            startup_capsule_ms: window.startup_capsule_ms,
+            capture_excluded: window.capture_excluded,
+        }
+    }
 }
 
 /// The complete `runtime\status.txt` text for one snapshot.
@@ -363,6 +397,66 @@ mod tests {
             capsule: "Ready",
             startup_capsule_ms: 42,
             capture_excluded: false,
+        }
+    }
+
+    #[test]
+    fn the_cheap_report_key_changes_with_every_fact_outside_the_snapshot() {
+        let base = FactsKey::of(&host(), &window());
+        assert_eq!(
+            base,
+            FactsKey::of(&host(), &window()),
+            "identical facts are the same key"
+        );
+
+        for changed in [
+            HostFacts {
+                current_result_path: Path::new(r"C:\runtime\other-result.txt"),
+                ..host()
+            },
+            HostFacts {
+                glossary: "glossary.txt",
+                ..host()
+            },
+            HostFacts {
+                process_id: 4243,
+                ..host()
+            },
+        ] {
+            assert_ne!(
+                base,
+                FactsKey::of(&changed, &window()),
+                "a changed host fact must be a new key: {changed:?}"
+            );
+        }
+
+        for changed in [
+            WindowFacts {
+                panel_visible: false,
+                ..window()
+            },
+            WindowFacts {
+                panel_error: "panel failed",
+                ..window()
+            },
+            WindowFacts {
+                capsule: "Failure",
+                ..window()
+            },
+            WindowFacts {
+                startup_capsule_ms: 43,
+                ..window()
+            },
+            WindowFacts {
+                capture_excluded: true,
+                ..window()
+            },
+        ] {
+            assert_ne!(
+                base,
+                FactsKey::of(&host(), &changed),
+                "a changed window fact must be a new key: {changed:?}"
+            );
         }
     }
 

@@ -377,6 +377,9 @@ impl Scenario {
                 let index = h.start();
                 // Cross the pending-audio budget while the capture is still live.
                 fs::write(h.directory(index).join("playback.pcm"), vec![7u8; 2_000]).unwrap();
+                // `poll()` only advances state (#49); the desktop caller measures
+                // storage on its own low-frequency tick.
+                h.app.measure_storage();
                 let snapshot = h.poll_until("the storage stop", |snapshot| {
                     snapshot.phase == Phase::Processing
                         && snapshot.detail.contains("storage budget was reached")
@@ -564,6 +567,8 @@ fn a_storage_stop_reason_survives_later_status_refreshes() {
     let mut h = Harness::with(policy(1_000), true, Ok(()));
     let index = h.start();
     fs::write(h.directory(index).join("playback.pcm"), vec![7u8; 2_000]).unwrap();
+    // `poll()` only advances state (#49); measure explicitly, like the desktop tick.
+    h.app.measure_storage();
     h.poll_until("the storage stop", |snapshot| {
         snapshot.phase == Phase::Processing && snapshot.detail.contains("storage budget")
     });

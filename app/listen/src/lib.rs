@@ -1270,6 +1270,11 @@ pub struct Application {
     /// The configured storage bounds and the injected free-space probe (#36). All
     /// accounting decisions go through this one module.
     storage: Storage,
+    /// When the storage bounds were last measured. `poll` never measures (#49): the
+    /// desktop caller asks for a low-frequency measurement, and
+    /// [`Application::measure_storage_if_due`] uses this to keep the runtime walk
+    /// off the 10 ms stop path.
+    last_measure: Option<Instant>,
     next_session_id: u64,
     /// The highest capture order whose complete text is the current result. An older
     /// segment that completes later must never overwrite it.
@@ -1406,6 +1411,7 @@ impl Application {
             delivery,
             record_problem: delivery_problem,
             storage: Storage::new(),
+            last_measure: None,
             next_session_id: 0,
             current_sequence: 0,
             completion_tx,
@@ -1431,7 +1437,7 @@ impl Application {
         // The durable ledger already exists before the first capture, so the cost
         // this tool has accumulated is readable immediately and after a restart.
         // This is also the one safe place to raise an already-reached reminder.
-        application.refresh_storage();
+        application.measure_storage();
         application.refresh_usage();
         // Whatever the previous process left behind is recovered before the first
         // user action, so a restart continues the work instead of losing it (#35).
@@ -1443,7 +1449,7 @@ impl Application {
     /// budget, a 1 GiB free-disk floor and a warning at four fifths of the budget.
     pub fn with_storage_policy(mut self, policy: storage::StoragePolicy) -> Self {
         self.storage.set_policy(policy);
-        self.refresh_storage();
+        self.measure_storage();
         self
     }
 
@@ -1451,16 +1457,57 @@ impl Application {
     /// inject a value so storage conditions are a state, never real disk pressure.
     pub fn with_free_space(mut self, free_space: Arc<dyn storage::FreeSpace>) -> Self {
         self.storage.set_free_space(free_space);
-        self.refresh_storage();
+        self.measure_storage();
         self
     }
 
-    /// Measure the storage bounds and publish them beside the capture state. A
+    /// Replace the runtime-directory walk. Production reads the disk; tests inject a
+    /// counted fake, so "a poll never measures" is observable as a call count and no
+    /// test depends on the machine's real disk.
+    pub fn with_storage_measure(mut self, measure: Arc<dyn storage::MeasureBytes>) -> Self {
+        self.storage.set_measure(measure);
+        self.measure_storage();
+        self
+    }
+
+    /// Measure the storage bounds now and publish them beside the capture state. A
     /// warning is recorded once as a [`Notice`] and disappears when the measurement
     /// falls back below the warning line; a real storage fault is carried separately
-    /// and is never turned into a network wait.
-    fn refresh_storage(&mut self) {
-        let status = self.storage.status(&self.runtime);
+    /// and is never turned into a network wait. A measurement that blocks the bounds
+    /// stops a live capture with the same sentence as before.
+    ///
+    /// This is the one measurement the published status comes from.
+    /// [`Application::poll`] advances state and never measures (#49); the panel and
+    /// `status.txt` read the last measurement, which is why a cached value is enough.
+    pub fn measure_storage(&mut self) {
+        let status = self.storage.measure(&self.runtime);
+        self.last_measure = Some(Instant::now());
+        self.publish_storage(status);
+    }
+
+    /// The desktop caller's tick: measure only when the last measurement is older
+    /// than one second (`STORAGE_MEASURE_INTERVAL`). The capture loop polls every
+    /// 10 ms, so the runtime walk must not happen on every tick; one second keeps the
+    /// user-visible bounds current without putting the walk back on the stop path.
+    pub fn measure_storage_if_due(&mut self) {
+        if self
+            .last_measure
+            .is_none_or(|last| last.elapsed() >= STORAGE_MEASURE_INTERVAL)
+        {
+            self.measure_storage();
+        }
+    }
+
+    /// Apply one measurement: stop a live capture the bounds block, then publish the
+    /// values and the warning. It performs no I/O, so it is the same work a poll
+    /// would do with a cached measurement.
+    fn publish_storage(&mut self, status: storage::StorageStatus) {
+        if status.blocking() {
+            if let Some(index) = self.capturing_index() {
+                let reason = storage::capture_stopped_detail(&status);
+                self.stop_capture_for_storage(index, &reason);
+            }
+        }
         self.apply_storage_status(status);
     }
 
@@ -1475,6 +1522,26 @@ impl Application {
             self.snapshot.notice = None;
         }
         self.snapshot.storage = Some(status);
+    }
+
+    /// Record a real storage write/save failure and publish it immediately: the fault
+    /// is an event, not something the next measurement has to rediscover, so it stays
+    /// observable in `Snapshot::storage` without waiting for a walk.
+    fn note_storage_fault(&mut self, fault: String) -> String {
+        let message = self.storage.note_fault(fault);
+        if let Some(status) = self.snapshot.storage.as_mut() {
+            status.fault = Some(message.clone());
+        }
+        message
+    }
+
+    /// A successful save means storage is writable again; the published fault goes
+    /// with the recorded one.
+    fn clear_storage_fault(&mut self) {
+        self.storage.clear_fault();
+        if let Some(status) = self.snapshot.storage.as_mut() {
+            status.fault = None;
+        }
     }
 
     /// The segment whose capture is still running. The playback device admits one
@@ -2309,8 +2376,9 @@ impl Application {
             }
         }
         // Storage measurements change with every action (a completed segment may
-        // release its audio, a delete may free it); publish the fresh values.
-        self.refresh_storage();
+        // release its audio, a delete may free it); publish the fresh values. This
+        // is a control action, not a tick, so one measurement here is cheap.
+        self.measure_storage();
         self.segments_dirty = true;
         self.refresh_segments();
     }
@@ -2324,8 +2392,9 @@ impl Application {
         // own sequence, and the older failure stays retryable beside it (#33/#35).
         // Storage is checked before the target is bound and before any session
         // directory exists: over the pending-audio budget or at/below the free-disk
-        // floor, no capture may start and nothing may be overwritten.
-        let storage_status = self.storage.status(&self.runtime);
+        // floor, no capture may start and nothing may be overwritten. A start is an
+        // explicit action, so it measures now instead of reading a cached value.
+        let storage_status = self.storage.measure(&self.runtime);
         if let Some(refusal) = storage::start_refusal(&storage_status) {
             self.apply_storage_status(storage_status);
             self.snapshot.phase = Phase::Failure;
@@ -2435,8 +2504,8 @@ impl Application {
                 }
                 // A capture that started means the storage state is usable again;
                 // the next real write failure will set a new fault.
-                self.storage.clear_fault();
-                self.refresh_storage();
+                self.clear_storage_fault();
+                self.measure_storage();
             }
             Err(error) => {
                 self.snapshot.recognition = Some(SessionState::Failed);
@@ -2809,17 +2878,8 @@ impl Application {
     /// Stop a live capture when the pending-audio budget or the free-disk floor is
     /// reached. The received audio stays on disk and the segment still finishes
     /// normally: the application never pretends to keep recording into a full store.
-    fn check_storage_pressure(&mut self) {
-        let status = self.storage.status(&self.runtime);
-        if status.blocking() {
-            if let Some(index) = self.capturing_index() {
-                let reason = storage::capture_stopped_detail(&status);
-                self.stop_capture_for_storage(index, &reason);
-            }
-        }
-        self.apply_storage_status(status);
-    }
-
+    /// Called from `Application::publish_storage`, i.e. only by a measurement, and
+    /// never by a poll (#49).
     fn stop_capture_for_storage(&mut self, index: usize, reason: &str) {
         if self.segments[index].stopped {
             return;
@@ -2945,10 +3005,12 @@ impl Application {
         if let Some((_, delivered)) = self.deliveries.pop_last() {
             self.apply_delivery(delivered);
         }
-        // Measure storage after statuses, events and deliveries: a segment that just
-        // released its audio no longer counts, and a budget that is reached while
-        // recording stops the capture instead of pretending it still works.
-        self.check_storage_pressure();
+        // The storage bounds are deliberately *not* measured here (#49): a poll only
+        // advances state. The measurement is a separate, caller-driven action
+        // ([`Application::measure_storage`] / [`Application::measure_storage_if_due`])
+        // that runs after this poll on the desktop tick, so a segment that just
+        // released its audio still stops counting at the measurement, and the 10 ms
+        // processing poll never walks the runtime directory.
         // Cost summaries and per-segment cost are read only once no recognition
         // session is alive, so the ledger's admission lock is never contended.
         self.flush_deferred_usage();
@@ -3228,7 +3290,7 @@ impl Application {
                 .map_err(|error| format!("Could not save the current result: {error}"))?;
         }
         // A complete result saved durably means storage is writable again.
-        self.storage.clear_fault();
+        self.clear_storage_fault();
         Ok(())
     }
 
@@ -3529,7 +3591,7 @@ impl Application {
         // network wait or a playback-device interruption. The recorded fault stays
         // observable in `Snapshot::storage` until a later write succeeds.
         let error = match storage::storage_fault_message(&error) {
-            Some(message) => self.storage.note_fault(message),
+            Some(message) => self.note_storage_fault(message),
             None => error,
         };
         let sequence = self.segments[index].facts.sequence;
@@ -3835,6 +3897,14 @@ impl Application {
 pub const EXIT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
 /// The same bound for a local capture, whose last window is closed by the device.
 const LOCAL_EXIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+/// How often the desktop caller's tick may ask for a fresh storage measurement
+/// (#49). The measurement is one runtime-directory walk plus a free-space probe;
+/// the capture loop runs every 10 ms, so measuring on every tick was the thing the
+/// wave removed. One second is far below the resolution the user-visible bounds
+/// need (the default budget is 1 GiB and playback audio grows by a few hundred KiB
+/// per second), and it bounds how far a running capture can pass the budget before
+/// the stop is announced to one second of audio.
+const STORAGE_MEASURE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One failure message with the retained audio paths, never a credential.
 fn failure_detail(error: &str, retained_audio: &[PathBuf]) -> String {

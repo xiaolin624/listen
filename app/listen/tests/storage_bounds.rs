@@ -333,6 +333,9 @@ fn pending_audio_is_counted_across_segments_and_a_full_budget_stops_the_capture_
     let second_directory = h.segment_dir(second);
     // The live capture itself crosses the budget. Nothing is deleted or overwritten.
     write_bytes(&second_directory.join("playback.pcm"), 500);
+    // The desktop caller measures storage on its own low-frequency tick; `poll()`
+    // never walks the runtime directory (#49). Ask for the measurement explicitly.
+    h.app.measure_storage();
 
     let stopped = h.poll_until("the storage stop", |snapshot| {
         snapshot.phase == Phase::Processing
@@ -498,6 +501,9 @@ fn audio_over_the_budget_never_blocks_saving_the_complete_text_to_its_own_bound(
     let first = h.start(0);
     let directory = h.segment_dir(first);
     write_bytes(&directory.join("playback.pcm"), 2_000);
+    // `poll()` no longer measures (#49); the desktop tick does. Measure explicitly
+    // so the budget stop is decided here instead of at some later tick.
+    h.app.measure_storage();
     let stopped = h.poll_until("the budget stop", |snapshot| {
         snapshot.phase == Phase::Processing
     });
@@ -580,6 +586,9 @@ fn the_free_disk_floor_stops_a_running_capture_and_keeps_the_received_audio() {
     let directory = h.segment_dir(first);
     write_bytes(&directory.join("playback.pcm"), 300);
     h.set_free(999_999);
+    // The free-space probe is read by the measurement, and `poll()` no longer
+    // measures (#49); the desktop tick does.
+    h.app.measure_storage();
     let stopped = h.poll_until("the floor stop", |snapshot| {
         snapshot.phase == Phase::Processing
     });
