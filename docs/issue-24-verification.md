@@ -165,12 +165,12 @@ At E:\luyin\.worktrees\issue-24\scripts\verify-generic-editor.ps1:76 char:5
 | 项 | 实测 |
 | --- | --- |
 | 目标容量 | 40 |
-| 目标最终长度 | **40**（草稿 24 + 换行 + 15） |
+| 目标最终长度 | **40**（草稿 24 + `\r\n` 2 + 转写前 14 个字符） |
 | 应有长度 | **54** |
 | `detail` | `The original target holds only 39 of 54 characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. … output is not retried automatically and the original text is not reverted. The complete result is in the expanded result panel.` |
 | `delivery.json` | `uncertain`（**不是** `appended`；与 Rust 契约 `Delivery::Uncertain` 一致） |
 | 前缀性质 | 目标内容确实是“应有文本”的前缀，且未超过 40 |
-| `detail` 自述计数 | `only 39 of 54` 与目标实际 40 字符的差异来自末尾换行（脚本两者都断言） |
+| `detail` 自述计数 | `only 39 of 54`；与应用把 `\r\n` 记作 1 个字符、目标实际 40 个 UTF-16 单元的差异一致（脚本不把 39 当阈值，另断言“目标 ≤ 40”“目标是应有文本前缀”） |
 | 面板 | `panel_visible=1`，`panel.txt` 含完整结果 |
 | 其它 | 邻居与其他窗口不变、0 Enter/0 Send、无临时音频 |
 
