@@ -424,6 +424,9 @@ pub enum Notice {
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed, so the resident
     /// status capsule is visible to screen sharing and recordings.
     CaptureExcluded(String),
+    /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` failed for the expanded
+    /// result panel, so screen sharing and recordings show the complete 转写文本.
+    PanelCaptureExcluded(String),
     /// This month's own cloud-recognition cost is approaching the CNY 100 reminder
     /// line (the reminder fires at 90%, CNY 90). It is a reminder only: nothing was
     /// stopped, cancelled, purchased or raised, and the capture flow is unaffected.
@@ -444,6 +447,9 @@ impl Notice {
             ),
             Notice::CaptureExcluded(reason) => format!(
                 "The status capsule could not be hidden from screen capture ({reason}), so screen sharing and recordings will show it. Capture and recognition are unaffected."
+            ),
+            Notice::PanelCaptureExcluded(reason) => format!(
+                "The expanded result panel could not be hidden from screen capture ({reason}), so screen sharing and recordings will show the complete transcript. Capture, recognition and the panel itself are unaffected."
             ),
             Notice::UsageReminder => "本月云端识别费用估计已达到每月 100 元提醒线的 90%（即 90 元）或更多。这只是提醒：采集、识别与安全回填照常继续，不会自动停用功能、取消当前录音、购买套餐或提高额度。".into(),
             Notice::StorageWarning => "待处理音频已接近缓存上限。达到上限或磁盘余量低于底线时，Listen 会停止开始新的采集并保留已经收到的声音和旧段；可清理不再需要的段，或调整待处理音频预算。".into(),
@@ -2137,6 +2143,15 @@ impl Application {
     /// failure must not stay visible only as `capsule_capture_excluded=0`.
     pub fn report_capture_exclusion(&mut self, reason: &str) {
         self.snapshot.notice = Some(Notice::CaptureExcluded(
+            reason.trim_end_matches('.').to_string(),
+        ));
+    }
+
+    /// Report that the platform refused to hide the expanded result panel from
+    /// screen capture. The panel shows the complete 转写文本, so a failure must be
+    /// stated in the panel and `status.txt`, not only as `panel_capture_excluded=0`.
+    pub fn report_panel_capture_exclusion(&mut self, reason: &str) {
+        self.snapshot.notice = Some(Notice::PanelCaptureExcluded(
             reason.trim_end_matches('.').to_string(),
         ));
     }

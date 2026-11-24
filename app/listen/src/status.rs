@@ -33,6 +33,10 @@ pub struct WindowFacts<'a> {
     pub capsule: &'a str,
     pub startup_capsule_ms: u64,
     pub capture_excluded: bool,
+    /// Whether the expanded result panel is hidden from screen capture. False
+    /// before the panel window exists and when the platform refused; the key is
+    /// reported either way, exactly like `capture_excluded`.
+    pub panel_capture_excluded: bool,
 }
 
 /// A cheap identity of the report's inputs that live outside the snapshot.
@@ -52,6 +56,7 @@ pub struct FactsKey {
     capsule: String,
     startup_capsule_ms: u64,
     capture_excluded: bool,
+    panel_capture_excluded: bool,
 }
 
 impl FactsKey {
@@ -65,6 +70,7 @@ impl FactsKey {
             capsule: window.capsule.to_owned(),
             startup_capsule_ms: window.startup_capsule_ms,
             capture_excluded: window.capture_excluded,
+            panel_capture_excluded: window.panel_capture_excluded,
         }
     }
 }
@@ -89,7 +95,7 @@ pub fn report_inputs_differ(
 /// This is the one place the machine-readable contract is serialized. The key set,
 /// the key order, the three conditional blocks (usage / storage / #38 latency) and
 /// the one-line rule for free-text values are pinned by the tests in this module;
-/// `scripts\verify-panel.ps1`'s `$requiredKeys` is the same 29 keys the desktop
+/// `scripts\verify-panel.ps1`'s `$requiredKeys` is the same 30 keys the desktop
 /// acceptance run asserts. Every key here existed before this function did, with the
 /// same spelling and the same order.
 pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_>) -> String {
@@ -113,7 +119,7 @@ pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_
     let milliseconds =
         |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
     let mut status = format!(
-        "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
+        "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\npanel_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
         snapshot.phase,
         snapshot.detail,
         snapshot
@@ -153,6 +159,7 @@ pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_
         one_line(window.panel_error),
         window.startup_capsule_ms,
         if window.capture_excluded { 1 } else { 0 },
+        if window.panel_capture_excluded { 1 } else { 0 },
         milliseconds(timing.capture_start_ms),
         milliseconds(timing.preparation_ms),
         milliseconds(timing.stop_to_result_ms),
@@ -254,8 +261,8 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
-    /// The 34 unconditional keys, in the order they were written before this wave.
-    const BASE_KEYS: [&str; 34] = [
+    /// The 35 unconditional keys, in the order they were written before this wave.
+    const BASE_KEYS: [&str; 35] = [
         "phase",
         "detail",
         "endpoint_role",
@@ -276,6 +283,7 @@ mod tests {
         "panel_error",
         "startup_capsule_ms",
         "capsule_capture_excluded",
+        "panel_capture_excluded",
         "timing_capture_start_ms",
         "timing_preparation_ms",
         "timing_stop_to_result_ms",
@@ -338,9 +346,9 @@ mod tests {
         "timing_delivery_save_ms",
     ];
 
-    /// `scripts\verify-panel.ps1`'s `$requiredKeys`, copied verbatim. These 29 keys,
+    /// `scripts\verify-panel.ps1`'s `$requiredKeys`, copied verbatim. These 30 keys,
     /// in this order, are the desktop acceptance contract.
-    const REQUIRED_KEYS: [&str; 29] = [
+    const REQUIRED_KEYS: [&str; 30] = [
         "phase",
         "detail",
         "endpoint_role",
@@ -359,6 +367,7 @@ mod tests {
         "panel_error",
         "startup_capsule_ms",
         "capsule_capture_excluded",
+        "panel_capture_excluded",
         "timing_capture_start_ms",
         "timing_preparation_ms",
         "timing_stop_to_result_ms",
@@ -412,6 +421,7 @@ mod tests {
             capsule: "Ready",
             startup_capsule_ms: 42,
             capture_excluded: false,
+            panel_capture_excluded: false,
         }
     }
 
@@ -464,6 +474,10 @@ mod tests {
             },
             WindowFacts {
                 capture_excluded: true,
+                ..window()
+            },
+            WindowFacts {
+                panel_capture_excluded: true,
                 ..window()
             },
         ] {
@@ -653,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn every_block_together_is_the_frozen_sixty_eight_keys_and_the_required_twenty_nine() {
+    fn every_block_together_is_the_frozen_sixty_nine_keys_and_the_required_thirty() {
         let mut state = snapshot();
         state.usage = Some(UsageSummary::default());
         state.storage = Some(storage());
@@ -665,13 +679,13 @@ mod tests {
         expected.extend(STORAGE_KEYS);
         expected.extend(TIMING_KEYS);
         assert_eq!(keys, expected);
-        assert_eq!(keys.len(), 68);
+        assert_eq!(keys.len(), 69);
 
         // No key is emitted twice; the contract is a set with one defined order.
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(unique.len(), keys.len(), "a key was emitted twice");
 
-        // The desktop acceptance script reads these 29 keys by name and order.
+        // The desktop acceptance script reads these 30 keys by name and order.
         let required: Vec<&str> = keys
             .iter()
             .copied()
@@ -726,6 +740,7 @@ mod tests {
             capsule: "Processing",
             startup_capsule_ms: 42,
             capture_excluded: true,
+            panel_capture_excluded: true,
         };
         let report = report(&state, &host(), &window);
 
@@ -770,6 +785,7 @@ mod tests {
             report.contains("\ncapsule_capture_excluded=1\n"),
             "{report}"
         );
+        assert!(report.contains("\npanel_capture_excluded=1\n"), "{report}");
         assert!(
             report.contains("\ntiming_recognition_ms=1234\n"),
             "{report}"
@@ -787,6 +803,24 @@ mod tests {
         assert!(report.contains("\nwaiting_segments=1\n"), "{report}");
         assert!(report.contains("\npending_results=1\n"), "{report}");
         assert!(report.ends_with("\n"), "{report}");
+    }
+
+    /// The expanded result panel is hidden from screen capture exactly like the
+    /// capsule (#54). The key is always present: `0` before the window exists or
+    /// when the platform refused, `1` once `SetWindowDisplayAffinity` succeeded.
+    #[test]
+    fn the_panel_capture_exclusion_is_always_reported_as_zero_or_one() {
+        for (panel_capture_excluded, expected) in [(false, "0"), (true, "1")] {
+            let window = WindowFacts {
+                panel_capture_excluded,
+                ..window()
+            };
+            let report = report(&snapshot(), &host(), &window);
+            assert!(
+                report.contains(&format!("\npanel_capture_excluded={expected}\n")),
+                "panel_capture_excluded={expected} must be reported: {report}"
+            );
+        }
     }
 
     #[test]

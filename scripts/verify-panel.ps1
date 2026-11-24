@@ -9,7 +9,7 @@
 #   ACCEPTANCE (control channel only) - issue #20's acceptance criterion. Every
 #   assertion here uses only the public automation contract:
 #     --control show|panel|copy|start|stop|retry|cleanup|quit
-#     runtime\status.txt   phase, panel_visible, panel_error, retry_available, ...
+#     runtime\status.txt   phase, panel_visible, panel_error, panel_capture_excluded, ...
 #     runtime\panel.txt    the full panel text, updated while the panel is hidden
 #     runtime\current-result.txt
 #   Nothing in this group reads a window handle, class name or control ID.
@@ -19,12 +19,24 @@
 #   CHECK because it is a one-time deletion assertion, not an acceptance oracle.
 #
 #   UI SELF-CHECKS (not acceptance) - a smaller set of window-level diagnostics:
-#   the panel's topmost/toolwindow style, position on the capsule monitor, that
-#   opening never takes focus, it stays inside the work area, its two read-only
-#   EDIT controls exactly match panel.txt, its buttons are enabled/disabled
-#   correctly, capsule click / Esc / tray menu behaviour, and screenshots.
-#   These use the private window class name and control IDs on purpose; #24 must
-#   not depend on them. See docs/issue-20-verification.md.
+#   the panel's topmost/toolwindow style, WDA_EXCLUDEFROMCAPTURE affinity, position
+#   on the capsule monitor, that opening never takes focus, it stays inside the work
+#   area, its two read-only EDIT controls exactly match panel.txt, its buttons are
+#   enabled/disabled correctly, capsule click / Esc / tray menu behaviour, and
+#   screenshots. These use the private window class name and control IDs on purpose;
+#   #24 must not depend on them. See docs/issue-20-verification.md.
+#
+#   CAPTURE EXCLUSION EVIDENCE (issue #54) - the panel shows the complete transcript,
+#   so it is excluded from screen sharing and recordings exactly like the capsule.
+#   CopyFromScreen therefore cannot see it. Two independent artefacts are kept:
+#     1. frame evidence: the documented inspection message PANEL_FRAME_MESSAGE
+#        (WM_APP + 21) asks the panel to render its current frame into
+#        runtime\panel-frame.bmp, which this script converts to panel-*.png. This is
+#        the same process painting its own pixels, exactly like the capsule's
+#        WM_APP + 20 export; the display affinity is not bypassed.
+#     2. a whole-desktop screenshot and the crop of the panel's own rectangle: both
+#        must show the desktop behind the panel, not the panel.
+#   The status oracle for the exclusion is status.txt panel_capture_excluded=1.
 #
 # ASCII only on purpose: this file must survive any code page.
 #
@@ -116,6 +128,8 @@ New-Item -ItemType Directory -Force -Path $Runtime, $Evidence, $FailureRuntime |
 $statusPath = Join-Path $Runtime 'status.txt'
 $panelPath = Join-Path $Runtime 'panel.txt'
 $resultPath = Join-Path $Runtime 'current-result.txt'
+$framePath = Join-Path $Runtime 'panel-frame.bmp'
+$failureFramePath = Join-Path $FailureRuntime 'panel-frame.bmp'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -137,6 +151,7 @@ public static class PanelProbe
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hwnd);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool GetWindowDisplayAffinity(IntPtr hwnd, out uint affinity);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
@@ -161,6 +176,8 @@ public static class PanelProbe
     public const long WS_EX_TOOLWINDOW = 0x00000080;
     public const uint WM_APP = 0x8000;
     public const uint TRAY_MESSAGE = WM_APP + 11;
+    public const uint PANEL_FRAME_MESSAGE = WM_APP + 21;
+    public const uint WDA_EXCLUDEFROMCAPTURE = 17;
     public const uint WM_COMMAND = 0x0111;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_LBUTTONDOWN = 0x0201;
@@ -265,6 +282,22 @@ public static class PanelProbe
         SendMessageTimeoutPtr(hwnd, WM_LBUTTONDOWN, (UIntPtr)1, packed, SMTO_ABORTIFHUNG, 2000, out ignored);
         SendMessageTimeoutPtr(hwnd, WM_LBUTTONUP, UIntPtr.Zero, packed, SMTO_ABORTIFHUNG, 2000, out ignored);
         return 0;
+    }
+
+    public static uint DisplayAffinity(IntPtr hwnd)
+    {
+        uint affinity;
+        GetWindowDisplayAffinity(hwnd, out affinity);
+        return affinity;
+    }
+
+    // Ask the panel for the frame it is currently presenting. The panel is excluded
+    // from every screen capture (#54), so this documented inspection message is the
+    // only way to keep panel appearance evidence; it is not a product path.
+    public static bool SendFrameRequest(IntPtr hwnd)
+    {
+        UIntPtr result;
+        return SendMessageTimeoutPtr(hwnd, PANEL_FRAME_MESSAGE, UIntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out result) != IntPtr.Zero;
     }
 
     public static bool Focus(IntPtr hwnd)
@@ -562,6 +595,44 @@ function Save-PanelShot([IntPtr]$Panel, [string]$Path) {
     Save-Shot $Path $rect.left $rect.top ($rect.right - $rect.left) ($rect.bottom - $rect.top)
 }
 
+function Test-NonEmptyFile([string]$Path) {
+    return ((Test-Path -LiteralPath $Path -PathType Leaf) -and ((Get-Item -LiteralPath $Path).Length -gt 0))
+}
+
+# A whole-desktop screenshot. The panel and the capsule are excluded from it by
+# WDA_EXCLUDEFROMCAPTURE; this is the evidence that a screen share shows the desktop
+# behind them, not the transcript.
+function Save-DesktopShot([string]$Path) {
+    $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    Save-Shot $Path $screen.Left $screen.Top $screen.Width $screen.Height
+}
+
+# The panel is excluded from every screen capture (#54), so CopyFromScreen cannot
+# prove what it looks like. PANEL_FRAME_MESSAGE (WM_APP + 21) makes the panel render
+# its current frame into panel-frame.bmp in its own runtime directory; the BMP is
+# converted to PNG here. The message is a documented inspection hook, not a product
+# path, and it does not change the appearance, position or focus.
+function Save-PanelFrame([IntPtr]$Panel, [string]$RuntimeDirectory, [string]$Path) {
+    if ($Panel -eq [IntPtr]::Zero) { return $false }
+    $bmp = Join-Path $RuntimeDirectory 'panel-frame.bmp'
+    Remove-Item -LiteralPath $bmp -ErrorAction SilentlyContinue
+    if (-not [PanelProbe]::SendFrameRequest($Panel)) { return $false }
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        if (Test-NonEmptyFile $bmp) { break }
+        Start-Sleep -Milliseconds 20
+    }
+    if (-not (Test-NonEmptyFile $bmp)) { return $false }
+    $image = [System.Drawing.Image]::FromFile($bmp)
+    try { $image.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $image.Dispose() }
+    Remove-Item -LiteralPath $bmp -ErrorAction SilentlyContinue
+    return (Test-NonEmptyFile $Path)
+}
+
+function Get-ImageSize([string]$Path) {
+    $image = [System.Drawing.Image]::FromFile($Path)
+    try { return @($image.Width, $image.Height) } finally { $image.Dispose() }
+}
+
 # The panel's full text is the status control, a blank line and the result control.
 # Returns $null when the panel window does not exist.
 function Read-VisiblePanelText([IntPtr]$Panel) {
@@ -605,8 +676,8 @@ $summary = [ordered]@{
 try {
     $existing = @(Get-OurListenProcesses)
     if ($existing.Count -gt 0) { throw "This Listen build is already running; this check will not replace or close it ($Exe)." }
-    Remove-Item -LiteralPath $statusPath, $panelPath, $resultPath -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $FailureRuntime 'status.txt'), (Join-Path $FailureRuntime 'panel.txt'), (Join-Path $FailureRuntime 'current-result.txt') -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $statusPath, $panelPath, $resultPath, $framePath -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $FailureRuntime 'status.txt'), (Join-Path $FailureRuntime 'panel.txt'), (Join-Path $FailureRuntime 'current-result.txt'), $failureFramePath -ErrorAction SilentlyContinue
 
     # ===================== ACCEPTANCE: control channel only =================
     # --- Ready state: contract files and keys ------------------------------
@@ -617,9 +688,12 @@ try {
     Check ($null -ne (Read-Text $panelPath)) 'runtime\panel.txt is readable as UTF-8'
     Check ((Get-StatusValue $status 'panel_visible') -eq '0') "status.txt reports panel_visible=0 initially ($(Get-StatusValue $status 'panel_visible'))"
     Check ((Get-StatusValue $status 'panel_error') -eq '') 'status.txt reports no panel_error'
-    $requiredKeys = @('phase', 'detail', 'endpoint_role', 'endpoint_id', 'endpoint_name', 'current_result', 'retained_audio', 'retry_available', 'backend', 'preparation', 'refine', 'refine_reason', 'notice', 'capsule', 'panel_visible', 'panel_error', 'startup_capsule_ms', 'capsule_capture_excluded', 'timing_capture_start_ms', 'timing_preparation_ms', 'timing_stop_to_result_ms', 'timing_finalize_ms', 'timing_recognition_ms', 'timing_last_window_wait_ms', 'timing_last_window_inference_ms', 'timing_save_ms', 'timing_delivery_ms', 'timing_recognition_windows', 'process_id')
+    $requiredKeys = @('phase', 'detail', 'endpoint_role', 'endpoint_id', 'endpoint_name', 'current_result', 'retained_audio', 'retry_available', 'backend', 'preparation', 'refine', 'refine_reason', 'notice', 'capsule', 'panel_visible', 'panel_error', 'startup_capsule_ms', 'capsule_capture_excluded', 'panel_capture_excluded', 'timing_capture_start_ms', 'timing_preparation_ms', 'timing_stop_to_result_ms', 'timing_finalize_ms', 'timing_recognition_ms', 'timing_last_window_wait_ms', 'timing_last_window_inference_ms', 'timing_save_ms', 'timing_delivery_ms', 'timing_recognition_windows', 'process_id')
     $missingKeys = @($requiredKeys | Where-Object { $status -notmatch ("(?m)^" + [regex]::Escape($_) + "=") })
-    Check ($missingKeys.Count -eq 0) ("status.txt keeps every previous key and adds panel_visible (missing: " + ($missingKeys -join ', ') + ')')
+    Check ($missingKeys.Count -eq 0) ("status.txt keeps every previous key and adds panel_capture_excluded (missing: " + ($missingKeys -join ', ') + ')')
+    # The panel does not exist yet, so there is no window to hide: the key is
+    # present and reports 0 rather than being absent or claiming a success.
+    Check ((Get-StatusValue $status 'panel_capture_excluded') -eq '0') "status.txt reports panel_capture_excluded=0 before the panel is ever opened ($(Get-StatusValue $status 'panel_capture_excluded'))"
     $panelText = Read-Text $panelPath
     Check ($panelText.Contains((Get-StatusValue $status 'detail'))) 'panel.txt contains the human-readable detail from status.txt'
     Check ($panelText.Length -gt (Get-StatusValue $status 'detail').Length) 'panel.txt has a result section after the status detail'
@@ -663,6 +737,7 @@ try {
     Invoke-Control 'show'
     $status = Wait-PanelVisibility $true
     Check ((Get-StatusValue $status 'panel_visible') -eq '1') '--control show reports panel_visible=1 in status.txt'
+    Check ((Get-StatusValue $status 'panel_capture_excluded') -eq '1') "status.txt reports panel_capture_excluded=1 while the panel is visible ($(Get-StatusValue $status 'panel_capture_excluded'))"
 
     # ============== UI SELF-CHECKS (not acceptance; see header) =============
     # Window-level diagnostics. They read the private class/control IDs on purpose
@@ -719,10 +794,36 @@ try {
     Check $foregroundStable 'opening the panel leaves the foreground window unchanged' 'ui'
     $visibleText = Read-VisiblePanelText $panel
     Check ($visibleText -ceq (Read-Text $panelPath)) 'panel.txt is exactly the text shown by the two read-only controls' 'ui'
+    $panelAffinity = [PanelProbe]::DisplayAffinity($panel)
+    Check ($panelAffinity -eq [PanelProbe]::WDA_EXCLUDEFROMCAPTURE) "the panel display affinity is WDA_EXCLUDEFROMCAPTURE ($panelAffinity)" 'ui'
+    # Frame evidence replaces the CopyFromScreen screenshot of the panel: the panel
+    # is excluded from capture, so only its own frame export can show what it looks
+    # like. The desktop screenshot and the crop of the panel rectangle are the
+    # matching proof that capture does not show the panel.
     $readyShot = Join-Path $Evidence 'panel-ready.png'
-    Save-PanelShot $panel $readyShot
+    $readyFrameSaved = Save-PanelFrame $panel $Runtime $readyShot
     $summary.screenshots.Add($readyShot)
-    Check (Test-Path -LiteralPath $readyShot) "saved the ready-state panel screenshot: $readyShot" 'ui'
+    Check $readyFrameSaved "the panel wrote its current frame and the evidence file is non-empty: $readyShot" 'ui'
+    $frameSize = if ($readyFrameSaved) { Get-ImageSize $readyShot } else { @(0, 0) }
+    $panelWidth = $panelRect.right - $panelRect.left
+    $panelHeight = $panelRect.bottom - $panelRect.top
+    Check (($frameSize[0] -eq $panelWidth) -and ($frameSize[1] -eq $panelHeight)) "the exported frame has the panel window size ($($frameSize[0])x$($frameSize[1]) vs ${panelWidth}x${panelHeight})" 'ui'
+    $desktopShot = Join-Path $Evidence 'desktop-panel-excluded.png'
+    Save-DesktopShot $desktopShot
+    $summary.screenshots.Add($desktopShot)
+    Check (Test-NonEmptyFile $desktopShot) "saved the whole-desktop screenshot while the panel is visible: $desktopShot" 'ui'
+    $panelRegionShot = Join-Path $Evidence 'desktop-panel-region.png'
+    Save-PanelShot $panel $panelRegionShot
+    $summary.screenshots.Add($panelRegionShot)
+    Check (Test-NonEmptyFile $panelRegionShot) "saved the desktop region the panel covers (it must show the desktop, not the panel): $panelRegionShot" 'ui'
+    $summary.capture_exclusion = [ordered]@{
+        status_panel_capture_excluded = Get-StatusValue $status 'panel_capture_excluded'
+        display_affinity = $panelAffinity
+        frame_path = $readyShot
+        frame_size = "$($frameSize[0])x$($frameSize[1])"
+        desktop_path = $desktopShot
+        desktop_region_path = $panelRegionShot
+    }
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $false) 'the copy button is disabled while there is no result' 'ui'
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 204))) -eq $false) 'the refine placeholder is disabled' 'ui'
     $refineLabel = [PanelProbe]::EditText([PanelProbe]::GetDlgItem($panel, 204))
@@ -829,8 +930,9 @@ try {
             $status = Read-Status
             Check ((Get-StatusValue $status 'capsule') -eq 'Capturing') 'status.txt reports capsule=Capturing while capturing'
             $capturingShot = Join-Path $Evidence 'panel-capturing.png'
-            Save-PanelShot $panel $capturingShot
+            $capturingFrameSaved = Save-PanelFrame $panel $Runtime $capturingShot
             $summary.screenshots.Add($capturingShot)
+            Check $capturingFrameSaved "saved the capturing-state panel frame evidence: $capturingShot" 'ui'
             # Closing the panel before the result proves the fallback opens it by itself.
             Invoke-Control 'panel'
             $status = Wait-PanelVisibility $false
@@ -896,8 +998,9 @@ try {
     $panel = Get-Panel $pidListen
     Check ((Read-VisiblePanelText $panel) -ceq $panelText) 'panel.txt is exactly the visible text after a fallback result' 'ui'
     $fallbackShot = Join-Path $Evidence 'panel-fallback.png'
-    Save-PanelShot $panel $fallbackShot
+    $fallbackFrameSaved = Save-PanelFrame $panel $Runtime $fallbackShot
     $summary.screenshots.Add($fallbackShot)
+    Check $fallbackFrameSaved "saved the fallback-state panel frame evidence: $fallbackShot" 'ui'
     $resultEdit = [PanelProbe]::GetDlgItem($panel, 212)
     Check (([PanelProbe]::EditText($resultEdit)).Replace("`r`n", "`n") -ceq $result) 'the panel shows the complete result in its read-only control' 'ui'
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($panel, 201))) -eq $true) 'the copy button is enabled once a result exists' 'ui'
@@ -989,9 +1092,9 @@ try {
     Check ($failurePanel -ne [IntPtr]::Zero) 'the failure panel window is visible after --control show' 'ui'
     Check ((Read-VisiblePanelText $failurePanel) -ceq $failureText) 'panel.txt is exactly the visible failure text' 'ui'
     $failureShot = Join-Path $Evidence 'panel-failure.png'
-    Save-PanelShot $failurePanel $failureShot
+    $failureFrameSaved = Save-PanelFrame $failurePanel $FailureRuntime $failureShot
     $summary.screenshots.Add($failureShot)
-    Check (Test-Path -LiteralPath $failureShot) 'saved the failure-state panel screenshot' 'ui'
+    Check $failureFrameSaved "saved the failure-state panel frame evidence: $failureShot" 'ui'
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 201))) -eq $false) 'the copy button is disabled when a fresh failure has no result' 'ui'
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 202))) -eq $false) 'the retry button is disabled when no audio was retained' 'ui'
     Check (([PanelProbe]::IsWindowEnabled([PanelProbe]::GetDlgItem($failurePanel, 203))) -eq $false) 'the cleanup button is disabled when no audio was retained' 'ui'

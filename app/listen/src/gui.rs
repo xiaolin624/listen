@@ -405,6 +405,7 @@ impl Ui {
                 capsule: visual.name(),
                 startup_capsule_ms: self.capsule.startup_ms(),
                 capture_excluded: self.capsule.capture_excluded(),
+                panel_capture_excluded: self.panel_capture_excluded(),
             };
             // `status.txt` is a pure function of the snapshot plus the facts outside
             // it. The rewrite decision compares those three values themselves — the
@@ -508,8 +509,14 @@ impl Ui {
     /// `--control show` and from a capsule click.
     fn open_panel(&mut self) {
         if self.panel.is_none() {
-            match Panel::create(self.capsule.hwnd(), self.hwnd) {
+            match Panel::create(self.capsule.hwnd(), self.hwnd, &self.runtime) {
                 Ok(panel) => {
+                    // The panel carries the complete 转写文本, so a platform refusal
+                    // to hide it from screen capture must be user-visible, not only
+                    // `panel_capture_excluded=0` in a file (#54).
+                    if let Some(reason) = panel.capture_exclusion_error().map(str::to_string) {
+                        self.app.report_panel_capture_exclusion(&reason);
+                    }
                     self.panel = Some(panel);
                     self.panel_error = None;
                 }
@@ -535,6 +542,14 @@ impl Ui {
 
     fn panel_visible(&self) -> bool {
         self.panel.as_ref().is_some_and(|panel| panel.visible())
+    }
+
+    /// Whether the existing panel window is hidden from screen capture. A panel
+    /// that was never created reports 0: there is no window to hide yet.
+    fn panel_capture_excluded(&self) -> bool {
+        self.panel
+            .as_ref()
+            .is_some_and(|panel| panel.capture_excluded())
     }
 
     fn panel_dialog(&self) -> Option<HWND> {

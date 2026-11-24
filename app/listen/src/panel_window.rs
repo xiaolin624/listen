@@ -16,14 +16,24 @@
 
 use crate::panel;
 use listen::Snapshot;
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    fs,
+    mem::size_of,
+    path::{Path, PathBuf},
+    slice,
+};
 use windows::{
     Win32::{
         Foundation::{HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET,
-            DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, GetMonitorInfoW, HBRUSH, HFONT,
-            HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-            MonitorFromWindow, OUT_DEFAULT_PRECIS,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+            COLOR_WINDOW, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET,
+            DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_DONTCARE, FW_NORMAL,
+            GetMonitorInfoW, HBRUSH, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
+            MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+            SelectObject,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -40,8 +50,9 @@ use windows::{
                 PostMessageW, RegisterClassW, RemovePropW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
                 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
                 SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetPropW,
-                SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-                WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_SETFONT, WM_SIZE, WNDCLASSW,
+                SetWindowDisplayAffinity, SetWindowPos, SetWindowTextW, ShowWindow,
+                WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
+                WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_PRINT, WM_SETFONT, WM_SIZE, WNDCLASSW,
                 WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
                 WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
             },
@@ -66,6 +77,15 @@ pub const COMMAND_CLOSE: usize = 4;
 /// 精修: ask the application to refine the complete current result.
 pub const COMMAND_REFINE: usize = 5;
 
+/// Inspection hook for the desktop verification script, matching the capsule's
+/// `CAPSULE_FRAME_MESSAGE` (#19). The panel is excluded from every screen capture
+/// by design (#54), so `scripts\verify-panel.ps1` cannot screenshot it; sending
+/// this message makes the panel render its current frame into
+/// `panel-frame.bmp` in the runtime directory. Nothing in the product sends it,
+/// and it never changes the window's appearance, position or focus.
+pub const PANEL_FRAME_MESSAGE: u32 = WM_APP + 21;
+pub const FRAME_FILE: &str = "panel-frame.bmp";
+
 // Panel control IDs. They are private; scripts use `--control` instead.
 const ID_STATUS: i32 = 211;
 const ID_RESULT: i32 = 212;
@@ -81,6 +101,26 @@ const FONT_PROP: PCWSTR = w!("ListenPanelFont");
 /// `EM_SETLIMITTEXT`: the default 64K edit limit is too small for a long session.
 const EDIT_LIMIT: usize = 0x7fff_fffe;
 
+/// `WM_PRINT` flags. The `windows` crate does not generate them, and asking the
+/// window to draw itself is exactly what the frame export needs: the title bar,
+/// the client background and every child control.
+const PRF_NONCLIENT: usize = 0x0000_0002;
+const PRF_CLIENT: usize = 0x0000_0004;
+const PRF_ERASEBKGND: usize = 0x0000_0008;
+const PRF_CHILDREN: usize = 0x0000_0010;
+
+thread_local! {
+    /// Where the panel writes an exported frame. It is thread-local rather than a
+    /// window property so the window procedure owns no allocation, exactly like
+    /// the capsule's frame export.
+    static FRAME_EXPORT: RefCell<Option<FrameExport>> = const { RefCell::new(None) };
+}
+
+struct FrameExport {
+    hwnd: HWND,
+    runtime: PathBuf,
+}
+
 /// One live panel window. The GUI owns at most one; dropping it destroys the
 /// window. Content and button state are pushed in with [`Panel::apply`].
 pub struct Panel {
@@ -94,13 +134,21 @@ pub struct Panel {
     last_status: String,
     last_result: String,
     last_refine_label: String,
+    /// Whether `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` succeeded. False
+    /// means the panel is visible in screen sharing, which `status.txt` reports as
+    /// `panel_capture_excluded=0`.
+    capture_excluded: bool,
+    /// Why the platform refused to hide the panel, so the application can tell the
+    /// user instead of only reporting a zero status key.
+    capture_exclusion_error: Option<String>,
 }
 
 impl Panel {
     /// Create the panel window hidden, owned by `owner` (the hidden message-loop
-    /// window) and positioned next to `capsule`. The caller shows it with
+    /// window) and positioned next to `capsule`. `runtime` is where the frame
+    /// inspection hook writes `panel-frame.bmp`. The caller shows it with
     /// [`Panel::show`] after filling it with [`Panel::apply`].
-    pub fn create(capsule: HWND, owner: HWND) -> Result<Self, String> {
+    pub fn create(capsule: HWND, owner: HWND, runtime: &Path) -> Result<Self, String> {
         unsafe {
             let instance = GetModuleHandleW(None).map_err(|error| error.to_string())?;
             let class = WNDCLASSW {
@@ -134,26 +182,54 @@ impl Panel {
                 None,
             )
             .map_err(|error| format!("Cannot create the result panel: {error}"))?;
+            // The panel shows the complete 转写文本, so it is excluded from screen
+            // sharing and recordings exactly like the capsule (#54). A refusal is
+            // never silent: the reason is kept for the application to report.
+            let capture_exclusion = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            let capture_excluded = capture_exclusion.is_ok();
+            let capture_exclusion_error = capture_exclusion.err().map(|error| error.to_string());
 
             match create_controls(hwnd, instance) {
-                Ok((status, result, copy, retry, cleanup, refine)) => Ok(Self {
-                    hwnd,
-                    status,
-                    result,
-                    copy,
-                    retry,
-                    cleanup,
-                    refine,
-                    last_status: String::new(),
-                    last_result: String::new(),
-                    last_refine_label: String::new(),
-                }),
+                Ok((status, result, copy, retry, cleanup, refine)) => {
+                    FRAME_EXPORT.with(|slot| {
+                        *slot.borrow_mut() = Some(FrameExport {
+                            hwnd,
+                            runtime: runtime.to_path_buf(),
+                        });
+                    });
+                    Ok(Self {
+                        hwnd,
+                        status,
+                        result,
+                        copy,
+                        retry,
+                        cleanup,
+                        refine,
+                        last_status: String::new(),
+                        last_result: String::new(),
+                        last_refine_label: String::new(),
+                        capture_excluded,
+                        capture_exclusion_error,
+                    })
+                }
                 Err(error) => {
                     let _ = DestroyWindow(hwnd);
                     Err(error)
                 }
             }
         }
+    }
+
+    /// Whether `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` succeeded. False
+    /// means the complete result is visible in screen sharing, which `status.txt`
+    /// reports as `panel_capture_excluded=0`.
+    pub fn capture_excluded(&self) -> bool {
+        self.capture_excluded
+    }
+
+    /// The platform's reason when the panel could not be excluded from capture.
+    pub fn capture_exclusion_error(&self) -> Option<&str> {
+        self.capture_exclusion_error.as_deref()
     }
 
     pub fn visible(&self) -> bool {
@@ -245,6 +321,13 @@ impl Panel {
 impl Drop for Panel {
     fn drop(&mut self) {
         unsafe {
+            FRAME_EXPORT.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    if slot.as_ref().is_some_and(|target| target.hwnd == self.hwnd) {
+                        *slot = None;
+                    }
+                }
+            });
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -584,6 +667,97 @@ unsafe fn hide_and_notify(hwnd: HWND) {
     notify(hwnd, COMMAND_CLOSE);
 }
 
+/// Write the panel's current rendering as a 32-bit top-down BMP, the same file
+/// format the capsule exports (#19). `WM_PRINT` asks this window and its child
+/// controls to draw themselves into our own memory DC; it is not a screen capture,
+/// so the `WDA_EXCLUDEFROMCAPTURE` affinity does not have to be bypassed — the same
+/// process renders its own pixels, exactly like the capsule's DIB. Only reachable
+/// through `PANEL_FRAME_MESSAGE`.
+unsafe fn save_frame(hwnd: HWND, runtime: &Path) -> Result<(), String> {
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect)
+            .map_err(|error| format!("Cannot read the result panel bounds: {error}"))?;
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return Err("The result panel has no drawable bounds".into());
+        }
+
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return Err("Cannot create the result panel bitmap context".into());
+        }
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                let _ = DeleteDC(dc);
+                return Err(format!("Cannot create the result panel bitmap: {error}"));
+            }
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+            return Err("The result panel bitmap has no pixels".into());
+        }
+        let previous = SelectObject(dc, HGDIOBJ(bitmap.0));
+        let flags = PRF_NONCLIENT | PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN;
+        SendMessageW(
+            hwnd,
+            WM_PRINT,
+            Some(WPARAM(dc.0 as usize)),
+            Some(LPARAM(flags as isize)),
+        );
+        let pixels = slice::from_raw_parts_mut(bits.cast::<u32>(), (width * height) as usize);
+        let bytes = frame_bmp(width, height, pixels);
+        let _ = SelectObject(dc, previous);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(dc);
+        fs::write(runtime.join(FRAME_FILE), bytes)
+            .map_err(|error| format!("Cannot save the result panel frame: {error}"))
+    }
+}
+
+/// The 54-byte BMP header the capsule writes, plus the pixels. GDI leaves the
+/// fourth byte at zero; a 32-bit BMP's fourth byte is the alpha channel for
+/// `System.Drawing`, so it is set to 255 to keep the evidence opaque.
+fn frame_bmp(width: i32, height: i32, pixels: &[u32]) -> Vec<u8> {
+    let pixel_bytes = pixels.len() * 4;
+    let file_size = 54 + pixel_bytes as u32;
+    let mut bytes = Vec::with_capacity(file_size as usize);
+    bytes.extend_from_slice(b"BM");
+    bytes.extend_from_slice(&file_size.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&54u32.to_le_bytes());
+    bytes.extend_from_slice(&40u32.to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&(-height).to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&32u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    bytes.extend_from_slice(&2835i32.to_le_bytes());
+    bytes.extend_from_slice(&2835i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    for pixel in pixels {
+        bytes.extend_from_slice(&(pixel | 0xff00_0000).to_le_bytes());
+    }
+    bytes
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -592,6 +766,20 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     unsafe {
         match message {
+            PANEL_FRAME_MESSAGE => {
+                // Copy the destination out before sending `WM_PRINT`: rendering
+                // re-enters this procedure, which must not find the slot borrowed.
+                let runtime = FRAME_EXPORT.with(|slot| {
+                    slot.try_borrow().ok().and_then(|slot| {
+                        slot.as_ref()
+                            .filter(|target| target.hwnd == hwnd)
+                            .map(|target| target.runtime.clone())
+                    })
+                });
+                // Returns 1 so the caller can tell a saved frame from a timeout.
+                let saved = runtime.is_some_and(|runtime| save_frame(hwnd, &runtime).is_ok());
+                LRESULT(if saved { 1 } else { 0 })
+            }
             WM_SIZE => {
                 layout(hwnd);
                 LRESULT(0)
@@ -640,6 +828,13 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                FRAME_EXPORT.with(|slot| {
+                    if let Ok(mut slot) = slot.try_borrow_mut() {
+                        if slot.as_ref().is_some_and(|target| target.hwnd == hwnd) {
+                            *slot = None;
+                        }
+                    }
+                });
                 release_font(hwnd);
                 LRESULT(0)
             }
@@ -673,5 +868,27 @@ mod tests {
         assert_eq!(command_for_control(ID_CLOSE), Some(COMMAND_CLOSE));
         assert_eq!(command_for_control(ID_STATUS as usize), None);
         assert_eq!(command_for_control(ID_RESULT as usize), None);
+    }
+
+    /// `System.Drawing` reads a 32-bit BMP as ARGB, so the exported frame must be
+    /// opaque and top-down; a zero alpha byte would make the evidence invisible.
+    #[test]
+    fn the_exported_frame_is_a_top_down_opaque_32_bit_bmp() {
+        let pixels = [0x0011_2233u32, 0x0044_5566];
+        let bytes = frame_bmp(2, 1, &pixels);
+
+        assert_eq!(&bytes[0..2], b"BM");
+        assert_eq!(
+            u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize,
+            bytes.len()
+        );
+        assert_eq!(u32::from_le_bytes(bytes[10..14].try_into().unwrap()), 54);
+        assert_eq!(i32::from_le_bytes(bytes[18..22].try_into().unwrap()), 2);
+        // A negative height is the top-down convention.
+        assert_eq!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()), -1);
+        assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 32);
+        // Little-endian BGRA, with the alpha byte forced opaque.
+        assert_eq!(&bytes[54..58], &[0x33, 0x22, 0x11, 0xff]);
+        assert_eq!(&bytes[58..62], &[0x66, 0x55, 0x44, 0xff]);
     }
 }

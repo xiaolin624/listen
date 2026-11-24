@@ -184,3 +184,36 @@ fn a_capsule_that_cannot_hide_from_screen_capture_is_reported_and_survives_a_cop
         "a successful copy must not clear the capture-exclusion warning"
     );
 }
+
+#[test]
+fn a_panel_that_cannot_hide_from_screen_capture_reports_the_full_transcript_risk() {
+    let (mut app, _runtime) = delivered_result();
+    app.report_panel_capture_exclusion("Access is denied");
+    let text = app
+        .snapshot()
+        .notice
+        .clone()
+        .expect("a failed panel exclusion must be user-visible; the panel shows the transcript")
+        .text();
+    assert!(
+        text.contains("The expanded result panel could not be hidden from screen capture"),
+        "{text}"
+    );
+    assert!(
+        text.contains("complete transcript"),
+        "the user must learn that the panel shows more than the capsule: {text}"
+    );
+    assert!(
+        text.contains("Access is denied"),
+        "the platform's reason must be kept: {text}"
+    );
+
+    // Like the capsule warning, this is a privacy fact about a window, not a
+    // clipboard condition: a successful copy must not clear it.
+    app.copy_result(|_| Ok(()));
+    assert_eq!(
+        app.snapshot().notice.map(|notice| notice.text()),
+        Some(text),
+        "a successful copy must not clear the panel capture-exclusion warning"
+    );
+}

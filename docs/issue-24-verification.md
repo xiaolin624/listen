@@ -11,7 +11,8 @@
 > （以及 `delivery.json`）；窗口类名、窗口样式、控件 ID 只作自检，不作验收依据。**
 
 - 所有桌面验收**串行**执行，同一时刻只跑一个，项与项之间确认 `Get-Process listen` 为空。
-- `status.txt` 的 `refine` 键在 W2（#44）后多一个取值 `unconfirmed`：精修改写可能已落入目标但无法证明，精修文本留在面板、不会第二次写目标。键名与键数未变（仍是 68 键 / 29 required），只是值域扩展；按取值集合断言的验收必须接受它。
+- `status.txt` 的 `refine` 键在 W2（#44）后多一个取值 `unconfirmed`：精修改写可能已落入目标但无法证明，精修文本留在面板、不会第二次写目标。该波次键名与键数未变（**当时** 68 键 / 29 required；#54 新增 `panel_capture_excluded` 后为 **69 键 / 30 required**），只是值域扩展；按取值集合断言的验收必须接受它。
+- `status.txt` 在 #54 后新增 `panel_capture_excluded=0|1`：展开结果面板与胶囊一样用 `WDA_EXCLUDEFROMCAPTURE` 隐身。键顺序插在 `capsule_capture_excluded` 之后；`scripts\verify-panel.ps1` 的 `$requiredKeys` 同步为 30 个，面板外观证据改由 `WM_APP+21` 帧导出（见 [issue-54 验证](issue-54-verification.md)）。
 - 识别一律走本地引擎（包内 `engine\sherpa` + `models\sense-voice` 的 SenseVoiceSmall q8）；
   `LOCALAPPDATA` 指向隔离目录，`LISTEN_ALI_API_KEY` / `LISTEN_ALI_WORKSPACE_ID` 未设置，
   全程不走云端识别路径、不产生付费请求、不消耗百炼额度。
@@ -106,6 +107,7 @@ powershell -File scripts\verify-panel.ps1   -PackageRoot <包> -Runtime <..> -Ev
 
 包级其它实测（`status.txt`）：`startup_capsule_ms=35`、`capsule=Ready`、`preparation=Ready`、
 `capsule_capture_excluded=1`；停止到结果、拖拽位置持久化、`--control quit` 干净退出、无残留进程。
+（#54 之后 `status.txt` 另报 `panel_capture_excluded=1`，面板与胶囊同样隐身；见 [issue-54 验证](issue-54-verification.md)。）
 
 证据：`.artifacts\issue-24\green-capsule-package.log`、`capsule\capsule-verification.json`、
 `capsule\capsule-{ready,capturing,processing,failure}.png`、`capsule\desktop-capsule-excluded.png`；
@@ -356,6 +358,7 @@ partial-result.txt,panel.txt,delivery.json,…}`、`device.log`。
 | 场景 | 结果 | 证据 |
 | --- | --- | --- |
 | 胶囊可见性 + 共享隐身 | 可见、空标题、`LAYERED\|TOOLWINDOW\|NOACTIVATE\|TOPMOST`、行为级置顶（探针窗覆盖后 `WindowFromPoint` 仍是胶囊）、`WDA_EXCLUDEFROMCAPTURE`、`capsule_capture_excluded=1`、`capsule-failure.png` | `capsule\capsule-verification.json` + 5 张 PNG |
+| 面板共享隐身（#54 后续补验） | 面板可见时 `panel_capture_excluded=1`、`GetWindowDisplayAffinity=17`；帧导出的 `panel-ready.png` 能看到面板本体；全桌面截图及其面板区域裁剪里看不到面板 | [issue-54 验证](issue-54-verification.md)、`.artifacts\issue-54\panel-verification.json` |
 | 胶囊不抢焦点 | `WM_MOUSEACTIVATE → MA_NOACTIVATE`；真实点击前后前台窗口不变、胶囊不移动 | 同上 |
 | 拖拽位置持久化 + 重启恢复 | 拖动 140×60 px，`capsule-position.txt` 记录 `(962,108)`，重启后恢复同一位置 | 同上 |
 | 托盘菜单 | 宿主隐藏窗存在、右键菜单可打开/取消 | `capsule\capsule-verification.json`、`panel\tray-menu.png` |

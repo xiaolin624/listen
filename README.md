@@ -2,7 +2,7 @@
 
 Windows 后台工具：先点击目标编辑区，按 **Ctrl+Alt+R** 采集**默认多媒体播放设备**上的声音，再按一次停止；日常默认把这段连续音频送到**已通过验收的阿里云百炼北京识别**，把完整结果追加到开始时选定的目标编辑区。本地 **SenseVoiceSmall q8（sherpa-onnx）** 识别保留为**显式备用**，只有用 `--engine` 或包内“本地备用”启动器才会运行。没有有效目标或写入无法确认时，完整结果保留在**展开结果面板**中，可直接复制。工具不会自动发送消息，也不会把转写文本作为命令执行。
 
-v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任务栏，并用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏；胶囊只用颜色、形状和动效表达状态，点击展开**结果面板**（完整结果、复制、重试、清理、精修）。原详情窗口已删除，托盘仍可打开面板。更早版本的历史与验收记录保持不变：[#2 采集到复制](docs/issue-2-verification.md)、[#3 原生目标](docs/issue-3-verification.md)、[#4 通用编辑区](docs/issue-4-verification.md)、[#6 长会话](docs/issue-6-verification.md)、[#7 失败重试](docs/issue-7-verification.md)、[#8 路由中断](docs/issue-8-verification.md)、[#9 质量基线](docs/issue-9-verification.md)、[#10 准备与延迟](docs/issue-10-verification.md)、[#11 交付包](docs/issue-11-verification.md)。v0.2 的引擎、术语表、胶囊、面板与精修验收见 [#17](docs/issue-17-verification.md)、[#19](docs/issue-19-verification.md)、[#20](docs/issue-20-verification.md)、[#21](docs/issue-21-verification.md)；本轮代码审查的修复与实测数字见 [审查修复记录](docs/issue-review-fixes.md)，用户真实语音暴露的术语表加载与匹配修复见 [术语表真实语音修复记录](docs/issue-glossary-real-speech.md)。
+v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任务栏，并用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏；胶囊只用颜色、形状和动效表达状态，点击展开**结果面板**（完整结果、复制、重试、清理、精修）；**结果面板同样隐身**，因为面板会显示完整转写。原详情窗口已删除，托盘仍可打开面板。更早版本的历史与验收记录保持不变：[#2 采集到复制](docs/issue-2-verification.md)、[#3 原生目标](docs/issue-3-verification.md)、[#4 通用编辑区](docs/issue-4-verification.md)、[#6 长会话](docs/issue-6-verification.md)、[#7 失败重试](docs/issue-7-verification.md)、[#8 路由中断](docs/issue-8-verification.md)、[#9 质量基线](docs/issue-9-verification.md)、[#10 准备与延迟](docs/issue-10-verification.md)、[#11 交付包](docs/issue-11-verification.md)。v0.2 的引擎、术语表、胶囊、面板与精修验收见 [#17](docs/issue-17-verification.md)、[#19](docs/issue-19-verification.md)、[#20](docs/issue-20-verification.md)、[#21](docs/issue-21-verification.md)；本轮代码审查的修复与实测数字见 [审查修复记录](docs/issue-review-fixes.md)，用户真实语音暴露的术语表加载与匹配修复见 [术语表真实语音修复记录](docs/issue-glossary-real-speech.md)，面板与胶囊一致的共享隐身见 [#54](docs/issue-54-verification.md)。
 
 ## v0.2 的行为
 
@@ -11,7 +11,7 @@ v0.2 的界面是**常驻状态胶囊**：置顶、不抢焦点、不进入任�
 - **非语音门禁**：Silero VAD 判为无语音时不调用识别器；音乐/提示音不会产生“The.”这类凭空文字。
 - **术语表校正**：识别结果在交付前经过本地术语表，一个词一条、支持拼音/中文写法/近似匹配，不要求穷举错误写法；普通词不会被替换。文件在每次开始采集时重新读取。
 - **状态胶囊**：置顶、不抢焦点、无任务栏/Alt+Tab 入口，共享屏幕时对他人不可见；可拖动并记住位置，支持多显示器和高 DPI。
-- **结果面板**：单击胶囊展开/收起；面板显示当前阶段、实时采集进度、应用给出的完整说明和**完整当前转写文本**，并提供复制、重试本地识别、清理失败音频、精修、关闭。结果只在面板中（无目标回退）时会自动展开一次；失败不会自动抢屏，胶囊变红后由用户点开查看原因。
+- **结果面板**：单击胶囊展开/收起；面板显示当前阶段、实时采集进度、应用给出的完整说明和**完整当前转写文本**，并提供复制、重试本地识别、清理失败音频、精修、关闭。结果只在面板中（无目标回退）时会自动展开一次；失败不会自动抢屏，胶囊变红后由用户点开查看原因。面板与胶囊一样用 `WDA_EXCLUDEFROMCAPTURE` 隐身；平台拒绝时面板与 `status.txt` 明示（`panel_capture_excluded=0` + `notice`），不会静默。
 - **精修（可选）**：面板里手动触发，只把**文字**（不含音频）发送到 DeepSeek API，修完在目标内容未变时直接替换本次追加的文本；目标被手改或无法确认时，精修结果留在面板、不覆盖用户编辑。没有 key、断网或 API 失败时保留本地结果并明确说明。本地识别不依赖精修。
 - **不自动发送**：没有任何 Enter、发送按钮或消息 API 路径；结果只追加文本或写入剪贴板。
 - **多段采集**：每次开始/停止是一个独立分段，后一段不会覆盖前一段的文字、目标或费用。旧段等待联网、仍在处理或失败保留音频都不拒绝新段；目标输入框的追加按采集顺序（先旧后新），识别/保存仍优先处理刚停止的当前段。面板按采集序号保留每个待取结果，托盘可按段清理。
@@ -111,7 +111,7 @@ Rust | re
 | `playback.state` | 仅云端连续 PCM 段：`committed_bytes=` 与 `clean_stop=`，是异常退出后判断录音是否完整结束的结束标记 |
 | `recovered.pcm` / `recovered.wav` | 仅在需要修复时生成在该段目录内（云端截断 PCM 的可读前缀 / 本地损坏识别窗口的重拼）；计入待处理音频预算，随完整文字保存后的音频清理释放 |
 | `panel.txt` | 结果面板当前全文：状态块 + 空行 + 完整结果；面板隐藏时也更新，供自动化读取 |
-| `status.txt` | 当前阶段、说明、`recognition_mode=cloud-trial\|local`、实际来源 `backend`、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、`segments.json`/`delivery.json` 降级、等待/待取段数、`storage_level`/`storage_fault`、各段耗时、进程 ID；不含转写正文 |
+| `status.txt` | 当前阶段、说明、`recognition_mode=cloud-trial\|local`、实际来源 `backend`、采集端点、`preparation`、`refine`、`notice`、`glossary`、`panel_visible`、`panel_error`、`capsule_capture_excluded`、`panel_capture_excluded`、`segments.json`/`delivery.json` 降级、等待/待取段数、`storage_level`/`storage_fault`、各段耗时、进程 ID；不含转写正文 |
 | `latency.jsonl` | 每次采集/失败的准备、采集启动、收尾、识别、保存、交付耗时；不含音频 |
 | 本次会话临时目录 | `session-*` 下是采集音频（云端连续 PCM + `pcm-format.txt`/`playback.state`，或本地重叠识别窗口）、临时上传分片与修复副本；完整文字保存后释放，失败时保留以便人工恢复 |
 

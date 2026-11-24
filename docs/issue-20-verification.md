@@ -38,7 +38,7 @@
 - 位置在每次显示前重算：胶囊所在显示器的工作区、同显示器、工作区内夹取；`WM_SIZE`/`WM_DPICHANGED` 只做子控件布局。
 - 关闭：`WM_CLOSE`（标题栏 X / Alt+F4）、`IDCANCEL`（Esc，经消息循环里的 `IsDialogMessageW`）、面板内「关闭」按钮，全部改为隐藏窗口而不是销毁；会话内再次打开无需重建，位置/文本复用。窗口由 GUI 持有，退出时随 `Drop` 销毁。
 - 面板按钮只向隐藏的属主窗口 `PostMessage(COMMAND_MESSAGE)`，应用在属主窗口里执行复制/重试/清理/关闭；不在面板自己的窗口过程里跑应用逻辑。`精修` 按钮占位、置灰，`command_for_control(ID_REFINE)` 故意返回 `None`，等 #21。
-- 面板截图来自真实屏幕（面板不排除录屏；只有胶囊用 `WDA_EXCLUDEFROMCAPTURE`），因此验收能截到面板本身。
+- 面板截图来自真实屏幕（本票当时面板不排除录屏；只有胶囊用 `WDA_EXCLUDEFROMCAPTURE`），因此验收能截到面板本身。**#54 之后已改变**：面板也与胶囊一样隐身，`verify-panel.ps1` 的面板外观证据改由 `PANEL_FRAME_MESSAGE = WM_APP + 21` 帧导出；见 [issue-54 验证](issue-54-verification.md)。
 
 ### 3. 应用外壳（`app/listen/src/gui.rs`）
 
