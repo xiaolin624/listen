@@ -11,6 +11,7 @@
 | 唯一应用点 | 通过 | `Application::apply`（`lib.rs`）是唯一派生 `snapshot.phase` / `snapshot.recognition` / `snapshot.detail` / `segments_dirty` / 记录与持久化的地方；规则本身是纯函数 `transition::decide` |
 | 「只有最新段驱动快照」只在一处判断 | 通过 | `index + 1 == self.segments.len()` **12 → 1**，唯一一处是 `Application::is_newest`；`apply` 用它算出 `primary` 并作为**入参**交给 `decide`（`Context`），调用者拿 `Applied { primary }` 的返回值，不再自行重算 |
 | 转移表覆盖每类转移 | 通过 | `tests/segment_transition_table.rs`：12 行（session event / delivery outcome / storage stop / fail / retry / start refusal），每行断言 `(phase, recognition, detail 类别, delivery, segments.json 的 state)` |
+| 段存储 / 恢复的窄 seam | **部分** | 转移层已完成：`transition::decide` 与 `Cause::lines` 是纯函数，8 个单测不需要完整 `Application` 组装。`segments.rs` / `recovery.rs` 仍没有自己的注入 seam，只有既有 4 个 `SegmentStore` 单测，见文末「本波没做完的边界」第 1 条 |
 | `snapshot.detail` 收敛 | 通过（实测） | `snapshot.detail =` **47 → 1**；`snapshot.detail.push*` **10 → 4**；四条都只在 `Application::say` 里。`facts.detail =` **12 → 3**、`facts.detail.push*` **10 → 1** |
 | `-Task Test` | 通过 | **332 passed / 0 failed / 16 ignored**（基线 322/0/16，+10 = 8 个 `transition` 单测 + 2 个转移表测试） |
 | `-Task CheckFormat` | 通过 | 无输出（exit 0） |

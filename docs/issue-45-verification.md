@@ -108,6 +108,9 @@
    保持逐字一致。唯一语义差异在**损坏输入**上：索引里的未知 `state` 现在读成最保守的 `failed`
    （旧行为：原样把该字符串拼进用户可见的说明），未知 `delivery` 读成 `uncertain`（旧：同样落到
    `uncertain`）。产品路径写不出未知值，版本门禁也拒绝未来格式；新读法仍 fail-closed。
+   **2026-11-25 更正**：这条读法在本修复分支被替换——未知拼写不再读成 `failed`/`uncertain`，而是让整份
+   `segments.json` 不可用、报告原始拼写并拒绝一切写盘（ADR 0005）；见 `docs\issue-review-fixes-2.md` F1。
+   本段保留 W3 当时的完成记录，不追溯改写。
 2. **`Segment` 的完整文字内容不落盘**：`text` 是 `#[serde(skip)]`；`text_file`/`text_chars` 仍是记录里的
    事实。这与 ADR 0005 的布局一致（文字在 `segment-NNNNNNNN.txt`），只是把"文字在哪"和"读完是什么"
    放在同一份权威表示里。
