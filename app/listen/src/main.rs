@@ -5,6 +5,7 @@ mod capsule_window;
 mod gui;
 mod panel;
 mod panel_window;
+mod status;
 
 use listen::launch::{self, LaunchAction};
 use std::env;

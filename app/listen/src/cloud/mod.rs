@@ -13,8 +13,9 @@ use crate::{
     AppResult, CapturedAudio, PlaybackAudio, Preparation, Timing, UsageSummary, elapsed_ms,
     millis_between,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
-        SessionFailure, SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
+        RecognitionMode, RecognitionReadiness, RecognitionSession, RecognitionSessions,
+        SegmentUsage, SessionEvent, SessionFailure, SessionRequest, SessionResult, SessionState,
+        SessionStatus, SessionUpdate,
     },
 };
 pub use budget::{Attempt, LedgerSnapshot, TrialLedger, Usage};
@@ -386,6 +387,9 @@ impl CloudSessions {
     }
 }
 impl RecognitionSessions for CloudSessions {
+    fn mode(&self) -> RecognitionMode {
+        RecognitionMode::CloudTrial
+    }
     fn requires_valid_glossary(&self) -> bool {
         true
     }

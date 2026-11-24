@@ -1,11 +1,12 @@
 use crate::{
-    capsule::{CapsuleState, capsule_state, preparation_name},
+    capsule::{CapsuleState, capsule_state},
     capsule_window::{self, Capsule},
     panel,
     panel_window::{self, Panel},
+    status,
 };
 use listen::{
-    Application, Control, Delivery, Phase, Refine, Snapshot, UsageSummary, deepseek::DeepSeek,
+    Application, Control, Delivery, Phase, Snapshot, UsageSummary, deepseek::DeepSeek,
     launch::Config, paste, recognition::SessionState, target::NativeTargets,
 };
 use std::{cell::RefCell, fs, path::PathBuf, sync::Arc};
@@ -383,207 +384,35 @@ impl Ui {
                     || last.notice != state.notice
                     || last.usage != state.usage
                     || last.segments != state.segments
+                    // Two captures can produce identical text and delivery, so the
+                    // current result's identity is compared as its own fact.
+                    || last.current_sequence != state.current_sequence
                     || last.storage != state.storage
             });
             let phase_changed = self
                 .last
                 .as_ref()
                 .is_some_and(|last| last.phase != state.phase);
-            let timing = &state.timing;
             let panel_visible = self.panel_visible();
-            let panel_error = self
-                .panel_error
-                .clone()
-                .unwrap_or_default()
-                .replace('\r', "")
-                .replace('\n', " ");
-            // The refine reason is one line so the file stays a simple key=value
-            // contract. Only a state that stopped refine explains itself.
-            let refine_reason = match &state.refine {
-                Refine::Unavailable(reason)
-                | Refine::NotApplied(reason)
-                | Refine::Unconfirmed(reason)
-                | Refine::Failed(reason) => reason.replace('\r', "").replace('\n', " "),
-                _ => String::new(),
+            // The window facts the snapshot cannot know. Everything else the status
+            // file says is derived by `status::report` from the snapshot, so the key
+            // set, the key order and the conditional blocks live in one tested pure
+            // function instead of in this 100 ms poll.
+            let current_result = self.runtime.join("current-result.txt");
+            let glossary = self.app.glossary_status();
+            let host = status::HostFacts {
+                current_result_path: &current_result,
+                glossary: &glossary,
+                process_id: std::process::id(),
             };
-            // A notice is a user-facing sentence with no key=value structure; it is
-            // one line so `status.txt` stays a simple contract.
-            let notice = state
-                .notice
-                .as_ref()
-                .map(|notice| notice.text().replace('\r', "").replace('\n', " "))
-                .unwrap_or_default();
-            // The 云端试用 usage keys are appended, never renamed: `status.txt` is a
-            // machine-readable contract and existing keys stay exactly as they are.
-            // The multi-segment counts are appended for the same reason.
-            let mut status = format!(
-                "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
-                state.phase,
-                state.detail,
-                state
-                    .endpoint
-                    .as_ref()
-                    .map(|endpoint| endpoint.role.as_str())
-                    .unwrap_or(""),
-                state
-                    .endpoint
-                    .as_ref()
-                    .map(|endpoint| endpoint.id.as_str())
-                    .unwrap_or(""),
-                state
-                    .endpoint
-                    .as_ref()
-                    .map(|endpoint| endpoint.name.as_str())
-                    .unwrap_or(""),
-                self.runtime.join("current-result.txt").display(),
-                state
-                    .retained_audio
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                state.retry_available,
-                state.backend.as_deref().unwrap_or(""),
-                // The selected path is a fact, not an inference from the backend
-                // wording: `local` is the explicit fallback, `cloud-trial` the daily
-                // default. Existing keys keep their exact meaning.
-                if state.cloud_trial() {
-                    "cloud-trial"
-                } else {
-                    "local"
-                },
-                self.app.glossary_status(),
-                preparation_name(state.preparation),
-                state.refine.name(),
-                refine_reason,
-                notice,
-                visual.name(),
-                if panel_visible { 1 } else { 0 },
-                panel_error,
-                self.capsule.startup_ms(),
-                if self.capsule.capture_excluded() {
-                    1
-                } else {
-                    0
-                },
-                timing
-                    .capture_start_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .preparation_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .stop_to_result_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .finalize_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .recognition_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .last_window_wait_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .last_window_inference_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .save_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing
-                    .delivery_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                timing.recognition_windows,
-                std::process::id(),
-                state
-                    .recognition
-                    .map(|state| state.name())
-                    .unwrap_or("none"),
-                state
-                    .segments
-                    .iter()
-                    .filter(|segment| segment.state.in_flight())
-                    .count(),
-                panel::pending_results(&state).len(),
-            );
-            // The cumulative use of this tool's own cloud requests. `usage_available=0`
-            // means the engine keeps no cloud ledger (local recognition), which is not
-            // the same as `usage_requests=0`: a cloud adapter always reports a summary,
-            // and an unreadable ledger reports `usage_unreadable=1` instead of zero.
-            status.push_str(&match &state.usage {
-                Some(usage) => format!(
-                    "usage_available=1\nusage_unreadable={}\nusage_requests={}\nusage_confirmed_nanoyuan={}\nusage_estimated_nanoyuan={}\nusage_unknown_requests={}\nusage_retried_segments={}\nusage_undated_requests={}\nusage_month_nanoyuan={}\nusage_month_reminder={}\nusage_month_reminder_nanoyuan={}\nusage_trial_cap_nanoyuan={}\n",
-                    if usage.unreadable { 1 } else { 0 },
-                    usage.requests,
-                    usage.confirmed_nanoyuan,
-                    usage.estimated_nanoyuan,
-                    usage.unknown_requests,
-                    usage.retried_segments,
-                    usage.undated_requests,
-                    usage.month_nanoyuan(),
-                    if usage.reminder_reached() { 1 } else { 0 },
-                    UsageSummary::MONTH_REMINDER_NANOYUAN,
-                    usage.trial_cap_nanoyuan,
-                ),
-                None => "usage_available=0\n".into(),
-            });
-            // The storage bounds are appended for the same reason: `status.txt` is a
-            // machine-readable contract and existing keys never change meaning. A
-            // warning is not a stop, and a real save failure is reported as a fault
-            // instead of being inferred from a phase.
-            status.push_str(&match &state.storage {
-                Some(storage) => format!(
-                    "storage_level={}\nstorage_pending_audio_bytes={}\nstorage_budget_bytes={}\nstorage_warning_bytes={}\nstorage_free_disk_bytes={}\nstorage_free_disk_floor_bytes={}\nstorage_text_bytes={}\nstorage_text_budget_bytes={}\nstorage_fault={}\n",
-                    storage.level().name(),
-                    storage.pending_audio_bytes,
-                    storage.budget_bytes,
-                    storage.warning_at_bytes,
-                    storage
-                        .free_disk_bytes
-                        .map(|bytes| bytes.to_string())
-                        .unwrap_or_default(),
-                    storage.free_disk_floor_bytes,
-                    storage.text_bytes,
-                    storage.text_budget_bytes,
-                    storage
-                        .fault
-                        .as_deref()
-                        .unwrap_or("")
-                        .replace('\r', "")
-                        .replace('\n', " "),
-                ),
-                None => "storage_level=none\n".into(),
-            });
-            // #38: the one stop-to-confirmed-backfill number and the stages behind
-            // it are appended. Existing keys keep their exact meaning, so scripts
-            // that read `timing_stop_to_result_ms` are unaffected.
-            let milliseconds =
-                |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
-            status.push_str(&format!(
-                "timing_stop_to_confirmed_ms={}\ntiming_cloud_connect_ms={}\ntiming_first_task_started_ms={}\ntiming_cloud_drain_ms={}\ntiming_cloud_final_ms={}\ntiming_event_wait_ms={}\ntiming_delivery_queue_ms={}\ntiming_apply_wait_ms={}\ntiming_schedule_ms={}\ntiming_delivery_lock_ms={}\ntiming_delivery_read_ms={}\ntiming_delivery_write_ms={}\ntiming_delivery_save_ms={}\n",
-                milliseconds(timing.stop_to_confirmed_ms),
-                milliseconds(timing.cloud_connect_ms),
-                milliseconds(timing.first_task_started_ms),
-                milliseconds(timing.cloud_drain_ms),
-                milliseconds(timing.cloud_final_ms),
-                milliseconds(timing.event_wait_ms),
-                milliseconds(timing.delivery_queue_ms),
-                milliseconds(timing.apply_wait_ms),
-                milliseconds(timing.schedule_ms),
-                milliseconds(timing.delivery_lock_ms),
-                milliseconds(timing.delivery_read_ms),
-                milliseconds(timing.delivery_write_ms),
-                milliseconds(timing.delivery_save_ms),
-            ));
+            let window = status::WindowFacts {
+                panel_visible,
+                panel_error: self.panel_error.as_deref().unwrap_or_default(),
+                capsule: visual.name(),
+                startup_capsule_ms: self.capsule.startup_ms(),
+                capture_excluded: self.capsule.capture_excluded(),
+            };
+            let status = status::report(&state, &host, &window);
             // `status.txt` also changes when only the panel opened/closed or the
             // panel window failed to create, which the snapshot comparison above
             // cannot see.
@@ -616,7 +445,7 @@ impl Ui {
                                 "Capturing the default multimedia playback endpoint. Ctrl+Alt+R stops."
                             }
                             Phase::Processing => {
-                                if state.cloud_trial() {
+                                if state.mode.is_cloud_trial() {
                                     "Waiting for complete cloud recognition; received audio is retained."
                                 } else {
                                     "Recognizing locally. Wait for the current result."

@@ -89,7 +89,10 @@ pub fn capsule_state(snapshot: &Snapshot) -> CapsuleState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use listen::{Phase, Preparation, Snapshot, Timing, streaming::CaptureProgress};
+    use listen::{
+        Phase, Preparation, Snapshot, Timing, recognition::RecognitionMode,
+        streaming::CaptureProgress,
+    };
 
     fn snapshot(phase: Phase, preparation: Preparation) -> Snapshot {
         Snapshot {
@@ -104,12 +107,14 @@ mod tests {
             retry_available: false,
             endpoint: None,
             backend: None,
+            mode: RecognitionMode::Local,
             timing: Timing::default(),
             refine: listen::Refine::Unavailable("not connected in this test".into()),
             refined_text: None,
             notice: None,
             usage: None,
             segments: Vec::new(),
+            current_sequence: None,
             storage: None,
         }
     }

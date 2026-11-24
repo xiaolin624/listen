@@ -55,6 +55,34 @@ pub struct RecognitionReadiness {
     pub error: Option<String>,
 }
 
+/// Which recognition path this process actually runs (ADR 0006). It is a fact the
+/// adapter answers about itself — never a prefix parsed out of its display wording,
+/// so rewording `RecognitionReadiness::backend` cannot change any behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecognitionMode {
+    /// The resident local model; audio never leaves this machine. This is the
+    /// default, because an adapter that says nothing runs no cloud request.
+    #[default]
+    Local,
+    /// The accepted single-vendor cloud trial; each capture's audio is sent to it.
+    CloudTrial,
+}
+
+impl RecognitionMode {
+    /// Whether this mode sends audio to the cloud.
+    pub fn is_cloud_trial(self) -> bool {
+        matches!(self, Self::CloudTrial)
+    }
+
+    /// The stable `status.txt` and ADR 0006 spelling: `local` / `cloud-trial`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::CloudTrial => "cloud-trial",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SegmentUsage {
@@ -128,6 +156,13 @@ pub const RETRY_UNSUPPORTED: &str =
 /// PCM directly to its engine here; it need not implement LocalTranscriber or use
 /// the local adapter's overlapping file windows.
 pub trait RecognitionSessions: Send {
+    /// Which path this adapter implements. The application stores the answer once,
+    /// so the panel, `status.txt` and the tray read the fact instead of parsing
+    /// `preparation().backend`. The default is local: an adapter that does not say
+    /// is never reported as the cloud trial.
+    fn mode(&self) -> RecognitionMode {
+        RecognitionMode::Local
+    }
     /// Local recognition can warn and continue without correction. A cloud trial
     /// must not silently upload after failing to load its declared term snapshot.
     fn requires_valid_glossary(&self) -> bool {

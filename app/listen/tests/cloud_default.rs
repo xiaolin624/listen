@@ -11,7 +11,7 @@ use listen::{
         MessageSocket, MessageTransport, Secret, TrialLedger,
     },
     launch::{Config, Engine, LaunchAction, Recognition},
-    recognition::SessionState,
+    recognition::{RecognitionMode, SessionState},
 };
 use std::{
     fs,
@@ -237,7 +237,11 @@ fn the_default_configuration_selects_the_accepted_cloud_trial_and_reports_its_so
     let state = app.snapshot();
     assert_eq!(state.phase, Phase::Ready, "{state:?}");
     assert_eq!(state.preparation, Preparation::Ready, "{state:?}");
-    assert!(state.cloud_trial(), "{state:?}");
+    assert_eq!(
+        state.mode,
+        RecognitionMode::CloudTrial,
+        "the mode is a fact of the adapter, not of its backend wording: {state:?}"
+    );
     let backend = state
         .backend
         .as_deref()
@@ -392,7 +396,7 @@ fn explicit_local_selection_runs_the_local_path_end_to_end_and_reports_it() {
         .expect("an explicit local configuration must build the local application")
         .with_targets(Arc::new(Selection(editor.clone())));
     let ready = app.snapshot();
-    assert!(!ready.cloud_trial(), "{ready:?}");
+    assert_eq!(ready.mode, RecognitionMode::Local, "{ready:?}");
     assert!(
         ready
             .backend
@@ -411,7 +415,7 @@ fn explicit_local_selection_runs_the_local_path_end_to_end_and_reports_it() {
     let result = await_phase(&mut app, Phase::Result);
     assert_eq!(result.text, LOCAL_TEXT);
     assert_eq!(result.delivery, Some(Delivery::Appended), "{result:?}");
-    assert!(!result.cloud_trial(), "{result:?}");
+    assert_eq!(result.mode, RecognitionMode::Local, "{result:?}");
     assert_eq!(*editor.0.lock().unwrap(), format!("draft\n{LOCAL_TEXT}"));
     assert_eq!(
         fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),

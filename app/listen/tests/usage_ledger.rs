@@ -95,6 +95,7 @@ fn summary(month_confirmed: u64, month_estimated: u64) -> UsageSummary {
 fn application(runtime: &Runtime, usage: UsageSummary) -> (Application, ScriptedControl) {
     let adapter = ScriptedSessions::new()
         .with_backend("Cloud trial: controlled provider; model=controlled; region=controlled")
+        .with_mode(listen::recognition::RecognitionMode::CloudTrial)
         .with_usage(usage);
     let control = adapter.control();
     let app = Application::with_recognition_sessions(Box::new(adapter), runtime.app(), Ok(()));

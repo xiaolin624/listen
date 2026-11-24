@@ -45,8 +45,9 @@ pub mod whisper_host;
 pub mod whisper_timing;
 use delivery::{DeliveryLedger, LatePlan};
 use recognition::{
-    LocalSessions, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
-    SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionUpdate,
+    LocalSessions, RecognitionMode, RecognitionSession, RecognitionSessions, SegmentUsage,
+    SessionEvent, SessionFailure, SessionId, SessionRequest, SessionResult, SessionState,
+    SessionUpdate,
 };
 use segments::{Change, SegmentStore};
 use storage::Storage;
@@ -563,13 +564,20 @@ pub struct Snapshot {
     /// Recognition progress is separate from complete, deliverable text.
     pub recognition: Option<SessionState>,
     pub detail: String,
+    /// The complete text of the current result. Display only: which capture produced
+    /// it is [`Snapshot::current_sequence`], never a comparison of this text.
     pub text: String,
     pub retained_audio: Vec<PathBuf>,
     pub progress: CaptureProgress,
     pub delivery: Option<Delivery>,
     pub retry_available: bool,
     pub endpoint: Option<CaptureEndpoint>,
+    /// The display wording of the recognition path (a model name, a provider
+    /// sentence). It is never parsed: the behavior switch is [`Snapshot::mode`].
     pub backend: Option<String>,
+    /// The recognition path this process actually runs. Every UI, `status.txt` and
+    /// tray branch reads this field, so editing `backend` cannot change behavior.
+    pub mode: RecognitionMode,
     pub timing: Timing,
     /// The 精修 state. Observable in every phase, including before any result exists,
     /// so a missing key or an in-flight refine never has to be guessed from the UI.
@@ -591,6 +599,12 @@ pub struct Snapshot {
     /// its own entry and its own complete text; `text` above is only the newest
     /// complete result.
     pub segments: Vec<SegmentSummary>,
+    /// The capture order whose complete result is the current one
+    /// ([`Snapshot::text`] / [`Snapshot::delivery`]). `None` before any result, and
+    /// when a restored text has no segment that can prove which capture produced it.
+    /// It is an identity: two captures can produce exactly the same text, and the
+    /// panel still has to tell them apart.
+    pub current_sequence: Option<u64>,
     /// The measured storage conditions (#36): pending audio across every segment,
     /// the configured budget and warning line, free disk against the floor, the
     /// separate saved-text bound and the last real storage fault. `None` only in a
@@ -599,13 +613,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Display metadata only; budget and delivery never depend on this label.
-    pub fn cloud_trial(&self) -> bool {
-        self.backend
-            .as_deref()
-            .is_some_and(|backend| backend.starts_with("Cloud trial:"))
-    }
-
     /// What this result's delivery means for the user. The panel reads this value
     /// instead of matching `delivery` itself; `None` stays [`DeliveryEffect::Unrecorded`]
     /// and is never folded into a proven outcome.
@@ -1333,6 +1340,9 @@ impl Application {
         hotkey_registration: AppResult<()>,
     ) -> Self {
         let control_error = hotkey_registration.err();
+        // The mode is asked of the adapter itself, once. It is stored in every
+        // snapshot from then on, so a reworded `backend` can never flip a branch.
+        let mode = sessions.mode();
         let readiness = sessions.preparation();
         let initial_error = control_error
             .clone()
@@ -1376,6 +1386,7 @@ impl Application {
                 retry_available: false,
                 endpoint: None,
                 backend: readiness.backend,
+                mode,
                 timing: Timing {
                     preparation_ms: readiness.elapsed_ms,
                     ..Timing::default()
@@ -1385,6 +1396,7 @@ impl Application {
                 notice: None,
                 usage: None,
                 segments: Vec::new(),
+                current_sequence: None,
                 storage: None,
             },
             sessions,
@@ -3803,8 +3815,17 @@ impl Application {
         note
     }
 
+    /// The one projection of this process's state.
+    ///
+    /// The current result's identity is projected here from the one authoritative
+    /// capture order, so `text`/`delivery` (its display facts) and
+    /// `current_sequence` (which capture produced them) cannot drift: every reader
+    /// gets them from the same snapshot. `0` is the internal "no current result
+    /// yet" value and never leaves as a sequence.
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.clone()
+        let mut snapshot = self.snapshot.clone();
+        snapshot.current_sequence = (self.current_sequence != 0).then_some(self.current_sequence);
+        snapshot
     }
 }
 

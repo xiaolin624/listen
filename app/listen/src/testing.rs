@@ -13,9 +13,9 @@
 use crate::{
     AppResult, CapturedAudio, Preparation, UsageSummary,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
-        SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
-        SessionUpdate,
+        RecognitionMode, RecognitionReadiness, RecognitionSession, RecognitionSessions,
+        SegmentUsage, SessionEvent, SessionFailure, SessionId, SessionRequest, SessionResult,
+        SessionState, SessionStatus, SessionUpdate,
     },
     streaming::CaptureProgress,
 };
@@ -50,6 +50,7 @@ impl ScriptedSessions {
             shared: Arc::new(Shared {
                 sessions: Mutex::new(Vec::new()),
                 backend: Mutex::new("scripted recognition".into()),
+                mode: Mutex::new(RecognitionMode::Local),
                 usage: Mutex::new(None),
                 segment_usage: Mutex::new(HashMap::new()),
                 retries: AtomicUsize::new(0),
@@ -60,6 +61,12 @@ impl ScriptedSessions {
     /// The note the result panel shows for this engine.
     pub fn with_backend(self, note: impl Into<String>) -> Self {
         *self.shared.backend.lock().unwrap() = note.into();
+        self
+    }
+
+    /// Which recognition path this adapter declares. Defaults to the local engine.
+    pub fn with_mode(self, mode: RecognitionMode) -> Self {
+        *self.shared.mode.lock().unwrap() = mode;
         self
     }
 
@@ -99,6 +106,10 @@ impl ScriptedSessions {
 }
 
 impl RecognitionSessions for ScriptedSessions {
+    fn mode(&self) -> RecognitionMode {
+        *self.shared.mode.lock().unwrap()
+    }
+
     fn preparation(&mut self) -> RecognitionReadiness {
         RecognitionReadiness {
             state: Preparation::Ready,
@@ -280,6 +291,10 @@ impl ScriptedSessionControl {
 struct Shared {
     sessions: Mutex<Vec<Arc<Session>>>,
     backend: Mutex<String>,
+    /// Which path this scripted adapter claims to implement. It is a declaration,
+    /// not a parsed prefix: a test that wants the cloud branches says so here and
+    /// can still show any `backend` wording it likes.
+    mode: Mutex<RecognitionMode>,
     usage: Mutex<Option<UsageSummary>>,
     segment_usage: Mutex<HashMap<String, SegmentUsage>>,
     retries: AtomicUsize,

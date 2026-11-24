@@ -155,7 +155,7 @@ fn headline(snapshot: &Snapshot) -> &'static str {
             crate::capsule::CapsuleState::Ready => "就绪",
             crate::capsule::CapsuleState::Capturing => "正在采集（实时进度）",
             crate::capsule::CapsuleState::Processing => {
-                if snapshot.cloud_trial() {
+                if snapshot.mode.is_cloud_trial() {
                     "正在云端识别"
                 } else {
                     "正在本机识别"
@@ -187,11 +187,11 @@ fn summary(snapshot: &Snapshot) -> &'static str {
         Phase::Failure => {
             "失败原因和保留的音频路径如下；没有自动重试，也没有向任何目标写入或发送。"
         }
-        Phase::Capturing if snapshot.cloud_trial() => {
+        Phase::Capturing if snapshot.mode.is_cloud_trial() => {
             "正在保存并逐步发送本次耳机音频；再按一次 Ctrl+Alt+R 停止，完整确认后交付。"
         }
         Phase::Capturing => "正在持续采集并分段识别；再按一次 Ctrl+Alt+R 停止。",
-        Phase::Processing if snapshot.cloud_trial() => {
+        Phase::Processing if snapshot.mode.is_cloud_trial() => {
             "正在等待云端整段完成确认；音频保留在本机，确认并保存完整文字后再安全回填。"
         }
         Phase::Processing => {
@@ -208,7 +208,7 @@ fn summary(snapshot: &Snapshot) -> &'static str {
 /// capture moving.
 fn capture_progress(snapshot: &Snapshot) -> String {
     let seconds = snapshot.progress.received_samples as f64 / SAMPLE_RATE as f64;
-    if snapshot.cloud_trial() {
+    if snapshot.mode.is_cloud_trial() {
         return format!(
             "已接收 {seconds:.1} 秒连续音频；{} 字节已保存。稳定分句不等于完整结果。",
             snapshot.progress.spool_bytes
@@ -245,6 +245,10 @@ pub fn segment_label(segment: &SegmentSummary) -> &'static str {
 /// result is shown by [`result_text`] itself, so only the other pending results are
 /// listed here; a later segment never replaces an earlier entry. A delivery whose
 /// write may have happened is still a result the user must take or check.
+///
+/// The current result is excluded by its **capture order**, never by comparing text:
+/// two captures can produce exactly the same text, and the older result must stay
+/// listed (see [`Snapshot::current_sequence`]).
 pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
     snapshot
         .segments
@@ -253,7 +257,7 @@ pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
             !segment.text.is_empty()
                 && segment.state == SegmentState::Result
                 && DeliveryEffect::of(segment.delivery).needs_user()
-                && snapshot.text != segment.text
+                && Some(segment.sequence) != snapshot.current_sequence
         })
         .collect()
 }
@@ -469,7 +473,7 @@ pub fn status_text(snapshot: &Snapshot) -> String {
         headline(snapshot).to_string(),
         summary(snapshot).to_string(),
     ];
-    if snapshot.cloud_trial() {
+    if snapshot.mode.is_cloud_trial() {
         if let Some(backend) = &snapshot.backend {
             lines.push(backend.clone());
         }
@@ -518,7 +522,7 @@ pub fn status_text(snapshot: &Snapshot) -> String {
     // result that was produced while the model was still loading) must not read as
     // "everything is ready for the next capture".
     if snapshot.preparation == Preparation::Failed && snapshot.phase != Phase::Failure {
-        lines.push(if snapshot.cloud_trial() {
+        lines.push(if snapshot.mode.is_cloud_trial() {
             "云端试用准备未完成，新的云端请求未发送。".into()
         } else {
             "本地识别模型准备失败，新的采集无法进行。".into()
@@ -574,15 +578,21 @@ pub fn text(snapshot: &Snapshot) -> String {
 /// on: the same pending result never re-opens a panel the user has just closed, while a
 /// new one does. `None` means "this state is not a reason to open". A successful append
 /// is never one: the text is already in the target and the capsule stays calm.
+///
+/// The key is the current result's **capture order**, not its text: two captures with
+/// identical text are two events, and the second must open the panel again. A result
+/// whose identity is unknown (a restored text with no segment that proves which
+/// capture produced it) is not opened for: `Unrecorded` already answers that state.
 pub fn auto_open_key(snapshot: &Snapshot) -> Option<String> {
     if snapshot.phase != Phase::Result {
         return None;
     }
+    let sequence = snapshot.current_sequence?;
     // The two pending outcomes share one user consequence but keep distinct key
     // prefixes, so a fallback that becomes uncertain re-opens the panel as a new event.
     match snapshot.delivery_effect() {
-        DeliveryEffect::NothingWritten => Some(format!("fallback:{}", snapshot.text)),
-        DeliveryEffect::UncertainWrite => Some(format!("uncertain:{}", snapshot.text)),
+        DeliveryEffect::NothingWritten => Some(format!("fallback:{sequence}")),
+        DeliveryEffect::UncertainWrite => Some(format!("uncertain:{sequence}")),
         DeliveryEffect::WroteTarget | DeliveryEffect::Unrecorded => None,
     }
 }
@@ -650,7 +660,10 @@ pub fn position(capsule: Rect, work: Rect, width: i32, height: i32, gap: i32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use listen::{Delivery, Phase, Preparation, Snapshot, Timing, streaming::CaptureProgress};
+    use listen::{
+        Delivery, Phase, Preparation, Snapshot, Timing, recognition::RecognitionMode,
+        streaming::CaptureProgress,
+    };
 
     fn snapshot(phase: Phase, preparation: Preparation) -> Snapshot {
         Snapshot {
@@ -665,12 +678,14 @@ mod tests {
             retry_available: false,
             endpoint: None,
             backend: None,
+            mode: RecognitionMode::Local,
             timing: Timing::default(),
             refine: Refine::Unavailable("No DeepSeek API key is configured".into()),
             refined_text: None,
             notice: None,
             usage: None,
             segments: Vec::new(),
+            current_sequence: None,
             storage: None,
         }
     }
@@ -679,9 +694,19 @@ mod tests {
         let mut state = snapshot(Phase::Result, Preparation::Ready);
         state.text = text.into();
         state.delivery = Some(delivery);
+        // One capture produced this result; the helper's snapshots are single-segment
+        // unless a test says otherwise.
+        state.current_sequence = Some(1);
         state.detail =
             "The complete result was appended to the original target. Review and send it manually."
                 .into();
+        state
+    }
+
+    /// A result produced by the capture with the given order.
+    fn result_at(sequence: u64, text: &str, delivery: Delivery) -> Snapshot {
+        let mut state = result(text, delivery);
+        state.current_sequence = Some(sequence);
         state
     }
 
@@ -750,11 +775,12 @@ mod tests {
             ),
         ];
         state.text = "当前结果".into();
+        state.current_sequence = Some(2);
         assert_eq!(pending_results(&state).len(), 1);
         assert_eq!(deletable_segments(&state), vec![1]);
         assert_eq!(
             auto_open_key(&state).as_deref(),
-            Some("uncertain:当前结果"),
+            Some("uncertain:2"),
             "an uncertain result is not hidden behind a calm appended delivery"
         );
     }
@@ -815,6 +841,7 @@ mod tests {
         ] {
             let mut state = result("当前完整文本", Delivery::Fallback);
             state.delivery = delivery;
+            state.current_sequence = Some(2);
             state.segments = vec![
                 segment(1, SegmentState::Result, "旧完整文本", delivery),
                 segment(2, SegmentState::Result, "当前完整文本", delivery),
@@ -957,6 +984,7 @@ mod tests {
     #[test]
     fn cloud_cost_is_shown_as_confirmed_conservative_and_unknown_never_as_zero() {
         let mut state = result("完整结果", Delivery::Appended);
+        state.mode = RecognitionMode::CloudTrial;
         state.backend = Some(
             "Cloud trial: Alibaba Model Studio; model=qwen-audio-3.1-asr-flash-message; \
              region=cn-beijing; shared single-vendor trial cap=CNY 50"
@@ -1001,6 +1029,7 @@ mod tests {
     #[test]
     fn approaching_the_monthly_reminder_line_is_rendered_as_a_reminder() {
         let mut state = snapshot(Phase::Result, Preparation::Ready);
+        state.mode = RecognitionMode::CloudTrial;
         state.backend = Some("Cloud trial: Alibaba Model Studio".into());
         state.usage = Some(listen::UsageSummary {
             requests: 2,
@@ -1026,6 +1055,7 @@ mod tests {
     #[test]
     fn reaching_the_monthly_reminder_line_is_a_reminder_not_a_stop() {
         let mut state = snapshot(Phase::Capturing, Preparation::Ready);
+        state.mode = RecognitionMode::CloudTrial;
         state.backend = Some("Cloud trial: Alibaba Model Studio".into());
         state.usage = Some(listen::UsageSummary {
             requests: 6,
@@ -1147,10 +1177,139 @@ mod tests {
 
     #[test]
     fn every_new_fallback_result_produces_a_new_auto_open_key() {
-        let first = auto_open_key(&result("第一段", Delivery::Fallback));
-        let second = auto_open_key(&result("第二段", Delivery::Fallback));
+        let first = auto_open_key(&result_at(1, "第一段", Delivery::Fallback));
+        let second = auto_open_key(&result_at(2, "第二段", Delivery::Fallback));
         assert!(first.is_some() && second.is_some());
         assert_ne!(first, second);
+    }
+
+    /// One snapshot whose two facts are set independently: the recognition mode is
+    /// the fact, `backend` is only the wording a user reads.
+    fn with_facts(
+        phase: Phase,
+        preparation: Preparation,
+        mode: RecognitionMode,
+        backend: &str,
+    ) -> Snapshot {
+        let mut state = snapshot(phase, preparation);
+        state.mode = mode;
+        state.backend = Some(backend.into());
+        state
+    }
+
+    #[test]
+    fn the_backend_wording_selects_no_panel_branch() {
+        // The mode is a fact of the recognition seam; `backend` is only its display
+        // wording. Before this wave the mode *was* the prefix of that string, so a
+        // reworded backend silently selected a different branch in every mode-aware
+        // sentence. Two snapshots that differ only in the wording must render the
+        // same panel once the displayed value itself is set aside.
+        const PREFIXED: &str =
+            "Cloud trial: Alibaba Model Studio; model=qwen-audio-3.1-asr-flash-message";
+        const REWORDED: &str = "Alibaba Model Studio trial (display wording changed)";
+        for phase in [
+            Phase::Preparing,
+            Phase::Ready,
+            Phase::Capturing,
+            Phase::Processing,
+            Phase::Result,
+            Phase::NoSpeech,
+            Phase::Failure,
+        ] {
+            for preparation in [
+                Preparation::Pending,
+                Preparation::Ready,
+                Preparation::Failed,
+            ] {
+                for mode in [RecognitionMode::Local, RecognitionMode::CloudTrial] {
+                    let prefixed = with_facts(phase.clone(), preparation, mode, PREFIXED);
+                    let reworded = with_facts(phase.clone(), preparation, mode, REWORDED);
+                    assert_eq!(
+                        status_text(&prefixed).replace(PREFIXED, "<backend>"),
+                        status_text(&reworded).replace(REWORDED, "<backend>"),
+                        "phase={phase:?} preparation={preparation:?} mode={mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_result_never_borrows_the_cloud_sentences_from_its_backend_wording() {
+        // The adversarial direction: a local engine whose display note happens to
+        // start with the old cloud prefix. The branch reads the mode field, so this
+        // still renders as local recognition.
+        const LOOKS_CLOUD: &str = "Cloud trial: legacy support note kept verbatim";
+        let mut local = with_facts(
+            Phase::Processing,
+            Preparation::Ready,
+            RecognitionMode::Local,
+            LOOKS_CLOUD,
+        );
+        assert_eq!(headline(&local), "正在本机识别");
+        assert!(summary(&local).contains("正在本机识别，不发送任何消息"));
+        assert!(status_text(&local).contains(&format!("（{LOOKS_CLOUD}）")));
+        local.phase = Phase::Capturing;
+        assert!(status_text(&local).contains("识别窗口已完成"));
+
+        // And the reverse: a cloud mode is never described as local, whatever the
+        // backend wording says.
+        let cloud = with_facts(
+            Phase::Processing,
+            Preparation::Ready,
+            RecognitionMode::CloudTrial,
+            "SenseVoice-like display note",
+        );
+        assert_eq!(headline(&cloud), "正在云端识别");
+        assert!(summary(&cloud).contains("正在等待云端整段完成确认"));
+        assert!(status_text(&cloud).contains("SenseVoice-like display note"));
+    }
+
+    #[test]
+    fn two_captures_with_identical_text_are_still_two_pending_results() {
+        // The user repeats exactly the same sentence, so the text cannot tell the two
+        // results apart. The capture order can: the older one keeps its place in the
+        // pending list, and the newer fallback is a new event that opens the panel
+        // again.
+        let text = "同一句话。";
+        let mut first = result(text, Delivery::Fallback);
+        first.current_sequence = Some(1);
+        first.segments = vec![segment(
+            1,
+            SegmentState::Result,
+            text,
+            Some(Delivery::Fallback),
+        )];
+        let first_key = auto_open_key(&first).expect("a fallback result opens the panel");
+
+        let mut second = result(text, Delivery::Fallback);
+        second.current_sequence = Some(2);
+        second.segments = vec![
+            segment(1, SegmentState::Result, text, Some(Delivery::Fallback)),
+            segment(2, SegmentState::Result, text, Some(Delivery::Fallback)),
+        ];
+        // The older result is still the user's to take, even with identical text.
+        assert_eq!(
+            pending_results(&second)
+                .iter()
+                .map(|segment| segment.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(result_text(&second).contains("【第 1 段 · 待取结果；可手动复制】"));
+        // The current result never lists itself as pending.
+        assert!(
+            pending_results(&second)
+                .iter()
+                .all(|segment| segment.sequence != 2)
+        );
+        // The new fallback is a new event, and the key is identity, not text.
+        let second_key = auto_open_key(&second).expect("the second fallback opens the panel");
+        assert_ne!(first_key, second_key);
+        assert!(
+            !second_key.contains(text),
+            "the key is an identity: {second_key}"
+        );
     }
 
     #[test]
@@ -1389,6 +1548,7 @@ mod tests {
     #[test]
     fn pending_results_stay_in_capture_order_and_never_replace_the_current_result() {
         let mut state = result("第三段当前结果", Delivery::Appended);
+        state.current_sequence = Some(3);
         state.segments = vec![
             segment(
                 1,
