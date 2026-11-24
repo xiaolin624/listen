@@ -292,6 +292,66 @@ pub enum Delivery {
     Uncertain,
 }
 
+/// What one delivery outcome means for the user, in one place. The panel's pending
+/// list, its cleanup menu and its auto-open rule, and the application's delete and
+/// persistence guards all read this classification instead of re-testing the same set
+/// of outcomes; only the sentences each surface prints stay separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryEffect {
+    /// A confirmed append and read-back: the target holds the complete text.
+    WroteTarget,
+    /// Nothing was written to any target; the complete text is a pending result here.
+    NothingWritten,
+    /// A write may have landed and cannot be proven. The complete text is a pending
+    /// result here, is never written again, and the user must check the target.
+    UncertainWrite,
+    /// No delivery record at all (`Snapshot::delivery == None`). The result is
+    /// complete, but nothing is proven about the target: this value claims neither
+    /// that the target holds the text nor that a write was attempted. A sentence that
+    /// still has to describe it keeps its own historical reading, named at that site.
+    Unrecorded,
+}
+
+impl Delivery {
+    /// The one classification of a delivery outcome. A new variant is classified here,
+    /// so every surface that reads the classification meets the new case once instead
+    /// of silently missing it.
+    pub fn effect(self) -> DeliveryEffect {
+        match self {
+            Self::Appended => DeliveryEffect::WroteTarget,
+            Self::Fallback => DeliveryEffect::NothingWritten,
+            Self::Uncertain => DeliveryEffect::UncertainWrite,
+        }
+    }
+}
+
+impl DeliveryEffect {
+    /// Classify an optional delivery record. `None` is its own case
+    /// ([`Self::Unrecorded`]), never folded into a proven outcome.
+    pub fn of(delivery: Option<Delivery>) -> Self {
+        delivery.map_or(Self::Unrecorded, Delivery::effect)
+    }
+
+    /// The one set judgment: the complete text is still the user's to take or check,
+    /// and its durable record must stay. A confirmed append and a result with no
+    /// record are not pending results.
+    pub fn needs_user(self) -> bool {
+        match self {
+            Self::NothingWritten | Self::UncertainWrite => true,
+            Self::WroteTarget | Self::Unrecorded => false,
+        }
+    }
+
+    /// Whether the target is proven to hold the complete text. Only a confirmed
+    /// append proves it; an unrecorded result proves nothing.
+    pub fn wrote_target(self) -> bool {
+        match self {
+            Self::WroteTarget => true,
+            Self::NothingWritten | Self::UncertainWrite | Self::Unrecorded => false,
+        }
+    }
+}
+
 /// The always-observable 精修 state. It is reported next to, not instead of, `Phase`:
 /// refining never changes what capture, processing or a result mean.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,6 +604,13 @@ impl Snapshot {
         self.backend
             .as_deref()
             .is_some_and(|backend| backend.starts_with("Cloud trial:"))
+    }
+
+    /// What this result's delivery means for the user. The panel reads this value
+    /// instead of matching `delivery` itself; `None` stays [`DeliveryEffect::Unrecorded`]
+    /// and is never folded into a proven outcome.
+    pub fn delivery_effect(&self) -> DeliveryEffect {
+        DeliveryEffect::of(self.delivery)
     }
 }
 
@@ -2619,10 +2686,7 @@ impl Application {
         let pending_payload = segment.facts.state.in_flight()
             || segment.facts.state == SegmentState::Failed
             || (segment.facts.state == SegmentState::Result
-                && matches!(
-                    segment.facts.delivery,
-                    Some(Delivery::Fallback) | Some(Delivery::Uncertain)
-                ))
+                && DeliveryEffect::of(segment.facts.delivery).needs_user())
             || segment.retained.is_some()
             || !segment.retained_paths.is_empty();
         if !pending_payload {
@@ -3326,6 +3390,7 @@ impl Application {
         };
         let current = delivered.sequence == self.current_sequence;
         let delivery = delivered.outcome.delivery;
+        let effect = delivery.effect();
         let detail = delivered.outcome.detail.clone();
         let applied_at = Instant::now();
         // Complete the one measurement from the user's Stop to the real target's
@@ -3347,7 +3412,7 @@ impl Application {
             }
             _ => None,
         };
-        if delivery == Delivery::Appended {
+        if effect.wrote_target() {
             timing.stop_to_confirmed_ms = delivered
                 .stopped_at
                 .map(|stopped_at| millis_between(delivered.delivery_finished_at, stopped_at));
@@ -3362,8 +3427,7 @@ impl Application {
         // An uncertain write may have landed and is never retried; its complete text
         // must stay as a pending result (record + text file) across a restart, exactly
         // like a fallback. Only a confirmed append leaves nothing pending.
-        let keep_record =
-            matches!(delivery, Delivery::Fallback | Delivery::Uncertain) || cleanup_error.is_some();
+        let keep_record = effect.needs_user() || cleanup_error.is_some();
         let applied = self.apply(Transition {
             sequence: delivered.sequence,
             state: Some(SegmentState::Result),

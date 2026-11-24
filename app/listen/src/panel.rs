@@ -9,8 +9,8 @@
 //! existing [`Snapshot`], so it stays consistent with the capsule and the files.
 
 use listen::{
-    Delivery, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot, UsageSummary,
-    storage::StorageLevel, streaming::SAMPLE_RATE,
+    DeliveryEffect, Phase, Preparation, Refine, SegmentState, SegmentSummary, Snapshot,
+    UsageSummary, storage::StorageLevel, streaming::SAMPLE_RATE,
 };
 
 /// The panel's button availability. `refine` is only enabled when the application
@@ -69,6 +69,36 @@ pub fn refine_label(snapshot: &Snapshot) -> &'static str {
     }
 }
 
+/// How a panel sentence reads a result that carries **no** delivery record. The same
+/// `Phase::Result` with `delivery == None` gets three mutually exclusive readings,
+/// kept exactly as they read before this wave; the values name them so the
+/// contradiction is reviewable instead of hiding in three `None` arms. None of them is
+/// a delivery outcome: the decision surfaces read
+/// [`DeliveryEffect::needs_user`], where `Unrecorded` is not a pending result.
+enum NoRecord {
+    /// The headline and the per-segment label: a plainly completed result.
+    Complete,
+    /// The summary: this run wrote no text to any target.
+    NothingWritten,
+    /// 精修: the target's transcript was replaced by the refined text.
+    ReplacedInPlace,
+}
+
+impl NoRecord {
+    /// The one sentence for this reading. `Complete` is the short headline, also used
+    /// as the per-segment label; `NothingWritten` explains the result in the summary;
+    /// `ReplacedInPlace` is the 精修 line for an applied refine.
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::Complete => "已完成",
+            Self::NothingWritten => "本次没有向任何目标写入文字；当前完整结果在下方。",
+            Self::ReplacedInPlace => {
+                "精修已应用：目标输入框中的本次转写已替换为精修结果，请检查后手动发送。"
+            }
+        }
+    }
+}
+
 /// The 精修 line for the panel's status block, or `None` when refine is not worth
 /// mentioning yet. `Unavailable` is only shown for a result (where the button would
 /// otherwise matter); the other states are always shown so the outcome cannot be
@@ -79,11 +109,18 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
             Some("可以精修：只把下方的文字发送到 DeepSeek API，不发送音频。".into())
         }
         Refine::Running => Some("正在精修：只发送文字，不发送音频；当前结果暂时保留。".into()),
-        Refine::Applied => Some(match snapshot.delivery {
-            Some(Delivery::Fallback) | Some(Delivery::Uncertain) => {
+        Refine::Applied => Some(match snapshot.delivery_effect() {
+            DeliveryEffect::NothingWritten | DeliveryEffect::UncertainWrite => {
                 "精修完成：没有目标输入框可替换，精修结果已保存为当前结果。".into()
             }
-            _ => "精修已应用：目标输入框中的本次转写已替换为精修结果，请检查后手动发送。".into(),
+            DeliveryEffect::WroteTarget => {
+                "精修已应用：目标输入框中的本次转写已替换为精修结果，请检查后手动发送。".into()
+            }
+            // No delivery record. This line keeps its historical reading
+            // (`ReplacedInPlace`) and still says the target's transcript was replaced;
+            // the summary's `NothingWritten` sentence for the same result is the
+            // contradiction this wave names, not resolves.
+            DeliveryEffect::Unrecorded => NoRecord::ReplacedInPlace.sentence().into(),
         }),
         Refine::NotApplied(reason) => Some(format!(
             "精修结果没有写回目标输入框：{reason}。精修文本在下方，你的编辑保持不变。"
@@ -103,11 +140,11 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
 /// colour alone, and it never hides a fallback delivery behind a plain "done".
 fn headline(snapshot: &Snapshot) -> &'static str {
     match snapshot.phase {
-        Phase::Result => match snapshot.delivery {
-            Some(Delivery::Appended) => "已完成：结果已追加到目标输入框",
-            Some(Delivery::Fallback) => "已完成：结果只在面板中",
-            Some(Delivery::Uncertain) => "已完成：是否已写入目标无法确认，结果只在面板中",
-            None => "已完成",
+        Phase::Result => match snapshot.delivery_effect() {
+            DeliveryEffect::WroteTarget => "已完成：结果已追加到目标输入框",
+            DeliveryEffect::NothingWritten => "已完成：结果只在面板中",
+            DeliveryEffect::UncertainWrite => "已完成：是否已写入目标无法确认，结果只在面板中",
+            DeliveryEffect::Unrecorded => NoRecord::Complete.sentence(),
         },
         Phase::NoSpeech => "没有检测到语音",
         Phase::Failure => "失败",
@@ -132,17 +169,19 @@ fn headline(snapshot: &Snapshot) -> &'static str {
 /// One sentence that says what the headline means for the user.
 fn summary(snapshot: &Snapshot) -> &'static str {
     match snapshot.phase {
-        Phase::Result => match snapshot.delivery {
-            Some(Delivery::Appended) => {
+        Phase::Result => match snapshot.delivery_effect() {
+            DeliveryEffect::WroteTarget => {
                 "完整结果已追加到目标输入框；请检查后手动发送。这里保留了一份副本。"
             }
-            Some(Delivery::Fallback) => {
+            DeliveryEffect::NothingWritten => {
                 "结果没有追加到目标输入框（没有有效目标，或写入未能确认）。完整文本在下方，请复制后手动粘贴。"
             }
-            Some(Delivery::Uncertain) => {
+            DeliveryEffect::UncertainWrite => {
                 "是否已写入原目标无法确认（上一进程的写入结果不确定，或响应丢失）；没有再次写入。完整文本在下方，请先检查原目标再复制处理。"
             }
-            None => "本次没有向任何目标写入文字；当前完整结果在下方。",
+            // No record, read as "this run wrote nothing" (`NothingWritten`): the
+            // sentence is the historical one, kept unchanged.
+            DeliveryEffect::Unrecorded => NoRecord::NothingWritten.sentence(),
         },
         Phase::NoSpeech => "这次没有交付任何文字；上一次的结果保持不变，仍可在下方复制。",
         Phase::Failure => {
@@ -189,13 +228,13 @@ pub fn segment_label(segment: &SegmentSummary) -> &'static str {
         SegmentState::Capturing => "正在采集",
         SegmentState::WaitingForNetwork => "等待联网，已收到的声音保存在这台电脑上",
         SegmentState::Processing => "处理中，等待完整结果",
-        SegmentState::Result => match segment.delivery {
-            Some(Delivery::Appended) => "已完成，结果已追加到目标输入框",
-            Some(Delivery::Fallback) => "已完成，结果只在面板中，尚未写入任何输入框",
-            Some(Delivery::Uncertain) => {
+        SegmentState::Result => match DeliveryEffect::of(segment.delivery) {
+            DeliveryEffect::WroteTarget => "已完成，结果已追加到目标输入框",
+            DeliveryEffect::NothingWritten => "已完成，结果只在面板中，尚未写入任何输入框",
+            DeliveryEffect::UncertainWrite => {
                 "已完成，是否已写入原目标无法确认；结果保留在面板中，没有再次写入"
             }
-            None => "已完成",
+            DeliveryEffect::Unrecorded => NoRecord::Complete.sentence(),
         },
         SegmentState::NoSpeech => "没有检测到语音",
         SegmentState::Failed => "失败，录音仍保留在本机",
@@ -213,10 +252,7 @@ pub fn pending_results(snapshot: &Snapshot) -> Vec<&SegmentSummary> {
         .filter(|segment| {
             !segment.text.is_empty()
                 && segment.state == SegmentState::Result
-                && matches!(
-                    segment.delivery,
-                    Some(Delivery::Fallback) | Some(Delivery::Uncertain)
-                )
+                && DeliveryEffect::of(segment.delivery).needs_user()
                 && snapshot.text != segment.text
         })
         .collect()
@@ -361,10 +397,7 @@ fn deletable(segment: &SegmentSummary) -> bool {
     match segment.state {
         SegmentState::Capturing | SegmentState::NoSpeech => false,
         SegmentState::WaitingForNetwork | SegmentState::Processing | SegmentState::Failed => true,
-        SegmentState::Result => matches!(
-            segment.delivery,
-            Some(Delivery::Fallback) | Some(Delivery::Uncertain)
-        ),
+        SegmentState::Result => DeliveryEffect::of(segment.delivery).needs_user(),
     }
 }
 
@@ -530,28 +563,27 @@ pub fn text(snapshot: &Snapshot) -> String {
 
 /// Why (and when) the panel should open without the user clicking it.
 ///
-/// Only a fallback delivery qualifies: issue #20 asks for click-to-toggle and its
-/// story 5 wants a result with no valid target to be reachable without the user
-/// discovering the capsule. A failure does not open the panel — the capsule turns
-/// red and the user clicks it to read the reason (#20's story 10) — so a failure
+/// A result the user still has to take or check qualifies: issue #20 asks for
+/// click-to-toggle and its story 5 wants a result with no valid target to be reachable
+/// without the user discovering the capsule, and a write that may have landed must not
+/// be discovered only by accident. A failure does not open the panel — the capsule
+/// turns red and the user clicks it to read the reason (#20's story 10) — so a failure
 /// never steals the screen.
 ///
-/// The key is stable for one event, so the caller can remember the last key it
-/// acted on: the same fallback result never re-opens a panel the user has just
-/// closed, while a new fallback result does. `None` means "this state is not a
-/// reason to open". A successful append is never one: the text is already in the
-/// target and the capsule stays calm.
+/// The key is stable for one event, so the caller can remember the last key it acted
+/// on: the same pending result never re-opens a panel the user has just closed, while a
+/// new one does. `None` means "this state is not a reason to open". A successful append
+/// is never one: the text is already in the target and the capsule stays calm.
 pub fn auto_open_key(snapshot: &Snapshot) -> Option<String> {
-    match snapshot.phase {
-        Phase::Result if snapshot.delivery == Some(Delivery::Fallback) => {
-            Some(format!("fallback:{}", snapshot.text))
-        }
-        // A result whose write may have happened still needs the user: it is not a
-        // calm "already appended" and it must not be discovered only by accident.
-        Phase::Result if snapshot.delivery == Some(Delivery::Uncertain) => {
-            Some(format!("uncertain:{}", snapshot.text))
-        }
-        _ => None,
+    if snapshot.phase != Phase::Result {
+        return None;
+    }
+    // The two pending outcomes share one user consequence but keep distinct key
+    // prefixes, so a fallback that becomes uncertain re-opens the panel as a new event.
+    match snapshot.delivery_effect() {
+        DeliveryEffect::NothingWritten => Some(format!("fallback:{}", snapshot.text)),
+        DeliveryEffect::UncertainWrite => Some(format!("uncertain:{}", snapshot.text)),
+        DeliveryEffect::WroteTarget | DeliveryEffect::Unrecorded => None,
     }
 }
 
@@ -618,7 +650,7 @@ pub fn position(capsule: Rect, work: Rect, width: i32, height: i32, gap: i32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use listen::{Phase, Preparation, Snapshot, Timing, streaming::CaptureProgress};
+    use listen::{Delivery, Phase, Preparation, Snapshot, Timing, streaming::CaptureProgress};
 
     fn snapshot(phase: Phase, preparation: Preparation) -> Snapshot {
         Snapshot {
@@ -725,6 +757,90 @@ mod tests {
             Some("uncertain:当前结果"),
             "an uncertain result is not hidden behind a calm appended delivery"
         );
+    }
+
+    #[test]
+    fn a_result_without_a_delivery_record_is_complete_and_leaves_nothing_pending() {
+        // `Phase::Result` with `delivery == None` had no coverage: the panel's three
+        // decision surfaces exclude it, while the three sentences keep their own
+        // historical readings of the same gap. This test pins that behavior before
+        // the one classification names the case.
+        let mut state = result("没有交付记录的完整结果", Delivery::Fallback);
+        state.delivery = None;
+        state.segments = vec![segment(
+            1,
+            SegmentState::Result,
+            "没有交付记录的完整结果",
+            None,
+        )];
+        let shown = text(&state);
+        assert!(shown.starts_with("已完成\n"), "{shown}");
+        assert!(
+            shown.contains("本次没有向任何目标写入文字；当前完整结果在下方。"),
+            "{shown}"
+        );
+        assert_eq!(segment_label(&state.segments[0]), "已完成");
+        assert!(pending_results(&state).is_empty());
+        assert!(deletable_segments(&state).is_empty());
+        assert_eq!(auto_open_key(&state), None);
+
+        // The 精修 line reads the same missing record as "the target's transcript was
+        // replaced" (the `ReplacedInPlace` reading). That sentence stays unchanged;
+        // its contradiction with the summary above is what the classification makes
+        // explicit instead of leaving it in a fallthrough arm.
+        state.refine = Refine::Applied;
+        let refined = status_text(&state);
+        assert!(
+            refined.contains("精修已应用：目标输入框中的本次转写已替换为精修结果"),
+            "{refined}"
+        );
+    }
+
+    #[test]
+    fn one_delivery_classification_decides_pending_cleanup_and_auto_open() {
+        // The mapping is the one place a delivery outcome becomes a user consequence.
+        assert_eq!(Delivery::Appended.effect(), DeliveryEffect::WroteTarget);
+        assert_eq!(Delivery::Fallback.effect(), DeliveryEffect::NothingWritten);
+        assert_eq!(Delivery::Uncertain.effect(), DeliveryEffect::UncertainWrite);
+        assert_eq!(DeliveryEffect::of(None), DeliveryEffect::Unrecorded);
+
+        // The three decision surfaces answer the same question — does the user still
+        // have to take or check this text? — from that one classification. The
+        // unrecorded result sits on the "nothing to do" side, like a proven append.
+        for (delivery, needs_user) in [
+            (Some(Delivery::Appended), false),
+            (Some(Delivery::Fallback), true),
+            (Some(Delivery::Uncertain), true),
+            (None, false),
+        ] {
+            let mut state = result("当前完整文本", Delivery::Fallback);
+            state.delivery = delivery;
+            state.segments = vec![
+                segment(1, SegmentState::Result, "旧完整文本", delivery),
+                segment(2, SegmentState::Result, "当前完整文本", delivery),
+            ];
+
+            assert_eq!(
+                DeliveryEffect::of(delivery).needs_user(),
+                needs_user,
+                "{delivery:?}"
+            );
+            assert_eq!(
+                pending_results(&state).len(),
+                usize::from(needs_user),
+                "the pending list for {delivery:?}"
+            );
+            assert_eq!(
+                deletable_segments(&state),
+                if needs_user { vec![1, 2] } else { Vec::new() },
+                "the cleanup menu for {delivery:?}"
+            );
+            assert_eq!(
+                auto_open_key(&state).is_some(),
+                needs_user,
+                "the auto-open rule for {delivery:?}"
+            );
+        }
     }
 
     #[test]
