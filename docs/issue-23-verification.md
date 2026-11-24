@@ -95,7 +95,7 @@
 | --- | --- |
 | 必需文件 / manifest 哈希 / pinned 哈希 / 启动器 / 扫描文件 | 17 / 19 / 5 / 2 / 19 |
 | 包内总字节 | 264,881,295 |
-| 本地备用 | `Ready`，`recognition_mode=local`，phase 序列 `Preparing → Ready`，启动到状态 2,196 ms |
+| 本地备用 | `Ready`，`recognition_mode=local`，phase 序列 `Preparing → Ready`，启动到状态 1–3 s（每次运行不同，见 `package-verify*.json`） |
 | 本地 backend | `SenseVoice q8, resident (sherpa-onnx), CPU, 6 thread(s); Silero VAD gates every window and each detected utterance is decoded separately.` |
 | 云端默认（无凭据） | `Failure` / `cloud-trial`，backend 显示 `Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing`，detail 含 `valid Alibaba workspace` |
 | 云端默认（合成凭据） | `Ready` / `cloud-trial`，`cloud_paid_requests=0`（账本 0 次预留） |
