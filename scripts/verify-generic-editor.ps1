@@ -34,7 +34,18 @@ if (-not $Handshake) { $Handshake = Join-Path $artifactsRoot ('issue-4\run-' + $
 $Handshake = [IO.Path]::GetFullPath($Handshake)
 if (Test-Path $Handshake) { Remove-Item -Recurse -Force $Handshake }
 New-Item -ItemType Directory -Force -Path $Handshake | Out-Null
-if (-not $Profile) { $Profile = Join-Path $artifactsRoot 'issue-4-profile' }
+# A fixed profile directory is handed to the browser instance that is already running
+# when a previous run has not exited yet; that instance was started without
+# --force-renderer-accessibility, so the fixture window loses its UIA render tree and
+# the driver waits for a window that will never appear. Without an explicit -Profile
+# the driver therefore creates a unique directory (timestamp + random suffix) of its
+# own, marks the first-run pages as already seen (below) and removes the directory at
+# the end. An explicit -Profile is used exactly as passed and is left in place for the
+# caller.
+$profileOwned = -not $Profile
+if ($profileOwned) {
+    $Profile = Join-Path $artifactsRoot ('issue-4-profile-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+}
 $Profile = [IO.Path]::GetFullPath($Profile)
 $fixture = Join-Path $projectRoot 'app\listen\tests\fixtures\generic-editors.html'
 $url = ([Uri]$fixture).AbsoluteUri + '?target=' + $Target
@@ -167,7 +178,11 @@ function Start-OwnedProcess([string]$fileName, [string]$arguments) {
     return [System.Diagnostics.Process]::Start($info)
 }
 function Get-ProfileProcesses {
-    return @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    # -Chrome accepts any Chromium build, so cleanup matches whatever executable was
+    # started (chrome.exe, msedge.exe, ...) instead of assuming Chrome.
+    $name = Split-Path $Chrome -Leaf
+    if (-not $name) { $name = 'chrome.exe' }
+    return @(Get-CimInstance Win32_Process -Filter ("Name='{0}'" -f $name) -ErrorAction SilentlyContinue | Where-Object {
             $_.CommandLine -and $_.CommandLine.IndexOf($Profile, [StringComparison]::OrdinalIgnoreCase) -ge 0
         })
 }
@@ -186,6 +201,9 @@ function Close-OwnedBrowser {
         try { Stop-Process -Id $chromeProcess.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
     }
     Start-Sleep -Seconds 1
+    # The auto-generated profile is ours and is removed; an explicit -Profile belongs to
+    # the caller and is never deleted by this driver.
+    if (-not $profileOwned) { return }
     for ($attempt = 0; $attempt -lt 20 -and (Test-Path $Profile); $attempt++) {
         try { Remove-Item -Recurse -Force -Path $Profile -ErrorAction Stop } catch { Start-Sleep -Milliseconds 500 }
     }
@@ -200,7 +218,25 @@ try {
         try { Stop-Process -Id $stale.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
     }
     if (Test-Path $Profile) { Remove-Item -Recurse -Force -Path $Profile }
-    $chromeProcess = Start-OwnedProcess $Chrome ('"--user-data-dir={0}" --no-first-run --no-default-browser-check --disable-session-crashed-bubble --new-window "{1}"' -f $Profile, $url)
+    if ($profileOwned) {
+        # A brand-new Chromium profile shows Edge's sign-in first-run experience on top
+        # of the fixture page; the page's editors are then never exposed through UIA and
+        # the driver reports "The owned fixture window did not appear". This directory is
+        # the driver's own, so it also marks the first-run/welcome pages as already seen.
+        # An explicit -Profile is left exactly as the caller prepared it.
+        New-Item -ItemType Directory -Force -Path (Join-Path $Profile 'Default') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $Profile 'First Run'), '', (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText((Join-Path $Profile 'Default\Preferences'),
+            '{"profile":{"has_seen_signin_fre":true},"browser":{"has_seen_welcome_page":true}}',
+            (New-Object Text.UTF8Encoding($false)))
+    }
+    # Chromium only builds the renderer accessibility tree on request. Edge exposes the
+    # fixture editors as UIA Edit elements with this switch; Chrome 157 exposes none even
+    # with it, so the flag is harmless there and required here. A brand-new profile also
+    # gets Edge's sign-in first-run page over the fixture, which keeps the page out of
+    # UIA entirely, so the smoke disables sync and background networking (the first-run
+    # page is gone and the fixture editors appear a few seconds after launch).
+    $chromeProcess = Start-OwnedProcess $Chrome ('"--user-data-dir={0}" --no-first-run --no-default-browser-check --disable-session-crashed-bubble --force-renderer-accessibility --disable-sync --disable-background-networking --new-window "{1}"' -f $Profile, $url)
     $window = Wait-FixtureWindow
     $targetName = if ($Target -eq 'plain') { 'Listen plain target' } else { '网页富文本编辑区' }
     $plain = Find-Edit $window 'Listen plain target'
@@ -293,7 +329,7 @@ try {
     $expectedDelivery = if ($expectFallback) { 'Some(Fallback)' } else { 'Some(Appended)' }
     if ($delivery -ne $expectedDelivery) { throw "Delivery mismatch: expected $expectedDelivery, observed $delivery. Detail: $detail" }
     if ($expectFallback) {
-        if ($detail -notlike '*fallback text box*') { throw "Fallback detail did not explain the fallback result: $detail" }
+        if ($detail -notlike '*expanded result panel*') { throw "Fallback detail did not explain the fallback result: $detail" }
         if ($Scenario -eq 'rebuild' -and $detail -notlike '*no longer available*' -and $detail -notlike '*rebuilt*') {
             throw "Fallback detail did not explain the rebuilt target: $detail"
         }
@@ -340,6 +376,7 @@ try {
         scenario = $Scenario
         handshake = $Handshake
         profile = $Profile
+        profile_auto_generated = $profileOwned
         expected = if ($expectFallback) { 'Fallback' } else { 'Appended' }
         capture_action = $captureAction
         delivery = $delivery

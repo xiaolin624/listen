@@ -107,6 +107,13 @@ fn write_text(text: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Copies `text` to the system clipboard for the expanded panel's
+/// 复制完整结果 button. It only writes the clipboard: it never pastes, never sends
+/// input and never touches a target, so the "append only, never send" rule holds.
+pub fn copy_to_clipboard(text: &str) -> AppResult<()> {
+    write_text(text)
+}
+
 fn clear() {
     if let Ok(_open) = Clipboard::open() {
         unsafe {
@@ -136,7 +143,7 @@ fn classify_clipboard(
     }
     if !text_format {
         return Err(
-            "The system clipboard holds non-text data (for example copied files or an image); the paste fallback was not used and that content was left untouched. Copy the complete result from the fallback text box instead."
+            "The system clipboard holds non-text data (for example copied files or an image); the paste fallback was not used and that content was left untouched. Copy the complete result from the expanded result panel instead."
                 .into(),
         );
     }
@@ -150,7 +157,7 @@ fn classify_clipboard(
                 _ => String::new(),
             };
             Err(format!(
-                "The system clipboard text could not be read{detail}, so the paste fallback was not used and the clipboard was left untouched. Copy the complete result from the fallback text box instead."
+                "The system clipboard text could not be read{detail}, so the paste fallback was not used and the clipboard was left untouched. Copy the complete result from the expanded result panel instead."
             ))
         }
     }
@@ -256,6 +263,18 @@ fn select_all_copy(keys: &mut Keys<'_>) -> AppResult<()> {
     keys.chord(VK_CONTROL, VK_C)
 }
 
+/// Selects the editor's whole content without copying it. A caller that already
+/// holds the live draft (for example from the accessible value) only needs the
+/// selection, so it can collapse it to the end before an appending paste.
+pub fn select_all(guard: &dyn Fn() -> AppResult<()>) -> AppResult<()> {
+    let mut sink = RealKeys;
+    let mut keys = Keys {
+        sink: &mut sink,
+        guard,
+    };
+    keys.chord(VK_CONTROL, VK_A)
+}
+
 /// Selects the editor's whole content, copies it and collapses the caret to the
 /// end, returning the real draft as the application sees it.
 pub fn read_draft(guard: &dyn Fn() -> AppResult<()>) -> AppResult<String> {
@@ -275,18 +294,23 @@ pub fn read_draft(guard: &dyn Fn() -> AppResult<()>) -> AppResult<String> {
 }
 
 /// Pastes `text` at the current caret position.
+///
+/// The clipboard write is synchronous, so no fixed wait is needed before the
+/// paste key. The caller confirms the pasted result through the accessible value
+/// (bounded by `PASTE_CONFIRM_TIMEOUT`) before falling back to a clipboard
+/// read-back, so the confirm window — not a fixed sleep — is what proves the
+/// paste landed. A responsive editor therefore confirms immediately instead of
+/// waiting out the settle time, while a slow one still gets the same total window.
 pub fn paste(text: &str, guard: &dyn Fn() -> AppResult<()>) -> AppResult<()> {
     // Do not overwrite the clipboard if the target already lost focus.
     (guard)()?;
     write_text(text)?;
-    thread::sleep(KEY_SETTLE);
     let mut sink = RealKeys;
     let mut keys = Keys {
         sink: &mut sink,
         guard,
     };
     keys.chord(VK_CONTROL, VK_V)?;
-    thread::sleep(Duration::from_millis(220));
     Ok(())
 }
 

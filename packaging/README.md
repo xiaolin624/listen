@@ -1,88 +1,190 @@
-# Listen 0.1.0：耳机音频本地转写
+# Listen 0.1.0：耳机音频转写（云端默认 + 显式本地备用）
 
-Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 开始采集**默认多媒体播放设备**上的声音，再按一次停止；它在本机用 whisper.cpp 转写，把完整结果追加到开始时选定的目标编辑区。无法可靠写入时，完整结果保留在 Listen 自己的**备用文本框**中。工具不会自动发送消息，也不会执行转写文字。
+Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 开始采集**默认多媒体播放设备**上的声音，再按一次停止；它把整段完整结果追加到开始时选定的目标编辑区。无法可靠写入或没有有效目标时，完整结果保留在 Listen 的**展开结果面板**里，由你复制。工具不会自动发送消息，也不会执行转写文字。
 
-本目录是可直接运行的交付包，不需要先运行仓库里的开发脚本，也不需要单独启动识别命令。`启动 Listen.cmd` 只负责用包内路径启动 `listen.exe`。
+本目录是可直接运行的交付包，不需要先运行仓库里的开发脚本，也不需要单独启动识别命令。
 
-## 快速启动
+- **日常默认是已通过验收的云端识别。** 双击 `启动 Listen.cmd` 使用阿里云百炼 Model Studio / `qwen-audio-3.1-asr-flash-message` / `cn-beijing`，运行目录 `runtime-cloud\`。2026-11-21 的单厂商验收（同一 20 段真实会议链路音频）为：交付 20/20，停止到结果可见最慢 844 ms（20/20 ≤ 1 秒），聚合准确率 95.86%（基线 75.39%，错误下降 83.2%）。证据见仓库 `docs/issue-40-acceptance-20261121.md`。
+- **本地识别是显式备用。** 只有双击 `启动 Listen 本地备用.cmd` 才会在本机用包内 `engine\` 和 `models\` 识别，运行目录 `runtime\`。云端失败、缺凭据或断网时**不会**自动改用本地；本地模式也不会读取云端运行目录里的待处理音频。
+- **状态会写明实际来源。** `runtime-cloud\status.txt` 或 `runtime\status.txt` 的 `recognition_mode=` 为 `cloud-trial` 或 `local`，`backend=` 行和结果面板同时给出实际厂商/型号/地域或本机引擎。
 
-1. 把整个目录解压到一个**可写**位置（例如 `D:\Tools\Listen-0.1.0`）。不要直接放在 `C:\Program Files` 下，因为运行时要在本目录写 `runtime\`。
-2. 如果 `models\` 为空，先按下面“模型准备”放入两个模型文件。包含模型的包可以跳过这一步。
-3. 双击 **`启动 Listen.cmd`**。等待状态显示 `Ready`。
-4. 在 Windows 声音设置中确认实际使用的耳机是**默认多媒体播放设备**；让会议或播放器通过这个设备播放声音。
-5. 点击要用接收文字的编辑区（原生控件或网页编辑区），按 **Ctrl+Alt+R** 开始。状态变为 `Capturing`。
-6. 再按 **Ctrl+Alt+R**，或在 Listen 窗口中点“停止并转写”。状态依次为 `Processing`、`Result`（或 `NoSpeech`）。
-7. 检查原编辑区里的结果。由你手动发送；Listen 不发送 Enter，也不点发送按钮。
+## 交付内容
 
-关闭窗口会隐藏到系统托盘；托盘左键打开窗口，右键提供显示、开始/停止和退出。只运行一个实例。
+| 路径 | 用途 |
+| --- | --- |
+| `listen.exe` | 正式应用 |
+| `libunwind.dll` | gnullvm 运行库，必须与 `listen.exe` 同目录 |
+| `启动 Listen.cmd` | **日常默认**；云端识别，固定阿里云北京型号，用 `runtime-cloud\` |
+| `启动 Listen 本地备用.cmd` | **显式本地备用**；用包内 SenseVoice q8 引擎/模型和 `runtime\` |
+| `scripts\configure-cloud-trial.ps1` | 本机凭据配置助手；隐藏输入，写入 Windows Credential Manager |
+| `CLOUD-TRIAL.md` | 云端默认的配置、费用、数据与失败行为说明 |
+| `engine\sherpa\` | SenseVoice 运行库：sherpa-onnx C API、ONNX Runtime 及其 provider DLL（本地备用） |
+| `models\` | 可选的本地备用模型（`models\sense-voice\`）；没有模型时按下文准备 |
+| `THIRD-PARTY-NOTICES.md` | 第三方署名与许可证索引；`licenses\` 内是上游许可证原文 |
+| `licenses\` | FunASR MODEL_LICENSE、sherpa-onnx（Apache 2.0）、ONNX Runtime（MIT）原文 |
+| `glossary.txt` | 本地术语表，两个启动器都显式使用它 |
+| `README.md`、`VERSION.txt`、`manifest.json` | 使用说明、版本、每个文件的大小与 SHA-256 |
 
-## 模型准备（不包含模型时）
+`manifest.json` 记录源码提交、是否包含模型、`default_mode=cloud`、云端固定厂商/型号/地域和显式本地备用的启动器；不记录本机密钥或测试环境路径。
 
-把下面两个文件放入本目录的 `models\`，文件名必须保持一致：
+## 快速启动（云端默认）
+
+1. 把整个目录解压到一个**可写**位置（例如 `D:\Tools\Listen-0.1.0`）。不要直接放在 `C:\Program Files` 下，因为运行时要在本目录写 `runtime-cloud\`。
+2. 本机已有可用的阿里云百炼 CLI（`bl.cmd`）登录，并为固定型号开启“用完即停”的免费额度保护。应用每次开始前都会只读核验：配置的工作空间必须是当前身份下唯一的默认工作空间、型号额度必须为正且未临近到期。核验不通过就**不发送音频**，已收到的声音保留在本机。
+3. 在解压后的本目录打开 PowerShell，运行：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\configure-cloud-trial.ps1
+   ```
+
+   先输入北京业务空间 Workspace ID，再以隐藏输入输入 API Key。Key 只存当前 Windows 用户的 Credential Manager；`%LOCALAPPDATA%\Listen\cloud-trial\ali.json` 只保存非秘密的 `workspace_id`、`model`、`region`。不要把 Key 写进命令行、聊天、日志或脚本。
+4. 双击 **`启动 Listen.cmd`**。桌面上会出现**状态胶囊**；等待它从“准备中”变为“就绪”。
+5. 在 Windows 声音设置中确认实际使用的耳机是**默认多媒体播放设备**；让会议或播放器通过这个设备播放声音。
+6. 点击要用接收文字的编辑区（原生控件或网页编辑区），按 **Ctrl+Alt+R** 开始。胶囊显示采集中的动效。
+7. 再按 **Ctrl+Alt+R** 停止。状态依次为处理中、结果（或没有检测到语音）。停止后只有取得整段云端确认并保存完整文字，才会安全回填。
+8. 单击胶囊展开**结果面板**，检查完整结果；需要时点“复制完整结果”。由你手动发送；Listen 不发送 Enter，也不点发送按钮。
+
+关闭结果面板不会退出 Listen；程序继续在系统托盘运行。托盘左键打开面板，右键提供打开结果面板、开始/停止、重试、清理和退出。只运行一个实例。
+
+**缺少凭据、工作空间、型号或地域时**：默认启动本身会显示失败状态并写出可操作的修正提示（`No Alibaba cloud API key ...` 或 `Cloud trial requires a valid Alibaba workspace ...`），开始采集会被拒绝，**不会**悄悄改成本地识别，也不会写出任何目标。按提示修正后再按 Ctrl+Alt+R。
+
+## 显式本地备用
+
+需要或想用本机识别时：
+
+1. 如果 `models\sense-voice\` 为空，先按下面“模型准备”放入三个模型文件。
+2. 关闭正在运行的 Listen，双击 **`启动 Listen 本地备用.cmd`**。
+3. 状态胶囊就绪后，操作与云端相同；`runtime\status.txt` 的 `recognition_mode=local`、`backend=` 和面板会写明本机引擎，不发送音频。
+
+这是**新的**本机识别采集，不是云端失败后的自动降级。`runtime-cloud\` 里尚未完成的云端录音不会被本地模式读取；下次打开默认启动器时仍会继续云端恢复。切换识别来源请显式关闭并重新启动，不要同时开两个实例。等价的命令行选择是 `listen.exe --engine sensevoice --sherpa-lib <包内 engine\sherpa> --sensevoice-model <…model.int8.onnx> --sensevoice-tokens <…tokens.txt> --sensevoice-vad <…silero_vad.onnx> --runtime <…runtime>`；**必须显式传全部引擎与模型路径**，否则应用会从 `listen.exe` 向上查找含 `.tools` 的祖先目录，可能加载到开发目录里的文件而不是包内文件。打包脚本与验证脚本也按这组显式参数区分两个启动器。
+
+## 费用与免费额度
+
+- 云端固定只使用一个厂商/型号/地域，不常规双发，也不会在失败时跨厂商切换或用本地结果冒充云端结果。
+- **免费额度到 2026-12-21 为止；之后按厂商实际计费转为付费**，费用取决于账号、地域、实际音频时长与用量。
+- 首轮试用共享硬上限 **CNY 50**：所有已结算估计与未决预留之和加新预留不得超过该值。每次尝试（包括重试）先在共享账本 `%LOCALAPPDATA%\Listen\cloud-trial\ledger.json` 记录准入；**不会自动购买套餐、自动提高预算或自动扩大额度**。
+- **CNY 100/月是提醒线，不是停用上限**：本月合计达到 90 元时就提前提示，超过 100 元仍只提示，不会中止采集。
+- 每次开始采集前都会现场只读核验免费保护（默认工作空间、精确型号、额度 > 0、`autoStop=true`、到期日）；核验不通过就不发送音频。该保护不等于“账单一定是 0 元”；**现金账单仍需你在阿里云控制台核对**。
+- 面板会显示本工具累计请求、已确认/保守估算/未知用量与金额；未知不会显示成 0，重试用量同样计入。
+- 只发送本次采集的音频和开始时固定的术语表，不发送目标草稿、其他窗口、截图或剪贴板。录音的留存、训练使用及例外条款取决于你的账号、地域和型号；本包**不宣称零留存**，也不替代你在阿里云控制台核实的条款。
+
+更完整的首次配置、失败提示与免费保护说明见 **[CLOUD-TRIAL.md](CLOUD-TRIAL.md)**。
+
+## 模型准备（本地备用不包含模型时）
+
+把下面三个文件放入本目录的 `models\sense-voice\`，文件名必须保持一致：
 
 | 文件 | 放置位置 | 字节数 | SHA-256 |
 | --- | --- | ---: | --- |
-| `ggml-small.bin` | `models\ggml-small.bin` | 487601967 | `1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b` |
-| `ggml-silero-v5.1.2.bin` | `models\ggml-silero-v5.1.2.bin` | 885098 | `29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf` |
+| `model.int8.onnx` | `models\sense-voice\model.int8.onnx` | 239233841 | `c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51` |
+| `tokens.txt` | `models\sense-voice\tokens.txt` | 315894 | `f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc` |
+| `silero_vad.onnx` | `models\sense-voice\silero_vad.onnx` | 643854 | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` |
 
 来源：
 
-- Whisper 多语言 small（F16）：<https://huggingface.co/ggerganov/whisper.cpp/tree/5359861c739e955e79d9a303bcbc70fb988958b1>
-- Silero VAD v5.1.2：<https://huggingface.co/ggml-org/whisper-vad/tree/9ffd54a1e1ee413ddf265af9913beaf518d1639b>
+- SenseVoiceSmall q8（sherpa-onnx 的 int8 ONNX 转换，`model.int8.onnx` + `tokens.txt`）：<https://k2-fsa.github.io/sherpa/onnx/sense-voice/pretrained.html>
+- Silero VAD（`silero_vad.onnx`，sherpa-onnx 的 VAD 模型）：<https://k2-fsa.github.io/sherpa/onnx/vad/index.html>
 
 下载后可用 PowerShell 校验：
 
 ```powershell
-Get-FileHash .\models\ggml-small.bin -Algorithm SHA256
-Get-FileHash .\models\ggml-silero-v5.1.2.bin -Algorithm SHA256
+Get-FileHash .\models\sense-voice\model.int8.onnx -Algorithm SHA256
+Get-FileHash .\models\sense-voice\tokens.txt -Algorithm SHA256
+Get-FileHash .\models\sense-voice\silero_vad.onnx -Algorithm SHA256
 ```
 
-两个模型都准备好后重新启动 Listen。模型只从本目录读取，不需要联网；识别全程在本机 CPU 上完成，没有云端识别、API 调用或自动更新。
+三个文件都准备好后重新启动本地备用。模型只从本目录读取，不需要联网；本地识别全程在本机 CPU 上完成，**要求 CPU 支持 AVX2**。本包没有配置 `DEEPSEEK_API_KEY`，因此面板里的“精修”不可用，两种识别来源都不受影响。模型权重使用 FunASR MODEL_LICENSE，署名与许可证原文见 `THIRD-PARTY-NOTICES.md` 与 `licenses\`。
 
 ## 缺少文件时会怎样
 
-- **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：`启动 Listen.cmd` 会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
-- **缺少 `engine\whisper-cli.exe`、`engine\vad-speech-segments.exe` 或引擎相邻 DLL**：启动器只检查前两个程序文件是否存在并给出提示；如果相邻 DLL 缺失，`listen.exe` 启动后进入 `Failure`，写明 `backend is unavailable; check its adjacent DLLs`。启动器本身不会预先校验每个相邻 DLL。
-- **缺少模型、模型为空或不是 ggml 格式**：启动状态为 `Failure`，写明 `Local model is unavailable (...)` 或 `Local model is not a whisper.cpp ggml model`。补齐模型后重新启动即可。
-- **默认多媒体播放设备不可用**：开始采集时进入 `Failure`，写明无法选择默认多媒体渲染端点；不会打开麦克风，也不会自动改用其他设备。
-- 包内 `engine\` 已放入引擎实际需要的 `whisper.dll`、`ggml.dll`、`ggml-cpu.dll`、`ggml-base.dll`、`vad-speech-segments.exe` 以及 Microsoft VC++ 运行库 DLL；`SDL2.dll`、`whisper-server.exe` 等无关程序没有打包。
+- **缺少 `listen.exe`、`libunwind.dll` 或启动器找不到它们**：两个启动器都会显示缺失的文件名并暂停，不会静默退出。`libunwind.dll` 是 gnullvm 运行库，必须和 `listen.exe` 放在同一目录。
+- **缺少 `scripts\configure-cloud-trial.ps1` 或 `CLOUD-TRIAL.md`**：默认云端启动器明确提示缺少该文件，不静默启动。
+- **缺少 `engine\sherpa\sherpa-onnx-c-api.dll` 或 `engine\sherpa\onnxruntime.dll`**：本地备用启动器直接提示引擎不完整并暂停，不静默启动；如果两个 DLL 不在同一目录，`listen.exe` 启动后进入失败状态。
+- **缺少 `models\sense-voice\` 下的模型文件**：本地备用状态为失败，写明 `The local SenseVoice model is missing: ...` 一类的具体文件。补齐三个文件后重新启动即可。云端默认不需要本地模型。
+- **默认多媒体播放设备不可用**：开始采集时进入失败状态，写明无法选择默认多媒体渲染端点；不会打开麦克风，也不会自动改用其他设备。
+- 包内 `engine\sherpa\` 只放 SenseVoice 实际加载的三个运行库（`sherpa-onnx-c-api.dll`、`onnxruntime.dll`、`onnxruntime_providers_shared.dll`；ONNX Runtime 为 MT/静态 CRT 构建，不需要额外 VC++ 运行库 DLL）；`models\sense-voice\` 只放上面三个模型文件。示例程序、其他模型和无关引擎都没有打包。
 
 ## 采集范围与行为
 
 - **只采集 Windows 默认多媒体渲染端点**（`eRender` + `eMultimedia`）上的混合声音，不打开麦克风。默认通信端点或单独路由到其他设备/应用的声音不在采集范围内，即使耳机也在播放。
 - 开始采集时状态会写出实际端点的角色、设备 ID 和友好名称。不要求选择应用类型或声音来源应用。
-- 采集期间默认多媒体端点被切换、移除或失活时，工具立即停止并进入 `Failure`，写明原端点/新端点和中断原因；已收到的音频或识别检查点保留，并明确标为不完整，不冒充完整采集。工具不会自动跟随到新设备。
-- 不建立会议历史：成功转写只覆盖 `runtime\current-result.txt`，失败时保留本次临时音频并在状态中给出路径。`status.txt` 不包含转写正文。
+- 采集期间默认多媒体端点被切换、移除或失活时，工具立即停止并进入失败状态，写明原端点/新端点和中断原因；已收到的音频或识别检查点保留，并明确标为不完整，不冒充完整采集。工具不会自动跟随到新设备。
+- 成功转写只覆盖当前运行目录的 `current-result.txt`，不建立会议历史；失败时保留本次临时音频并在状态中给出路径。`status.txt` 不包含转写正文。
 - **不会自动发送**：没有 Enter、发送按钮、消息 API 或执行转写文本的代码路径。原生/网页写入、剪贴板降级都只追加文本。
-- 写入无法确认时，完整结果进入备用文本框；你可以按 Ctrl+C 或点“复制完整结果”。工具不自动重试，也不回滚原目标。
+- 写入无法确认时，完整结果进入展开结果面板；你可以选择文字按 Ctrl+C，或点“复制完整结果”。工具不自动重试，也不回滚原目标。
+- 多段待取结果分别保存，后一段不覆盖前一段；未完成录音和待取结果跨重启保留。
+- 云端模式只把本次采集的连续音频和开始时固定的术语表发送给选定厂商；网络断开时继续保存在本机并自动重连、补传，停止后只有取得整段确认才交付。**不会**因云端失败而调用本地识别，也不会把未确认文字交付。
+
+## 结果面板
+
+单击胶囊展开/收起面板。面板上方是当前阶段、识别来源、实时采集进度和完整说明，下方是**完整当前转写文本**；两个文本区都是只读的，可选择、可 Ctrl+C。按钮：
+
+- **复制完整结果**：只写剪贴板，不粘贴、不发送；
+- **重试**：对失败捕获保留的音频重新识别（云端模式下是同一厂商的新请求，会计费和再次核验保护）；
+- **清理失败音频**：删除保留的失败音频，之后不能再用它重试；
+- **删除待处理段**：按采集顺序清理指定段的待处理音频和待取结果，不影响其他段；
+- **精修（不可用）**：没有 `DEEPSEEK_API_KEY` 时明确置灰；精修仍需你单独触发；
+- **关闭**：隐藏面板，程序继续在托盘运行。
+
+没有有效目标、目标失效或写入无法确认时，结果只出现在面板里并自动展开一次；成功追加不会自动打开面板。失败不会自动抢屏：胶囊变红，你点开面板即可看到原因。
 
 ## 平台限制（请先读）
 
-- 自动追加要求目标通过 UI Automation 暴露**可写的 Value 模式**，且焦点在开始时能绑定到该编辑区。只读、禁用、密码框、没有 Value 模式的控件或无法确认身份的目标会进入备用文本框。
+- 自动追加要求目标通过 UI Automation 暴露**可写的 Value 模式**，且焦点在开始时能绑定到该编辑区。只读、禁用、密码框、没有 Value 模式的控件或无法确认身份的目标会进入展开结果面板。
 - 浏览器 `contenteditable` 的 `ValuePattern.SetValue` **不会派发 `input`/`change` 事件**，原有富文本结构会被拍平。React/Vue 等受控编辑器可能在下一次重绘时覆盖写入；Listen 只能确认写入当时可访问值已写入并读回。
-- 有些受控编辑器（例如部分聊天输入框）暴露 Value 模式但会静默丢弃写入。这类编辑区只有在**停止时目标窗口仍是前台、焦点仍是原目标**时才会走粘贴降级：读出真实草稿、只追加、用全选复制校验；每个按键前都会重新校验前台/焦点。降级会短暂借用系统剪贴板，结束后恢复文本；**如果剪贴板里是文件/图片等非文本内容或无法安全读取，降级不会运行也不会清空剪贴板**，完整结果进入备用文本框并说明原因。降级只发送 `Ctrl+A/V/C` 和方向键，**从不发送 Enter**。目标不在前台、焦点变化或校验不通过时仍进入备用文本框。
-- **Codex 桌面端等没有专门适配**：如果它不通过标准可写 Value 模式暴露输入区，Listen 不会猜测控件或注入发送，结果会进入备用文本框。没有按应用白名单/黑名单分流。
+- 有些受控编辑器（例如部分聊天输入框）暴露 Value 模式但会静默丢弃写入。这类编辑区只有在**停止时目标窗口仍是前台、焦点仍是原目标**时才会走粘贴降级：读出真实草稿、只追加、用全选复制校验；每个按键前都会重新校验前台/焦点。降级会短暂借用系统剪贴板，结束后恢复文本；**如果剪贴板里是文件/图片等非文本内容或无法安全读取，降级不会运行也不会清空剪贴板**，完整结果进入展开结果面板并说明原因。降级只发送 `Ctrl+A/V/C` 和方向键，**从不发送 Enter**。目标不在前台、焦点变化或校验不通过时仍进入展开结果面板。
+- **Codex 桌面端等没有专门适配**：如果它不通过标准可写 Value 模式暴露输入区，Listen 不会猜测控件或注入发送，结果会进入展开结果面板。没有按应用白名单/黑名单分流。
 - UIA 读取、检查和写入不是跨进程原子事务；在最后检查和写入之间发生的并发编辑仍可能造成“可能已部分写入”的提示。失败后只做诊断读回，不自动重试、不回滚。
-- 目标有长度上限时会截断。Listen 会检测稳定前缀，明确报告“只保存了 N/M 个字符，不是完整交付”，并在备用文本框保留完整结果；不会把截断报告成成功。
-- CPU 识别；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。
+- 目标有长度上限时会截断。Listen 会检测稳定前缀，明确报告“只保存了 N/M 个字符，不是完整交付”，并在展开结果面板保留完整结果；不会把截断报告成成功。
+- 本地备用引擎为 SenseVoice q8（sherpa-onnx，CPU，**要求 AVX2**）；本版本没有交付 CUDA/GPU 加速。识别会保留模型输出的繁体/简体、标点、英文和数字，不做摘要、同音纠正或语义改写；中英切换、专有名词、同音字和标点仍可能有错。云端准确率数字只对应验收时的固定 20 段语料，不等于对所有会议内容的保证。
 - 测试中的 10 分钟/60 分钟只是验证样例，**不是产品时长上限**，也不是延迟或准确率 SLA。
 - 尚未覆盖：所有第三方编辑器/浏览器扩展输入区、物理拔插耳机、蓝牙免提/立体声切换、会议软件独占模式、其他 Windows 版本、真实会议录音的分段边界质量。不要把它理解为“任意控件无条件可写”或“任意会议逐字零错误”。
+
+## 术语表（专名校正）
+
+包内的 `glossary.txt` 是本地**术语表**：`#` 开头是注释，空行忽略，一行一个词，正式写法在前，可选的别名（拼音、中文写法或顽固误写）放在 `|` 后，用逗号分隔。例如：
+
+```text
+DeepSeek Harness | shen du qiu suo, 迪普西克
+WASAPI | waapp
+CUDA | ku da, ku
+Rust | re
+```
+
+识别结果交付前会按术语表校正专名和技术词，并保持原顺序、分段和标点。匹配是近似的（忽略大小写、空格和连字符；多词正式写法还会用有辨识度的前导词召回，并能处理词数变化和词长缩短），所以一个词通常无需列出所有误识别写法；普通句子不会被替换。包内的 `glossary.txt` 就放在 `listen.exe` 旁边：`runtime\glossary.txt` 不存在时程序会使用它，`status.txt` 的 `glossary=` 行写明实际使用的文件。文件在**每次开始采集时重新读取**，改完保存后下一次采集即生效，不需要重启；文件缺失时不做校正，文件格式错误时状态会说明原因，本次采集仍会交付未校正的文本。云端模式在开始时固定同一份术语快照。
 
 ## 本地数据
 
 | 路径 | 用途 |
 | --- | --- |
-| `runtime\current-result.txt` | 当前完整 UTF-8 转写；成功后覆盖，不建立会议历史 |
-| `runtime\status.txt` | 当前阶段、说明、采集端点、当前结果与失败保留音频路径；不含转写正文 |
-| `runtime\latency.jsonl` | 每次采集的准备/收尾/识别/保存/交付耗时；不含音频 |
-| `runtime\` 下本次会话临时目录 | 采集音频与本地后端日志；成功后删除，失败时保留以便人工处理 |
+| `glossary.txt` | 本地术语表；本地可编辑，下一次采集开始时生效 |
+| `runtime-cloud\current-result.txt` | 云端默认的当前完整 UTF-8 转写；成功后覆盖，不建立会议历史 |
+| `runtime-cloud\status.txt` / `panel.txt` | 云端默认的状态与面板文本；`recognition_mode=cloud-trial`，不含转写正文以外的新内容 |
+| `runtime-cloud\` 下本次会话临时目录 | 云端连续 PCM、待恢复录音与交付状态；完整文字保存后才释放音频 |
+| `runtime\current-result.txt` | 显式本地备用的当前完整 UTF-8 转写；成功后覆盖，不建立会议历史 |
+| `runtime\status.txt` / `panel.txt` | 本地备用的状态与面板文本；`recognition_mode=local` |
+| `runtime\` 下本次会话临时目录 | 本地采集音频与后端日志；成功后删除，失败时保留以便人工处理 |
+| `%LOCALAPPDATA%\Listen\cloud-trial\ali.json` | 云端非秘密配置：工作空间、固定型号和地域 |
+| `%LOCALAPPDATA%\Listen\cloud-trial\ledger.json` | 共享 CNY 50 试用账本；不随包分发、不自动重置 |
+| Windows Credential Manager `Listen/CloudTrial/Alibaba/cn-beijing` | 当前用户的云端 API Key；不在包内、状态或日志中 |
 
-确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时窗口会提供“重试本地识别”和“清理失败音频”按钮（`--control retry|cleanup` 走同一入口）；只有“尚未成功消费任何识别窗口”的采集可以整段重试，长会话已有窗口成功后的失败只保留检查点文本和剩余音频路径，状态会明确说明。
+确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理音频保留在自己的运行目录，不用本地模式冒充处理。
+
+## 署名与许可
+
+本包分发三类第三方组件；完整索引、来源 URL 与许可证原文的 SHA-256 见 **`THIRD-PARTY-NOTICES.md`**，上游许可证原文在 `licenses\`：
+
+- **SenseVoiceSmall 模型权重**（`models\sense-voice\`）来自 **FunASR / SenseVoice** 项目，使用 **FunASR MODEL_LICENSE**（FunASR Model Open Source License Agreement v1.1，版权 (C) [2023-2028] [Alibaba Group]）。原文：`licenses\FunASR-MODEL_LICENSE.txt`。该许可证 2.2 条要求注明出处与作者信息并保留模型名称，因此本 README、`VERSION.txt` 和 `THIRD-PARTY-NOTICES.md` 都保留 “SenseVoiceSmall / FunASR” 署名。
+- **sherpa-onnx**（`engine\sherpa\sherpa-onnx-c-api.dll`）按 **Apache License, Version 2.0** 分发。原文：`licenses\sherpa-onnx-LICENSE.txt`。
+- **ONNX Runtime**（`engine\sherpa\onnxruntime.dll`、`onnxruntime_providers_shared.dll`）按 **MIT License** 分发（版权 Microsoft Corporation）。原文：`licenses\onnxruntime-LICENSE.txt`。
+
+本包**不包含** whisper.cpp 的模型或运行库；本地识别只使用上面这套 SenseVoice 组件。第三方许可证原文只做逐字分发，不改写条款；如与上游仓库不一致，以上游仓库为准。
 
 ## 版本与验证
 
-- 版本：0.1.0
+- 版本：0.1.0（见 `VERSION.txt`）
+- 默认：阿里云百炼 Model Studio / `qwen-audio-3.1-asr-flash-message` / `cn-beijing`，单厂商
+- 显式本地备用：SenseVoice q8（sherpa-onnx C API 常驻应用进程，CPU，要求 AVX2）
 - 源码：<https://github.com/xiaolin624/listen>
-- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交和是否包含模型。
-- 端到端验证、延迟、长会话和已知限制见仓库 `docs/issue-11-verification.md` 与 `docs/issue-11-release-notes.md`。
-- 本机断网封禁复验仍未完成；包内三个二进制没有网络导入，运行期只加载本机模块。静态/运行期证据见仓库 `docs/issue-11-verification.md`，不能替代系统级强制禁网实测。
+- 交付包由 `scripts/package-listen.ps1` 生成；`manifest.json` 记录每个文件的大小和 SHA-256、源码提交、是否包含模型、`default_mode=cloud`、固定厂商/型号/地域、`engine_source` 与 `engine_files`。
+- 验收证据：`docs/issue-40-acceptance-20261121.md`（2026-11-21，同一 20 段真实音频，20/20 交付、最慢 844 ms、95.86% 对比 75.39%）。费用、数据条款与未覆盖项见 `CLOUD-TRIAL.md`；本包不声称现金账单已对账或零留存。换引擎到 SenseVoice 的交付包验收记录见仓库 `docs/issue-23-verification.md`（ticket #23）。

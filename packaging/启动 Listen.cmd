@@ -1,4 +1,7 @@
 @echo off
+rem Daily default (issue #40): the accepted Alibaba cloud path. If the local
+rem cloud credential, workspace, model or region is missing or invalid, Listen
+rem refuses the capture and explains why; it never falls back to local recognition.
 setlocal
 cd /d "%~dp0"
 if not exist "%~dp0listen.exe" (
@@ -12,22 +15,17 @@ if not exist "%~dp0libunwind.dll" (
   pause
   exit /b 1
 )
-if not exist "%~dp0engine\whisper-cli.exe" goto engine_missing
-if not exist "%~dp0engine\vad-speech-segments.exe" goto engine_missing
-if not exist "%~dp0models\ggml-small.bin" goto model_missing
-if not exist "%~dp0models\ggml-silero-v5.1.2.bin" goto model_missing
-start "" "%~dp0listen.exe" --engine "%~dp0engine\whisper-cli.exe" --model "%~dp0models\ggml-small.bin" --vad-model "%~dp0models\ggml-silero-v5.1.2.bin" --runtime "%~dp0runtime"
+if not exist "%~dp0scripts\configure-cloud-trial.ps1" (
+  echo The cloud configuration helper is missing: %~dp0scripts\configure-cloud-trial.ps1
+  echo Extract the complete package again before starting Listen.
+  pause
+  exit /b 1
+)
+if not exist "%~dp0CLOUD-TRIAL.md" (
+  echo The cloud configuration guide is missing: %~dp0CLOUD-TRIAL.md
+  echo Extract the complete package again before starting Listen.
+  pause
+  exit /b 1
+)
+start "" "%~dp0listen.exe" --runtime "%~dp0runtime-cloud" --glossary "%~dp0glossary.txt"
 exit /b 0
-
-:engine_missing
-echo The local recognition engine is incomplete.
-echo Expected engine\whisper-cli.exe, engine\vad-speech-segments.exe and their adjacent DLLs.
-pause
-exit /b 1
-
-:model_missing
-echo The local speech models are not prepared.
-echo Put ggml-small.bin and ggml-silero-v5.1.2.bin into the models folder, then run this file again.
-echo See README.md for the model sources and SHA-256 values.
-pause
-exit /b 1

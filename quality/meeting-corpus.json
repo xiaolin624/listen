@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "kind": "real-tencent-meeting-loopback",
+  "language": "zh-CN",
+  "sample_rate": 16000,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "notes": "用户按 spoken 朗读；reference 是评分用的期望文本，本版两者相同。录音只采集默认多媒体播放设备，不做任何识别。每句都按正常会议语速读，不需要放慢。",
+  "instructions": [
+    "戴上耳机，用手机加入腾讯会议，并确认这台电脑也加入了同一个会议。",
+    "电脑端腾讯会议保持静音，不要用扬声器；会议声音从这台电脑的默认播放设备（耳机）播放。",
+    "本工具只采集这台电脑的默认多媒体播放设备，不做任何识别，也不会联网。",
+    "一句一句朗读屏幕上的句子，读完后在这个窗口按 Enter 停止录音，然后选择接受或重录。",
+    "录音期间不要切换播放设备，也不要播放其他声音；每句控制在 12 秒以内。"
+  ],
+  "samples": [
+    {
+      "id": "mandarin-long",
+      "spoken": "我先同步一下今天的进展：后端接口已经联调完成，前端还在补最后的错误提示，明天下午可以一起走一遍验收流程。",
+      "reference": "我先同步一下今天的进展：后端接口已经联调完成，前端还在补最后的错误提示，明天下午可以一起走一遍验收流程。",
+      "focus": "普通话长句：多个分句、冒号与逗号，检查简体输出、断句和句末标点。"
+    },
+    {
+      "id": "product-names-whisper-sensevoice",
+      "spoken": "我们把语音识别从 Whisper 换成 SenseVoice，现在用 sherpa-onnx 在本地跑推理。",
+      "reference": "我们把语音识别从 Whisper 换成 SenseVoice，现在用 sherpa-onnx 在本地跑推理。",
+      "focus": "产品名 Whisper、SenseVoice、sherpa-onnx：检查英文原样保留，不会被译成中文或拆错。"
+    },
+    {
+      "id": "product-names-deepseek-cuda",
+      "spoken": "DeepSeek Harness 的接口已经调通了，CUDA 加速这一版先不开，先用 CPU 把流程跑稳。",
+      "reference": "DeepSeek Harness 的接口已经调通了，CUDA 加速这一版先不开，先用 CPU 把流程跑稳。",
+      "focus": "产品名 DeepSeek Harness（两个单词连读）和 CUDA、CPU：检查空格与大小写形式是否完整保留。"
+    },
+    {
+      "id": "wasapi-loopback-tokens",
+      "spoken": "采集走的是 WASAPI loopback，音频直接送进模型；接口偶尔返回 HTTP 500，日志里能看到 JSON 解析失败。",
+      "reference": "采集走的是 WASAPI loopback，音频直接送进模型；接口偶尔返回 HTTP 500，日志里能看到 JSON 解析失败。",
+      "focus": "技术词 WASAPI loopback、HTTP 500、JSON：检查缩写、数字状态码和短英文词连续出现时的保留情况。"
+    },
+    {
+      "id": "numbers-units",
+      "spoken": "这次发布的是版本 1.8.2，服务端口改成 8080，失败重试 3 次，间隔 2 秒，超时先设 30 秒。",
+      "reference": "这次发布的是版本 1.8.2，服务端口改成 8080，失败重试 3 次，间隔 2 秒，超时先设 30 秒。",
+      "focus": "数字与单位：版本号、端口、次数、秒数。按口语正常读（版本一点八点二、八零八零、三次、两秒、三十秒），检查数字是否输出为阿拉伯数字而不是中文数字。"
+    },
+    {
+      "id": "homophones",
+      "spoken": "本机环境已经配好了，本季度的目标不变；请确认是要在本机部署，还是下个季度再部署一次。",
+      "reference": "本机环境已经配好了，本季度的目标不变；请确认是要在本机部署，还是下个季度再部署一次。",
+      "focus": "同音易混词：本机 / 本季、在 / 再。检查识别结果是否把本机写成本季（或反过来）。"
+    },
+    {
+      "id": "mixed-chinese-english",
+      "spoken": "这个 PR 我 review 过了，主要改了 retry 的逻辑，merge 之前还需要再补一个 unit test。",
+      "reference": "这个 PR 我 review 过了，主要改了 retry 的逻辑，merge 之前还需要再补一个 unit test。",
+      "focus": "中英混合：英文小写词 PR、review、retry、merge、unit test 夹在中文句子里，检查既不被翻译也不被漏掉。"
+    },
+    {
+      "id": "digits-punctuation",
+      "spoken": "结论有三点：第一，灰度比例先控制在 5%；第二，回滚窗口留 30 分钟；第三，明天 10:30 之前给我确认。",
+      "reference": "结论有三点：第一，灰度比例先控制在 5%；第二，回滚窗口留 30 分钟；第三，明天 10:30 之前给我确认。",
+      "focus": "数字与标点压力：冒号、第一/第二/第三的列举、分号、百分号和时间。检查标点是否成句、数字是否连贯。"
+    },
+    {
+      "id": "meeting-scene",
+      "spoken": "对方在腾讯会议里说话，我这边把耳机里的声音直接录下来，不做任何识别，先保证音频完整。",
+      "reference": "对方在腾讯会议里说话，我这边把耳机里的声音直接录下来，不做任何识别，先保证音频完整。",
+      "focus": "真实会议场景的长句：腾讯会议、耳机、只采集不识别，检查中文专名和整句内容是否稳定。"
+    },
+    {
+      "id": "english-acronyms",
+      "spoken": "今天的 demo 先讲 MVP，API 文档我下午发到群里，SLA 和 QPS 这两个指标下周再对齐。",
+      "reference": "今天的 demo 先讲 MVP，API 文档我下午发到群里，SLA 和 QPS 这两个指标下周再对齐。",
+      "focus": "连续短英文缩写：demo、MVP、API、SLA、QPS，检查缩写是否被逐字母保留、有没有被拆成中文。"
+    }
+  ]
+}

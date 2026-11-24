@@ -1,113 +1,99 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod capsule;
+mod capsule_window;
 mod gui;
+mod panel;
+mod panel_window;
 
-use listen::{
-    audio::WasapiPlayback,
-    whisper::{Backend, Whisper},
-};
-use std::{env, path::PathBuf};
+use listen::launch::{self, LaunchAction};
+use std::env;
 
-pub struct Config {
-    engine: PathBuf,
-    model: PathBuf,
-    vad_model: PathBuf,
-    runtime: PathBuf,
-    language: String,
-    threads: usize,
-    hidden: bool,
-    backend: Backend,
-}
+const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.
+Only that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.
 
-enum LaunchAction {
-    Run(Config),
-    Control(String),
-    Help,
-}
+Default recognition: the accepted Alibaba cloud trial. Each capture's continuous audio and capture-start glossary go to the Beijing Message model (Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing). Every start must pass the live default-workspace, exact-model free-only protection check and the shared CNY 50 ledger before any audio is sent; a key or billing alert does not bypass this protection. If the credential, workspace, model or region is missing or invalid, the capture is refused with the reason and does not recognise locally instead. Received audio is retained.
 
-const HELP: &str = "Listen: Ctrl+Alt+R starts/stops capture of the default multimedia render endpoint.\nOnly that endpoint is captured; audio routed only to the default communication endpoint or to another device is outside the capture. A default-route switch or endpoint removal interrupts the capture, retains received audio/checkpoint, and marks the result incomplete.\nOptions: --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> --runtime <directory> --language <zh|auto|...> --threads <count> --backend <host|cli> --hidden\n--backend host (default) loads the same model once in this process and decodes each window in a fresh state; if that is unavailable Listen falls back to the whisper.cpp CLI and says so. --backend cli keeps one CLI process per window.\nThe engine package must include vad-speech-segments.exe. No cloud service is used.\nControl running application: --control <start|stop|toggle|retry|cleanup|show|quit>\nRetry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.\nResults are copyable in the application. Messages are never sent automatically.";
+Local recognition (SenseVoice q8 through sherpa-onnx, resident in this process on the CPU) is an explicit fallback: select it with --engine sensevoice (or --engine whisper / a whisper-cli.exe path). It is never started silently in place of a failed cloud request, and the UI/status names the path actually used.
 
-fn parse() -> Result<LaunchAction, String> {
-    let executable = env::current_exe().map_err(|e| e.to_string())?;
-    let root = executable
-        .ancestors()
-        .find(|path| path.join(".tools").is_dir())
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir().map_err(|e| e.to_string())?);
-    let mut config = Config {
-        engine: root.join(".tools/whisper-v1.8.2-cpu/bin/Release/whisper-cli.exe"),
-        model: root.join(".tools/models/ggml-small.bin"),
-        vad_model: root.join(".tools/models/ggml-silero-v5.1.2.bin"),
-        runtime: root.join(".artifacts/listen"),
-        language: "zh".into(),
-        threads: 6,
-        hidden: false,
-        backend: Backend::ModelHost,
-    };
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--hidden" {
-            config.hidden = true;
-            continue;
-        }
-        if arg == "--help" || arg == "-h" {
-            return Ok(LaunchAction::Help);
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| format!("Missing value for {arg}"))?;
-        match arg.as_str() {
-            "--control" => {
-                if args.next().is_some() {
-                    return Err("--control must be used on its own".into());
-                }
-                return Ok(LaunchAction::Control(value));
-            }
-            "--engine" => config.engine = PathBuf::from(value),
-            "--model" => config.model = PathBuf::from(value),
-            "--vad-model" => config.vad_model = PathBuf::from(value),
-            "--runtime" => config.runtime = PathBuf::from(value),
-            "--language" => config.language = value,
-            "--backend" => {
-                config.backend = match value.as_str() {
-                    "host" => Backend::ModelHost,
-                    "cli" => Backend::Cli,
-                    _ => return Err("--backend must be host or cli".into()),
-                };
-            }
-            "--threads" => {
-                config.threads = value
-                    .parse()
-                    .map_err(|_| "--threads must be a positive integer")?;
-                if config.threads == 0 {
-                    return Err("--threads must be positive".into());
-                }
-            }
-            _ => return Err(format!("Unknown option: {arg}")),
-        }
-    }
-    // Resolve once so changing the foreground application cannot change file interpretation.
-    let cwd = env::current_dir().map_err(|e| e.to_string())?;
-    for path in [
-        &mut config.engine,
-        &mut config.model,
-        &mut config.vad_model,
-        &mut config.runtime,
-    ] {
-        if !path.is_absolute() {
-            *path = cwd.join(&*path);
-        }
-    }
-    Ok(LaunchAction::Run(config))
-}
+Options:
+  --cloud-trial <ali>
+        explicitly select the default Alibaba Model Studio /
+        qwen-audio-3.1-asr-flash-message / cn-beijing path. Configure locally
+        with scripts/configure-cloud-trial.ps1 (hidden key entry; current-user
+        Windows Credential Manager). LISTEN_ALI_API_KEY and
+        LISTEN_ALI_WORKSPACE_ID are optional process-local test injections.
+        Every paid attempt, including retries, shares the one persisted CNY 50
+        first-trial ledger; the panel reports this tool's cumulative and monthly
+        usage, and the CNY 100/month line is a reminder, never a hard stop.
+        Cannot be combined with --engine; there is no automatic cloud/local fallback.
+  --engine <sensevoice|whisper|whisper-cli.exe>
+        Select local recognition explicitly. sensevoice selects the resident local
+        engine; whisper or a path selects the whisper.cpp fallback. An explicit
+        engine deselects the cloud default and cannot be combined with
+        --cloud-trial.
+  --sherpa-lib <directory>
+        directory holding sherpa-onnx-c-api.dll and onnxruntime.dll.
+  --sensevoice-model <model.int8.onnx>
+        pinned SenseVoice q8 model.
+  --sensevoice-tokens <tokens.txt>
+        SenseVoice tokens.
+  --sensevoice-vad <silero_vad.onnx>
+        pinned Silero VAD model used as the non-speech gate.
+  --sensevoice-language <auto|zh|en|...>
+        SenseVoice language hint (default auto).
+  --model <ggml.bin> --vad-model <ggml-silero.bin> --language <zh|auto|...> --backend <host|cli>
+        whisper.cpp fallback settings; --backend host (default) keeps the model resident, cli starts one process per window.
+  --runtime <directory> --threads <count> --hidden
+        runtime files, recognition threads and start-hidden behavior.
+  --pending-audio-budget-mib <MiB>
+        pending capture audio allowed across every segment before a new capture is
+        refused and a running one is stopped (default 1024 = 1 GiB). The measurement
+        counts every segment's temporary upload, overlapping recognition windows and
+        repair/retry files, not just the final WAV. Saved text has its own bound.
+  --pending-audio-warn-mib <MiB>
+        pending audio at which the approaching-limit warning is shown; the warning
+        never stops anything (default: four fifths of the budget).
+  --free-disk-floor-mib <MiB>
+        free space that must remain on the runtime volume; at or below it no new
+        capture starts and a running one is stopped with its received audio kept
+        (default 1024 = 1 GiB). This is a storage condition, never a network wait.
+  --glossary <glossary.txt>
+        local UTF-8 term list, one term per line, re-read at every capture start
+        (default: <runtime>\\glossary.txt, then glossary.txt next to listen.exe;
+        the dev launcher passes packaging\\glossary.txt). A malformed file is
+        reported and the uncorrected transcript is still delivered.
+
+Control running application: --control <start|stop|toggle|retry|cleanup|show|panel|copy|refine|quit|delete-segment:<n>>
+Retry recognizes the same audio retained after a failed local recognition; cleanup deletes that audio.
+delete-segment:<n> deletes exactly one segment's pending recording and pending result (the
+capture order shown in the panel). Every other segment and unfinished task is untouched;
+a segment that is still recovering is stopped safely first, and late results cannot
+recreate it or write to a target.
+show opens the expanded result panel, panel toggles it and copy copies the complete current result to the clipboard.
+refine asks the DeepSeek API to correct the complete current result. Only that transcript text is sent, never the audio.
+The refined text replaces the appended transcript only while the original target still holds exactly what Listen wrote; if the target was edited, the refined text stays in the panel and the edit is preserved. Without DEEPSEEK_API_KEY in the local environment the refine entry is unavailable, and local recognition is unaffected.
+Clicking the status capsule toggles the expanded result panel; the panel shows the complete current result and the status detail. Text is never submitted as a message automatically.";
 
 fn main() {
     // A control invocation is part of a script or another automation. It must
     // never block on a modal dialog: report the failure on stderr and use the exit
     // code. Interactive launch errors keep the existing visible message.
     let control_mode = env::args().any(|argument| argument == "--control");
-    let result = match parse() {
-        Ok(LaunchAction::Run(config)) => gui::run(config),
+    let result = match launch::root() {
+        Ok(root) => launch::Config::parse(&root, env::args().skip(1)),
+        Err(error) => Err(error),
+    };
+    let result = match result {
+        Ok(LaunchAction::Run(config)) => {
+            // The window owns Application construction, so hand it the explicit term
+            // list (if any) before it starts. The file itself is re-read at every
+            // capture; without --glossary the application resolves its own default.
+            if let Some(glossary) = config.glossary() {
+                listen::glossary::set_default_path(glossary.to_path_buf());
+            }
+            gui::run(config)
+        }
         Ok(LaunchAction::Control(control)) => gui::control(&control),
         Ok(LaunchAction::Help) => {
             gui::show_help(HELP);

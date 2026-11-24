@@ -1,6 +1,6 @@
 //! Bounded PCM windows shared by WASAPI capture and controlled playback devices.
 //! Recognition receives paths, never an accumulating in-memory recording.
-use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText};
+use crate::{AppResult, CapturedAudio, LocalTranscriber, TimedText, recognition::ReadinessSignal};
 use std::{
     collections::VecDeque,
     fs::{self, File},
@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -53,6 +53,7 @@ pub struct Progress {
     recognized: AtomicU64,
     spool: AtomicU64,
     peak_pending: AtomicUsize,
+    cancelled: AtomicBool,
     error: Mutex<Option<String>>,
 }
 impl Progress {
@@ -65,6 +66,12 @@ impl Progress {
             spool_bytes: self.spool.load(Ordering::Relaxed),
             peak_pending_segments: self.peak_pending.load(Ordering::Relaxed),
         }
+    }
+    /// Ask the recognition worker to stop consuming buffered windows. The windows
+    /// it has not decoded yet stay on disk, so an aborted capture can still be
+    /// retained and retried instead of being silently deleted.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
     }
     pub fn failure(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
@@ -396,6 +403,8 @@ impl RecognitionWorker {
         stream: SegmentStream,
         transcriber: Arc<dyn LocalTranscriber>,
         directory: PathBuf,
+        readiness: Arc<ReadinessSignal>,
+        stable: mpsc::SyncSender<String>,
     ) -> Self {
         let progress = stream.progress.clone();
         let state = progress.clone();
@@ -403,7 +412,7 @@ impl RecognitionWorker {
             // A crashing local backend is a recoverable failure, not a silent stall.
             // Report it at once so capture stops and its audio is retained.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                recognize(stream, transcriber, directory)
+                recognize(stream, transcriber, directory, readiness, stable)
             }));
             let result = match outcome {
                 Ok(result) => result,
@@ -437,8 +446,11 @@ fn recognize(
     stream: SegmentStream,
     transcriber: Arc<dyn LocalTranscriber>,
     directory: PathBuf,
+    readiness: Arc<ReadinessSignal>,
+    stable: mpsc::SyncSender<String>,
 ) -> AppResult<RecognitionOutcome> {
     let mut committed = String::new();
+    let mut last_stable_len = 0;
     let mut tail = String::new();
     // Absolute sample position where the window that produced `tail` ended. A
     // later window that starts after this position cannot claim that text, so the
@@ -450,6 +462,20 @@ fn recognize(
         windows: 0,
     };
     while let Ok(segment) = stream.receiver.recv() {
+        if stream.progress.cancelled.load(Ordering::Acquire) {
+            // The capture was aborted (for example because the model could not be
+            // prepared). Keep this window's complete WAV on disk for the user's
+            // retry/cleanup controls instead of decoding and deleting it.
+            return Err(
+                "Local recognition was cancelled before this window was decoded; its audio was retained"
+                    .into(),
+            );
+        }
+        // First-use preparation may still be running when the first window closes.
+        // Wait for its outcome before decoding; a failed or wedged preparation is
+        // reported as a retained-audio failure instead of decoding against an
+        // unprepared engine. Once ready this is a single uncontended lock.
+        readiness.wait()?;
         let wait_ms = segment.queued_at.elapsed().as_millis() as u64;
         let workspace = segment.audio.path.parent().unwrap();
         let started = Instant::now();
@@ -509,6 +535,10 @@ fn recognize(
         })?;
         fs::rename(&staged, directory.join("partial-result.txt"))
             .map_err(|e| format!("Cannot commit recoverable transcript checkpoint: {e}"))?;
+        if !committed.trim().is_empty() && committed.len() != last_stable_len {
+            let _ = stable.try_send(committed.trim().to_string());
+            last_stable_len = committed.len();
+        }
         let bytes = fs::metadata(&segment.audio.path)
             .map_err(|e| e.to_string())?
             .len();
