@@ -26,6 +26,11 @@ pub(crate) mod segments;
 pub mod sensevoice;
 pub mod storage;
 pub mod streaming;
+/// Scripted adapters for integration tests. Hidden from the public documentation:
+/// no product path constructs them. Integration tests are their own crate, so a
+/// shared adapter has to live here rather than in a `tests/` support module.
+#[doc(hidden)]
+pub mod testing;
 pub mod usage;
 pub use usage::UsageSummary;
 #[cfg(windows)]

@@ -13,14 +13,12 @@ use listen::{
     AppResult, Application, CapturedAudio, Control, Delivery, Notice, Phase, SegmentState,
     Snapshot, Target, TargetSelection, Timing,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
-        SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
-        SessionUpdate,
+        SessionEvent, SessionFailure, SessionId, SessionResult, SessionState, SessionUpdate,
     },
     storage::{FreeSpace, StorageLevel, StoragePolicy},
+    testing::{ScriptedControl, ScriptedSessionControl, ScriptedSessions},
 };
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -110,142 +108,10 @@ impl Target for Bound {
     }
 }
 
-struct Controls {
-    stopped: AtomicBool,
-    state: Mutex<SessionState>,
-}
-impl Controls {
-    fn new(state: SessionState) -> Arc<Self> {
-        Arc::new(Self {
-            stopped: AtomicBool::new(false),
-            state: Mutex::new(state),
-        })
-    }
-    fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
-    }
-    fn set(&self, state: SessionState) {
-        *self.state.lock().unwrap() = state;
-    }
-}
-
-struct Started {
-    id: SessionId,
-    directory: PathBuf,
-    events: mpsc::Sender<SessionEvent>,
-    controls: Arc<Controls>,
-}
-
-#[derive(Default)]
-struct Registry {
-    entries: Mutex<Vec<Started>>,
-    usage: Mutex<HashMap<String, listen::recognition::SegmentUsage>>,
-}
-impl Registry {
-    fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        let entries = self.entries.lock().unwrap();
-        let entry = entries
-            .get(index)
-            .unwrap_or_else(|| panic!("no segment {} was started", index + 1));
-        (entry.id, entry.directory.clone(), entry.events.clone())
-    }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.entries.lock().unwrap()[index].controls.clone()
-    }
-    fn count(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-}
-
-struct Sessions {
-    registry: Arc<Registry>,
-}
-impl Sessions {
-    fn spawn(&self, request: &SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
-        // Every session keeps a little captured audio, exactly like a real
-        // adapter's spool; the tests add more when a condition needs it.
-        fs::write(request.directory.join("audio.wav"), b"captured audio")
-            .map_err(|error| error.to_string())?;
-        let (events, receiver) = mpsc::channel();
-        let controls = Controls::new(SessionState::Capturing);
-        self.registry.entries.lock().unwrap().push(Started {
-            id: request.id,
-            directory: request.directory.clone(),
-            events,
-            controls: controls.clone(),
-        });
-        Ok(Box::new(ControlledSession {
-            events: receiver,
-            controls,
-        }))
-    }
-}
-impl RecognitionSessions for Sessions {
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: listen::Preparation::Ready,
-            backend: Some("controlled storage recognition".into()),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request)
-    }
-    fn retry(
-        &mut self,
-        request: SessionRequest,
-        _audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request)
-    }
-    fn segment_usage(&self, directory: &Path) -> Option<listen::recognition::SegmentUsage> {
-        self.registry
-            .usage
-            .lock()
-            .unwrap()
-            .get(&directory.file_name()?.to_string_lossy().into_owned())
-            .cloned()
-    }
-}
-
-struct ControlledSession {
-    events: mpsc::Receiver<SessionEvent>,
-    controls: Arc<Controls>,
-}
-impl RecognitionSession for ControlledSession {
-    fn stop(&mut self) {
-        self.controls.stopped.store(true, Ordering::SeqCst);
-    }
-    fn status(&self) -> SessionStatus {
-        let state = if self.controls.stopped() {
-            SessionState::AwaitingFinal
-        } else {
-            *self.controls.state.lock().unwrap()
-        };
-        SessionStatus {
-            state,
-            progress: Default::default(),
-            endpoint: None,
-            detail: match state {
-                SessionState::AwaitingFinal => {
-                    "Waiting for whole-task confirmation; unconfirmed sentences are not delivered."
-                        .into()
-                }
-                _ => "Capturing continuous playback to local PCM before upload.".into(),
-            },
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
 struct Harness {
     runtime: Runtime,
     app: Application,
-    registry: Arc<Registry>,
+    script: ScriptedControl,
     editors: Vec<Arc<Editor>>,
     focus: Arc<FocusedEditors>,
     free: Arc<AtomicU64>,
@@ -285,22 +151,18 @@ impl Harness {
             editors: editors.clone(),
             focus: Mutex::new(0),
         });
-        let registry = Arc::new(Registry::default());
+        let adapter = ScriptedSessions::new().with_backend("controlled storage recognition");
+        let script = adapter.control();
         let free = Arc::new(AtomicU64::new(free_bytes));
-        let app = Application::with_recognition_sessions(
-            Box::new(Sessions {
-                registry: registry.clone(),
-            }),
-            runtime.0.clone(),
-            Ok(()),
-        )
-        .with_targets(focus.clone())
-        .with_storage_policy(policy)
-        .with_free_space(Arc::new(ControlledFreeSpace(free.clone())));
+        let app =
+            Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+                .with_targets(focus.clone())
+                .with_storage_policy(policy)
+                .with_free_space(Arc::new(ControlledFreeSpace(free.clone())));
         Self {
             runtime,
             app,
-            registry,
+            script,
             editors,
             focus,
             free,
@@ -323,19 +185,23 @@ impl Harness {
             "{:?}",
             self.snapshot()
         );
-        self.registry.count() - 1
+        self.script.count() - 1
     }
     fn stop(&mut self) {
         self.app.dispatch(Control::Stop);
     }
     fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        self.registry.entry(index)
+        let session = self.script.session(index);
+        (session.id(), session.directory(), session.sender())
     }
     fn segment_dir(&self, index: usize) -> PathBuf {
-        self.entry(index).1
+        self.script.session(index).directory()
     }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.registry.controls(index)
+    fn controls(&self, index: usize) -> ScriptedSessionControl {
+        self.script.session(index)
+    }
+    fn stopped(&self, index: usize) -> bool {
+        self.script.session(index).stop_count() > 0
     }
     fn draft(&self, editor: usize) -> String {
         self.editors[editor].draft.lock().unwrap().clone()
@@ -472,7 +338,7 @@ fn pending_audio_is_counted_across_segments_and_a_full_budget_stops_the_capture_
         snapshot.phase == Phase::Processing
     });
     assert!(
-        h.controls(second).stopped(),
+        h.stopped(second),
         "the capture must be stopped instead of pretending to keep recording: {stopped:?}"
     );
     let status = stopped.storage.clone().expect("storage status");
@@ -718,7 +584,7 @@ fn the_free_disk_floor_stops_a_running_capture_and_keeps_the_received_audio() {
         snapshot.phase == Phase::Processing
     });
     assert!(
-        h.controls(first).stopped(),
+        h.stopped(first),
         "capture stops when the disk floor is reached: {stopped:?}"
     );
     assert!(directory.join("playback.pcm").is_file());
@@ -830,7 +696,7 @@ fn deleting_a_selected_pending_result_removes_only_it_and_a_late_event_cannot_re
 fn deleting_a_recovering_segment_stops_its_later_processing_and_keeps_the_new_capture() {
     let mut h = Harness::new(&["一段草稿", "二段草稿"], budget_policy(1 << 20), 1 << 30);
     let first = h.start(0);
-    h.controls(first).set(SessionState::WaitingForNetwork);
+    h.controls(first).set_state(SessionState::WaitingForNetwork);
     h.poll_until("segment 1 waiting for the network", |snapshot| {
         snapshot.segments.iter().any(|segment| {
             segment.sequence == 1 && segment.state == SegmentState::WaitingForNetwork
@@ -971,7 +837,7 @@ fn the_live_capture_cannot_be_deleted_and_is_left_recording() {
     assert_eq!(after.segments.len(), 1);
     assert!(directory.is_dir());
     assert!(
-        !h.controls(first).stopped(),
+        !h.stopped(first),
         "a refused delete must not stop the capture"
     );
 }

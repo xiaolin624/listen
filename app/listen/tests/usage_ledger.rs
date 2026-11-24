@@ -7,17 +7,13 @@
 //! ledger file with an independent JSON fixture so the summary is derived from the
 //! same facts a restart would read, not from private helpers.
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Phase, PlaybackAudio, Preparation, Recording,
-    Target, TargetSelection, UsageSummary,
+    AppResult, Application, CapturedAudio, Control, Phase, PlaybackAudio, Recording, Target,
+    TargetSelection, UsageSummary,
     cloud::{
         AliSettings, CloudError, CloudSessions, CredentialSource, MessageSocket, MessageTransport,
         PcmSpoolWriter, PcmStream, Secret, TrialLedger, VerifiedBounds,
     },
-    recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent, SessionId,
-        SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
-    },
-    streaming::CaptureProgress,
+    testing::{ScriptedControl, ScriptedSessions},
 };
 use serde_json::{Value, json};
 use std::{
@@ -59,108 +55,6 @@ impl Drop for Runtime {
     }
 }
 
-/// A controlled recognition adapter. It reports whatever cumulative usage the test
-/// publishes and lets the test finish the current session, so the application's own
-/// reminder and refresh rules can be observed without a vendor.
-struct ControlledSessions {
-    usage: Arc<Mutex<UsageSummary>>,
-    session: Arc<Mutex<Option<mpsc::Sender<SessionUpdate>>>>,
-}
-impl ControlledSessions {
-    fn new(usage: UsageSummary) -> (Self, Arc<Mutex<UsageSummary>>, SessionControl) {
-        let usage = Arc::new(Mutex::new(usage));
-        let session = Arc::new(Mutex::new(None));
-        (
-            Self {
-                usage: usage.clone(),
-                session: session.clone(),
-            },
-            usage,
-            SessionControl(session),
-        )
-    }
-}
-struct SessionControl(Arc<Mutex<Option<mpsc::Sender<SessionUpdate>>>>);
-impl SessionControl {
-    fn finish(&self, text: &str) {
-        self.0
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("a capture is running")
-            .send(SessionUpdate::Finished(SessionResult {
-                text: text.into(),
-                description: "controlled playback".into(),
-                timing: listen::Timing::default(),
-                stopped_at: None,
-                recovered: false,
-            }))
-            .unwrap();
-    }
-}
-impl RecognitionSessions for ControlledSessions {
-    fn usage(&mut self) -> Option<UsageSummary> {
-        Some(self.usage.lock().unwrap().clone())
-    }
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: Preparation::Ready,
-            backend: Some(
-                "Cloud trial: controlled provider; model=controlled; region=controlled".into(),
-            ),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir_all(&request.directory).map_err(|error| error.to_string())?;
-        let (tx, rx) = mpsc::channel();
-        *self.session.lock().unwrap() = Some(tx);
-        Ok(Box::new(ControlledSession {
-            id: request.id,
-            rx,
-            state: SessionState::Capturing,
-        }))
-    }
-    fn retry(
-        &mut self,
-        _request: SessionRequest,
-        _audio: listen::CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        Err("the controlled surface does not retry".into())
-    }
-}
-struct ControlledSession {
-    id: SessionId,
-    rx: mpsc::Receiver<SessionUpdate>,
-    state: SessionState,
-}
-impl RecognitionSession for ControlledSession {
-    fn stop(&mut self) {
-        self.state = SessionState::AwaitingFinal;
-    }
-    fn status(&self) -> SessionStatus {
-        SessionStatus {
-            state: self.state,
-            progress: CaptureProgress::default(),
-            endpoint: None,
-            detail: "Controlled cloud capture".into(),
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        let update = self.rx.try_recv().ok()?;
-        self.state = match update {
-            SessionUpdate::Finished(_) => SessionState::Complete,
-            SessionUpdate::Failed(_) => SessionState::Failed,
-            SessionUpdate::Stable(_) => self.state,
-        };
-        Some(SessionEvent {
-            id: self.id,
-            update,
-        })
-    }
-}
-
 fn wait(app: &mut Application, phase: Phase) -> listen::Snapshot {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -195,20 +89,23 @@ fn summary(month_confirmed: u64, month_estimated: u64) -> UsageSummary {
     }
 }
 
-fn application(
-    runtime: &Runtime,
-    usage: UsageSummary,
-) -> (Application, Arc<Mutex<UsageSummary>>, SessionControl) {
-    let (sessions, usage, control) = ControlledSessions::new(usage);
-    let app = Application::with_recognition_sessions(Box::new(sessions), runtime.app(), Ok(()));
-    (app, usage, control)
+/// The application driven by the scripted adapter, which reports the summary and
+/// lets the test finish the running session. The application's own reminder and
+/// refresh rules are observed without a vendor.
+fn application(runtime: &Runtime, usage: UsageSummary) -> (Application, ScriptedControl) {
+    let adapter = ScriptedSessions::new()
+        .with_backend("Cloud trial: controlled provider; model=controlled; region=controlled")
+        .with_usage(usage);
+    let control = adapter.control();
+    let app = Application::with_recognition_sessions(Box::new(adapter), runtime.app(), Ok(()));
+    (app, control)
 }
 
 #[test]
 fn usage_from_the_recognition_adapter_is_visible_before_and_during_a_capture() {
     let runtime = Runtime::new();
     let reported = summary(420_000_000, 28_500_000_000);
-    let (mut app, _, _) = application(&runtime, reported.clone());
+    let (mut app, _) = application(&runtime, reported.clone());
 
     // The cost is a fact about the ledger, not about the current capture: it is
     // readable before the user starts anything.
@@ -760,7 +657,7 @@ fn approaching_the_monthly_line_notifies_without_touching_the_trial_cap() {
     let near_the_line = summary(90_000_000_000, 0);
     assert!(near_the_line.reminder_reached());
     assert!(near_the_line.month_nanoyuan() < listen::UsageSummary::MONTH_REMINDER_NANOYUAN);
-    let (mut app, _, control) = application(&runtime, near_the_line);
+    let (mut app, control) = application(&runtime, near_the_line);
 
     let ready = app.snapshot();
     assert_eq!(ready.notice, Some(listen::Notice::UsageReminder));
@@ -774,7 +671,7 @@ fn approaching_the_monthly_line_notifies_without_touching_the_trial_cap() {
     app.dispatch(Control::Start);
     assert_eq!(app.snapshot().phase, Phase::Capturing);
     app.dispatch(Control::Stop);
-    control.finish("接近提醒线也照常完成");
+    control.last().finish("接近提醒线也照常完成");
     let result = wait(&mut app, Phase::Result);
     assert_eq!(result.text, "接近提醒线也照常完成");
     assert_eq!(result.notice, Some(listen::Notice::UsageReminder));
@@ -790,7 +687,7 @@ fn the_monthly_reminder_does_not_interrupt_a_capture_or_its_delivery() {
     // This month's own usage already reached the 100 CNY reminder line.
     let over_the_line = summary(120_000_000_000, 0);
     assert!(over_the_line.reminder_reached());
-    let (mut app, _, control) = application(&runtime, over_the_line);
+    let (mut app, control) = application(&runtime, over_the_line);
 
     // The reminder is visible as soon as the application can read the ledger, and
     // it explicitly says the feature keeps working.
@@ -809,7 +706,7 @@ fn the_monthly_reminder_does_not_interrupt_a_capture_or_its_delivery() {
     // Nor does it cancel the capture: stopping still produces the complete
     // result, and the result is delivered normally.
     app.dispatch(Control::Stop);
-    control.finish("提醒之后仍然完成");
+    control.last().finish("提醒之后仍然完成");
     let result = wait(&mut app, Phase::Result);
     assert_eq!(result.text, "提醒之后仍然完成");
     assert_eq!(result.delivery, Some(listen::Delivery::Fallback));

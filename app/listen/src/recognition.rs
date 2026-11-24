@@ -117,6 +117,12 @@ pub struct SessionEvent {
     pub update: SessionUpdate,
 }
 
+/// What an adapter answers when its engine cannot process retained audio again.
+/// The application shows this as the reason a retry did not start a session; it is
+/// the fail-closed answer for an engine whose `retry` stays at the default.
+pub const RETRY_UNSUPPORTED: &str =
+    "This recognition engine does not support retrying a retained recording";
+
 /// The replaceable recognition seam. A session owns capture, continuous audio
 /// consumption and stop/final confirmation. A future streaming adapter can feed
 /// PCM directly to its engine here; it need not implement LocalTranscriber or use
@@ -134,13 +140,29 @@ pub trait RecognitionSessions: Send {
     fn usage(&mut self) -> Option<UsageSummary> {
         None
     }
-    fn preparation(&mut self) -> RecognitionReadiness;
+    /// An engine with nothing to prepare reports Ready. `start` stays the
+    /// fail-closed gate: an adapter that is not actually ready answers there, so
+    /// the default never turns a missing readiness answer into a capture that
+    /// silently records without recognition.
+    fn preparation(&mut self) -> RecognitionReadiness {
+        RecognitionReadiness {
+            state: Preparation::Ready,
+            backend: None,
+            elapsed_ms: None,
+            error: None,
+        }
+    }
     fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>>;
+    /// Retained audio can only be processed again by an engine that supports it.
+    /// The default answers with the reason and spawns no session, so an adapter
+    /// without retry support never has to fake a worker that could only fail.
     fn retry(
         &mut self,
-        request: SessionRequest,
-        audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>>;
+        _request: SessionRequest,
+        _audio: CapturedAudio,
+    ) -> AppResult<Box<dyn RecognitionSession>> {
+        Err(RETRY_UNSUPPORTED.into())
+    }
     /// What this engine knows about one segment's paid usage, for the segment's
     /// own durable record. The default reports nothing (the local engine meters no
     /// cost), so an adapter that cannot measure usage never invents a number.

@@ -7,21 +7,17 @@
 #![cfg(windows)]
 
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Delivery, Phase, Preparation, SegmentState,
-    Target, TargetSelection, Timing,
-    recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent, SessionId,
-        SessionRequest, SessionResult, SessionState, SessionStatus, SessionUpdate,
-    },
+    AppResult, Application, Control, Delivery, Phase, SegmentState, Target, TargetSelection,
+    Timing,
+    recognition::{SessionEvent, SessionId, SessionResult, SessionState, SessionUpdate},
+    testing::{ScriptedControl, ScriptedSessions},
 };
 use std::{
-    collections::VecDeque,
     fs,
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -47,65 +43,6 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A recognition adapter whose final event the test sends. It records nothing
-/// about time itself: every duration on the stop path is either injected through
-/// `SessionResult::timing` or measured by the application and the target.
-struct ScriptedSessions {
-    inputs: VecDeque<mpsc::Receiver<SessionEvent>>,
-    started: mpsc::Sender<SessionId>,
-}
-struct ScriptedSession {
-    events: mpsc::Receiver<SessionEvent>,
-    stopped: bool,
-}
-impl RecognitionSessions for ScriptedSessions {
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: Preparation::Ready,
-            backend: Some("scripted recognition".into()),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
-        fs::write(request.directory.join("audio.wav"), b"retained capture")
-            .map_err(|error| error.to_string())?;
-        self.started.send(request.id).unwrap();
-        Ok(Box::new(ScriptedSession {
-            events: self.inputs.pop_front().ok_or("missing scripted session")?,
-            stopped: false,
-        }))
-    }
-    fn retry(
-        &mut self,
-        _request: SessionRequest,
-        _audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        Err("no retained capture in this scenario".into())
-    }
-}
-impl RecognitionSession for ScriptedSession {
-    fn stop(&mut self) {
-        self.stopped = true;
-    }
-    fn status(&self) -> SessionStatus {
-        SessionStatus {
-            state: if self.stopped {
-                SessionState::AwaitingFinal
-            } else {
-                SessionState::Capturing
-            },
-            progress: Default::default(),
-            endpoint: None,
-            detail: "scripted recognition session".into(),
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
     }
 }
 
@@ -151,12 +88,11 @@ struct Harness {
     runtime: Runtime,
     editor: Arc<Editor>,
     app: Application,
-    ids: mpsc::Receiver<SessionId>,
-    inputs: Vec<mpsc::Sender<SessionEvent>>,
+    script: ScriptedControl,
 }
 
 impl Harness {
-    fn new(sessions: usize, draft: &str, read_ms: u64, write_ms: u64) -> Self {
+    fn new(draft: &str, read_ms: u64, write_ms: u64) -> Self {
         let runtime = Runtime::new();
         let editor = Arc::new(Editor {
             draft: Mutex::new(draft.into()),
@@ -166,29 +102,16 @@ impl Harness {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         });
-        let mut receivers = VecDeque::new();
-        let mut inputs = Vec::new();
-        for _ in 0..sessions {
-            let (tx, rx) = mpsc::channel();
-            receivers.push_back(rx);
-            inputs.push(tx);
-        }
-        let (started, ids) = mpsc::channel();
-        let app = Application::with_recognition_sessions(
-            Box::new(ScriptedSessions {
-                inputs: receivers,
-                started,
-            }),
-            runtime.0.clone(),
-            Ok(()),
-        )
-        .with_targets(Arc::new(Selection(editor.clone())));
+        let adapter = ScriptedSessions::new();
+        let script = adapter.control();
+        let app =
+            Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+                .with_targets(Arc::new(Selection(editor.clone())));
         Self {
             runtime,
             editor,
             app,
-            ids,
-            inputs,
+            script,
         }
     }
 
@@ -200,7 +123,7 @@ impl Harness {
             "start must capture: {:?}",
             self.app.snapshot()
         );
-        self.ids.recv().unwrap()
+        self.script.last().id()
     }
 
     fn stop(&mut self) {
@@ -208,18 +131,16 @@ impl Harness {
     }
 
     fn finish(&self, index: usize, id: SessionId, text: &str, timing: Timing) {
-        self.inputs[index]
-            .send(SessionEvent {
-                id,
-                update: SessionUpdate::Finished(SessionResult {
-                    text: text.into(),
-                    description: "scripted playback".into(),
-                    timing,
-                    stopped_at: None,
-                    recovered: false,
-                }),
-            })
-            .unwrap();
+        self.script.session(index).send_event(SessionEvent {
+            id,
+            update: SessionUpdate::Finished(SessionResult {
+                text: text.into(),
+                description: "scripted playback".into(),
+                timing,
+                stopped_at: None,
+                recovered: false,
+            }),
+        });
     }
 
     fn draft(&self) -> String {
@@ -249,7 +170,7 @@ fn option(timing: &Timing, field: fn(&Timing) -> Option<u64>, name: &str) -> u64
 
 #[test]
 fn one_confirmed_backfill_reports_stop_to_confirmed_and_every_stage() {
-    let mut harness = Harness::new(1, "原有草稿", 5, 25);
+    let mut harness = Harness::new("原有草稿", 5, 25);
     let id = harness.start();
     harness.stop();
     harness.finish(0, id, "第一行：Rust 和 WASAPI。", Timing::default());
@@ -357,7 +278,7 @@ fn one_confirmed_backfill_reports_stop_to_confirmed_and_every_stage() {
 
 #[test]
 fn a_cloud_result_keeps_its_own_whole_task_confirmation_stages() {
-    let mut harness = Harness::new(1, "草稿", 0, 0);
+    let mut harness = Harness::new("草稿", 0, 0);
     let id = harness.start();
     harness.stop();
     let adapter = Timing {
@@ -390,7 +311,7 @@ fn a_cloud_result_keeps_its_own_whole_task_confirmation_stages() {
 
 #[test]
 fn a_fallback_never_reports_a_confirmed_target_read_back() {
-    let mut harness = Harness::new(1, "草稿", 5, 5);
+    let mut harness = Harness::new("草稿", 5, 5);
     *harness.editor.fail_write.lock().unwrap() = Some("The original target is read-only".into());
     let id = harness.start();
     harness.stop();
@@ -420,7 +341,7 @@ fn two_results_that_confirm_together_are_appended_in_capture_order() {
     // Both segments target the same editor and confirm close together. The newest
     // segment is still processed and saved first (#38), but the target append order
     // is capture order: the older sentence must never land after the newer one.
-    let mut harness = Harness::new(2, "合并草稿", 0, 20);
+    let mut harness = Harness::new("合并草稿", 0, 20);
     let first = harness.start();
     harness.stop();
     let second = harness.start();
@@ -473,7 +394,7 @@ fn two_results_that_confirm_together_are_appended_in_capture_order() {
 fn an_older_segment_never_delays_a_newer_segments_save_or_delivery() {
     // A 50 ms write keeps both deliveries in flight while the first poll applies the
     // two session events, so the saves can be observed before the deliveries.
-    let mut harness = Harness::new(2, "合并草稿", 0, 50);
+    let mut harness = Harness::new("合并草稿", 0, 50);
     let first = harness.start();
     harness.stop();
     // A new capture is admitted while the older segment is still processing.
@@ -585,7 +506,7 @@ fn an_older_segment_never_delays_a_newer_segments_save_or_delivery() {
 #[test]
 fn the_delivery_history_is_bounded_while_confirmed_appends_keep_working() {
     let segments = 60;
-    let mut harness = Harness::new(segments, "草稿", 0, 0);
+    let mut harness = Harness::new("草稿", 0, 0);
     let mut first_save_ms = None;
     let mut last_save_ms = None;
     for index in 0..segments {

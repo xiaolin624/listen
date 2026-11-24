@@ -11,10 +11,9 @@ use listen::{
     AppResult, Application, CapturedAudio, Control, Delivery, Phase, Refine, RefineText, Snapshot,
     Target, TargetSelection, Timing,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
-        SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
-        SessionUpdate,
+        SessionEvent, SessionFailure, SessionId, SessionResult, SessionState, SessionUpdate,
     },
+    testing::{ScriptedControl, ScriptedSessions},
 };
 use std::{
     fs,
@@ -145,126 +144,6 @@ impl Target for Bound {
     }
 }
 
-/// The per-session controls: whether it was stopped and which state it reports
-/// while it is alive.
-struct Controls {
-    stopped: AtomicBool,
-    state: Mutex<SessionState>,
-}
-impl Controls {
-    fn set(&self, state: SessionState) {
-        *self.state.lock().unwrap() = state;
-    }
-}
-
-struct Started {
-    id: SessionId,
-    directory: PathBuf,
-    events: mpsc::Sender<SessionEvent>,
-    controls: Arc<Controls>,
-}
-
-#[derive(Default)]
-struct Registry {
-    entries: Mutex<Vec<Started>>,
-}
-impl Registry {
-    fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        let entries = self.entries.lock().unwrap();
-        let entry = entries
-            .get(index)
-            .unwrap_or_else(|| panic!("no segment {} was started", index + 1));
-        (entry.id, entry.directory.clone(), entry.events.clone())
-    }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.entries.lock().unwrap()[index].controls.clone()
-    }
-    fn count(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-}
-
-struct Sessions {
-    registry: Arc<Registry>,
-}
-impl Sessions {
-    fn spawn(&self, request: &SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
-        fs::write(request.directory.join("audio.wav"), b"captured segment")
-            .map_err(|error| error.to_string())?;
-        let (events, receiver) = mpsc::channel();
-        let controls = Arc::new(Controls {
-            stopped: AtomicBool::new(false),
-            state: Mutex::new(SessionState::Capturing),
-        });
-        self.registry.entries.lock().unwrap().push(Started {
-            id: request.id,
-            directory: request.directory.clone(),
-            events,
-            controls: controls.clone(),
-        });
-        Ok(Box::new(ControlledSession {
-            events: receiver,
-            controls,
-        }))
-    }
-}
-impl RecognitionSessions for Sessions {
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: listen::Preparation::Ready,
-            backend: Some("controlled late-backfill recognition".into()),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request)
-    }
-    fn retry(
-        &mut self,
-        request: SessionRequest,
-        _audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request)
-    }
-}
-
-struct ControlledSession {
-    events: mpsc::Receiver<SessionEvent>,
-    controls: Arc<Controls>,
-}
-impl RecognitionSession for ControlledSession {
-    fn stop(&mut self) {
-        self.controls.stopped.store(true, Ordering::SeqCst);
-    }
-    fn status(&self) -> SessionStatus {
-        let state = if self.controls.stopped.load(Ordering::SeqCst) {
-            SessionState::AwaitingFinal
-        } else {
-            *self.controls.state.lock().unwrap()
-        };
-        SessionStatus {
-            state,
-            progress: Default::default(),
-            endpoint: None,
-            detail: match state {
-                SessionState::WaitingForNetwork => {
-                    "Waiting for the network. The received playback is saved on this machine; Listen retries the cloud connection automatically.".into()
-                }
-                SessionState::AwaitingFinal => {
-                    "Waiting for whole-task cloud confirmation; unconfirmed sentences are not delivered."
-                        .into()
-                }
-                _ => "Capturing continuous playback to local PCM before upload.".into(),
-            },
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
 /// A controllable 精修 port: it records exactly which transcript it was given and
 /// returns a recognisable correction without any network.
 #[derive(Default)]
@@ -289,7 +168,7 @@ impl RefineText for Refiner {
 struct Harness {
     runtime: Runtime,
     app: Application,
-    registry: Arc<Registry>,
+    script: ScriptedControl,
     editors: Vec<Arc<Editor>>,
     focus: Arc<FocusedEditors>,
     refiner: Arc<Refiner>,
@@ -306,21 +185,17 @@ impl Harness {
             editors: editors.clone(),
             focus: Mutex::new(Some(0)),
         });
-        let registry = Arc::new(Registry::default());
+        let adapter = ScriptedSessions::new().with_backend("controlled late-backfill recognition");
+        let script = adapter.control();
         let refiner = Arc::new(Refiner::default());
-        let app = Application::with_recognition_sessions(
-            Box::new(Sessions {
-                registry: registry.clone(),
-            }),
-            runtime.0.clone(),
-            Ok(()),
-        )
-        .with_targets(focus.clone())
-        .with_refine(refiner.clone());
+        let app =
+            Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+                .with_targets(focus.clone())
+                .with_refine(refiner.clone());
         Self {
             runtime,
             app,
-            registry,
+            script,
             editors,
             focus,
             refiner,
@@ -338,7 +213,7 @@ impl Harness {
             "{:?}",
             self.snapshot()
         );
-        self.registry.count() - 1
+        self.script.count() - 1
     }
     /// Start a capture while the foreground is not a supported editable target.
     fn start_without_target(&mut self) -> usize {
@@ -350,7 +225,7 @@ impl Harness {
             "{:?}",
             self.snapshot()
         );
-        self.registry.count() - 1
+        self.script.count() - 1
     }
     fn focus(&self, editor: Option<usize>) {
         *self.focus.focus.lock().unwrap() = editor;
@@ -359,13 +234,13 @@ impl Harness {
         self.app.dispatch(Control::Stop);
     }
     fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        self.registry.entry(index)
-    }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.registry.controls(index)
+        let session = self.script.session(index);
+        (session.id(), session.directory(), session.sender())
     }
     fn waiting_for_network(&self, index: usize) {
-        self.controls(index).set(SessionState::WaitingForNetwork);
+        self.script
+            .session(index)
+            .set_state(SessionState::WaitingForNetwork);
     }
     fn draft(&self, editor: usize) -> String {
         self.editors[editor].draft()

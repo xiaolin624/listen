@@ -11,20 +11,15 @@ use listen::{
     AppResult, Application, CapturedAudio, Control, Delivery, Phase, SegmentState, Snapshot,
     Target, TargetSelection, Timing,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SegmentUsage, SessionEvent,
-        SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
+        SegmentUsage, SessionEvent, SessionFailure, SessionId, SessionResult, SessionState,
         SessionUpdate,
     },
+    testing::{ScriptedControl, ScriptedSessions},
 };
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, atomic::Ordering, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -108,159 +103,10 @@ impl Editor {
     }
 }
 
-/// Per-session controls the test drives: whether the capture was stopped and which
-/// state the recognition adapter reports while it is alive.
-struct Controls {
-    stopped: AtomicBool,
-    state: Mutex<SessionState>,
-}
-impl Controls {
-    fn new(state: SessionState) -> Arc<Self> {
-        Arc::new(Self {
-            stopped: AtomicBool::new(false),
-            state: Mutex::new(state),
-        })
-    }
-    fn set(&self, state: SessionState) {
-        *self.state.lock().unwrap() = state;
-    }
-    fn state(&self) -> SessionState {
-        *self.state.lock().unwrap()
-    }
-}
-
-struct Started {
-    id: SessionId,
-    directory: PathBuf,
-    events: mpsc::Sender<SessionEvent>,
-    controls: Arc<Controls>,
-}
-
-#[derive(Default)]
-struct Registry {
-    entries: Mutex<Vec<Started>>,
-    usage: Mutex<HashMap<String, SegmentUsage>>,
-}
-impl Registry {
-    fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        let entries = self.entries.lock().unwrap();
-        let entry = entries
-            .get(index)
-            .unwrap_or_else(|| panic!("no segment {} was started", index + 1));
-        (entry.id, entry.directory.clone(), entry.events.clone())
-    }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.entries.lock().unwrap()[index].controls.clone()
-    }
-    fn count(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-    fn set_usage(&self, directory: &Path, usage: SegmentUsage) {
-        self.usage.lock().unwrap().insert(
-            directory
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            usage,
-        );
-    }
-}
-
-struct Sessions {
-    registry: Arc<Registry>,
-}
-impl Sessions {
-    fn spawn(
-        &self,
-        request: &SessionRequest,
-        state: SessionState,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
-        fs::write(request.directory.join("audio.wav"), b"captured segment")
-            .map_err(|error| error.to_string())?;
-        let (events, receiver) = mpsc::channel();
-        let controls = Controls::new(state);
-        self.registry.entries.lock().unwrap().push(Started {
-            id: request.id,
-            directory: request.directory.clone(),
-            events,
-            controls: controls.clone(),
-        });
-        Ok(Box::new(ControlledSession {
-            events: receiver,
-            controls,
-        }))
-    }
-}
-impl RecognitionSessions for Sessions {
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: listen::Preparation::Ready,
-            backend: Some("controlled multi-segment recognition".into()),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request, SessionState::Capturing)
-    }
-    fn retry(
-        &mut self,
-        request: SessionRequest,
-        _audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        self.spawn(&request, SessionState::AwaitingFinal)
-    }
-    fn segment_usage(&self, directory: &Path) -> Option<SegmentUsage> {
-        self.registry
-            .usage
-            .lock()
-            .unwrap()
-            .get(&directory.file_name()?.to_string_lossy().into_owned())
-            .cloned()
-    }
-}
-
-struct ControlledSession {
-    events: mpsc::Receiver<SessionEvent>,
-    controls: Arc<Controls>,
-}
-impl RecognitionSession for ControlledSession {
-    fn stop(&mut self) {
-        self.controls.stopped.store(true, Ordering::SeqCst);
-    }
-    fn status(&self) -> SessionStatus {
-        let state = if self.controls.stopped.load(Ordering::SeqCst) {
-            SessionState::AwaitingFinal
-        } else {
-            self.controls.state()
-        };
-        SessionStatus {
-            state,
-            progress: Default::default(),
-            endpoint: None,
-            detail: match state {
-                SessionState::WaitingForNetwork => {
-                    "Waiting for the network. The received playback is saved on this machine; Listen retries the cloud connection automatically.".into()
-                }
-                SessionState::AwaitingFinal => {
-                    "Waiting for whole-task cloud confirmation; unconfirmed sentences are not delivered."
-                        .into()
-                }
-                _ => "Capturing continuous playback to local PCM before upload.".into(),
-            },
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
 struct Harness {
     runtime: Runtime,
     app: Application,
-    registry: Arc<Registry>,
+    script: ScriptedControl,
     editors: Vec<Arc<Editor>>,
     focus: Arc<FocusedEditors>,
 }
@@ -275,19 +121,15 @@ impl Harness {
             editors: editors.clone(),
             focus: Mutex::new(0),
         });
-        let registry = Arc::new(Registry::default());
-        let app = Application::with_recognition_sessions(
-            Box::new(Sessions {
-                registry: registry.clone(),
-            }),
-            runtime.0.clone(),
-            Ok(()),
-        )
-        .with_targets(focus.clone());
+        let adapter = ScriptedSessions::new().with_backend("controlled multi-segment recognition");
+        let script = adapter.control();
+        let app =
+            Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+                .with_targets(focus.clone());
         Self {
             runtime,
             app,
-            registry,
+            script,
             editors,
             focus,
         }
@@ -306,16 +148,14 @@ impl Harness {
             "{:?}",
             self.snapshot()
         );
-        self.registry.count() - 1
+        self.script.count() - 1
     }
     fn stop(&mut self) {
         self.app.dispatch(Control::Stop);
     }
     fn entry(&self, index: usize) -> (SessionId, PathBuf, mpsc::Sender<SessionEvent>) {
-        self.registry.entry(index)
-    }
-    fn controls(&self, index: usize) -> Arc<Controls> {
-        self.registry.controls(index)
+        let session = self.script.session(index);
+        (session.id(), session.directory(), session.sender())
     }
     fn draft(&self, editor: usize) -> String {
         self.editors[editor].draft.lock().unwrap().clone()
@@ -393,7 +233,9 @@ impl Harness {
             .unwrap();
     }
     fn waiting_for_network(&self, index: usize) {
-        self.controls(index).set(SessionState::WaitingForNetwork);
+        self.script
+            .session(index)
+            .set_state(SessionState::WaitingForNetwork);
     }
     fn runtime(&self) -> &Path {
         &self.runtime.0
@@ -671,7 +513,7 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
     let mut h = Harness::new(&["草稿一", "草稿二", "草稿三", "草稿四"]);
     let first = h.start(0);
     let (_, first_directory, _) = h.entry(first);
-    h.registry.set_usage(
+    h.script.set_segment_usage(
         &first_directory,
         SegmentUsage {
             provider: "Alibaba Model Studio".into(),
@@ -689,7 +531,7 @@ fn every_segment_saves_its_own_audio_text_state_and_cost_without_overwriting_an_
     h.set_draft(0, "草稿一\n用户改写");
     let second = h.start(1);
     let (_, second_directory, _) = h.entry(second);
-    h.registry.set_usage(
+    h.script.set_segment_usage(
         &second_directory,
         SegmentUsage {
             provider: "Alibaba Model Studio".into(),

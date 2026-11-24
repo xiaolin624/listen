@@ -1,19 +1,16 @@
 //! User workflows driven through the same application interface as the hotkey.
 //! The recognition adapter controls confirmation timing, never target delivery.
 use listen::{
-    AppResult, Application, CapturedAudio, Control, Delivery, Phase, Preparation, Target,
-    TargetSelection, Timing,
+    AppResult, Application, Control, Delivery, Phase, Target, TargetSelection, Timing,
     recognition::{
-        RecognitionReadiness, RecognitionSession, RecognitionSessions, SessionEvent,
-        SessionFailure, SessionId, SessionRequest, SessionResult, SessionState, SessionStatus,
-        SessionUpdate,
+        SessionEvent, SessionFailure, SessionId, SessionResult, SessionState, SessionUpdate,
     },
+    testing::ScriptedSessions,
 };
 use std::{
-    collections::VecDeque,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -64,65 +61,6 @@ impl Target for BoundEditor {
     }
 }
 
-struct ControlledSessions {
-    inputs: VecDeque<mpsc::Receiver<SessionEvent>>,
-    started: mpsc::Sender<SessionId>,
-}
-struct ControlledSession {
-    events: mpsc::Receiver<SessionEvent>,
-    stopped: bool,
-}
-impl RecognitionSessions for ControlledSessions {
-    fn preparation(&mut self) -> RecognitionReadiness {
-        RecognitionReadiness {
-            state: Preparation::Ready,
-            backend: Some("controlled recognition".into()),
-            elapsed_ms: None,
-            error: None,
-        }
-    }
-    fn start(&mut self, request: SessionRequest) -> AppResult<Box<dyn RecognitionSession>> {
-        fs::create_dir(&request.directory).map_err(|error| error.to_string())?;
-        fs::write(request.directory.join("audio.wav"), b"retained capture")
-            .map_err(|error| error.to_string())?;
-        self.started.send(request.id).unwrap();
-        Ok(Box::new(ControlledSession {
-            events: self
-                .inputs
-                .pop_front()
-                .ok_or("missing controlled session")?,
-            stopped: false,
-        }))
-    }
-    fn retry(
-        &mut self,
-        _request: SessionRequest,
-        _audio: CapturedAudio,
-    ) -> AppResult<Box<dyn RecognitionSession>> {
-        Err("no retained capture in this scenario".into())
-    }
-}
-impl RecognitionSession for ControlledSession {
-    fn stop(&mut self) {
-        self.stopped = true;
-    }
-    fn status(&self) -> SessionStatus {
-        SessionStatus {
-            state: if self.stopped {
-                SessionState::AwaitingFinal
-            } else {
-                SessionState::Capturing
-            },
-            progress: Default::default(),
-            endpoint: None,
-            detail: "controlled recognition session".into(),
-        }
-    }
-    fn poll(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
 fn wait_for_result(app: &mut Application) -> listen::Snapshot {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -161,24 +99,18 @@ fn stable_sentences_wait_for_stop_and_complete_confirmation_before_appending() {
     )
     .unwrap();
     let editor = Arc::new(Editor(Mutex::new("initial draft".into())));
-    let (events, input) = mpsc::channel();
-    let (started, ids) = mpsc::channel();
-    let sessions = ControlledSessions {
-        inputs: VecDeque::from([input]),
-        started,
-    };
+    let adapter = ScriptedSessions::new();
+    let script = adapter.control();
     let mut app =
-        Application::with_recognition_sessions(Box::new(sessions), runtime.0.clone(), Ok(()))
+        Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
             .with_targets(Arc::new(Selection(editor.clone())));
 
     app.dispatch(Control::Start);
-    let id = ids.recv().unwrap();
-    events
-        .send(SessionEvent {
-            id,
-            update: SessionUpdate::Stable("stable sentence".into()),
-        })
-        .unwrap();
+    let id = script.last().id();
+    script.session(0).send_event(SessionEvent {
+        id,
+        update: SessionUpdate::Stable("stable sentence".into()),
+    });
     app.poll();
     assert_eq!(app.snapshot().phase, Phase::Capturing);
     assert_eq!(app.snapshot().recognition, Some(SessionState::Stable));
@@ -193,15 +125,20 @@ fn stable_sentences_wait_for_stop_and_complete_confirmation_before_appending() {
     assert_eq!(waiting.recognition, Some(SessionState::AwaitingFinal));
     assert_eq!(*editor.0.lock().unwrap(), "draft edited during capture");
 
-    events
-        .send(complete(id, "complete confirmed transcript"))
-        .unwrap();
+    script
+        .session(0)
+        .send_event(complete(id, "complete confirmed transcript"));
     let result = wait_for_result(&mut app);
     assert_eq!(result.text, "complete confirmed transcript");
     assert_eq!(result.delivery, Some(Delivery::Appended));
     assert_eq!(
         *editor.0.lock().unwrap(),
         "draft edited during capture\ncomplete confirmed transcript"
+    );
+    assert_eq!(
+        script.retry_attempts(),
+        0,
+        "a completed capture is never retried"
     );
 }
 
@@ -211,23 +148,17 @@ fn a_save_failure_keeps_recognition_failed_audio_recoverable_and_the_target_unch
     // A directory at the result path forces a real storage failure.
     fs::create_dir(runtime.0.join("current-result.txt")).unwrap();
     let editor = Arc::new(Editor(Mutex::new("protected draft".into())));
-    let (events, input) = mpsc::channel();
-    let (started, ids) = mpsc::channel();
-    let mut app = Application::with_recognition_sessions(
-        Box::new(ControlledSessions {
-            inputs: VecDeque::from([input]),
-            started,
-        }),
-        runtime.0.clone(),
-        Ok(()),
-    )
-    .with_targets(Arc::new(Selection(editor.clone())));
+    let adapter = ScriptedSessions::new();
+    let script = adapter.control();
+    let mut app =
+        Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+            .with_targets(Arc::new(Selection(editor.clone())));
     app.dispatch(Control::Start);
-    let id = ids.recv().unwrap();
+    let id = script.last().id();
     app.dispatch(Control::Stop);
-    events
-        .send(complete(id, "complete result kept for recovery"))
-        .unwrap();
+    script
+        .session(0)
+        .send_event(complete(id, "complete result kept for recovery"));
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.snapshot().phase != Phase::Failure {
         app.poll();
@@ -247,44 +178,37 @@ fn repeated_confirmation_and_other_sessions_late_events_cannot_deliver_twice_or_
  {
     let runtime = Runtime::new();
     let editor = Arc::new(Editor(Mutex::new("draft".into())));
-    let (first_events, first_input) = mpsc::channel();
-    let (second_events, second_input) = mpsc::channel();
-    let (started, ids) = mpsc::channel();
-    let mut app = Application::with_recognition_sessions(
-        Box::new(ControlledSessions {
-            inputs: VecDeque::from([first_input, second_input]),
-            started,
-        }),
-        runtime.0.clone(),
-        Ok(()),
-    )
-    .with_targets(Arc::new(Selection(editor.clone())));
+    let adapter = ScriptedSessions::new();
+    let script = adapter.control();
+    let mut app =
+        Application::with_recognition_sessions(Box::new(adapter), runtime.0.clone(), Ok(()))
+            .with_targets(Arc::new(Selection(editor.clone())));
 
     app.dispatch(Control::Start);
-    let first_id = ids.recv().unwrap();
+    let first_id = script.last().id();
     // Even a session's own complete-looking text cannot bypass Stop.
-    first_events
-        .send(complete(first_id, "premature confirmation"))
-        .unwrap();
+    script
+        .session(0)
+        .send_event(complete(first_id, "premature confirmation"));
     app.poll();
     assert_eq!(app.snapshot().phase, Phase::Capturing);
     assert_eq!(*editor.0.lock().unwrap(), "draft");
     app.dispatch(Control::Stop);
     app.dispatch(Control::Stop);
-    first_events
-        .send(complete(first_id, "first confirmed result"))
-        .unwrap();
+    script
+        .session(0)
+        .send_event(complete(first_id, "first confirmed result"));
     let first = wait_for_result(&mut app);
     assert_eq!(first.text, "first confirmed result");
-    first_events
-        .send(complete(first_id, "duplicate must not replace the result"))
-        .unwrap();
+    script
+        .session(0)
+        .send_event(complete(first_id, "duplicate must not replace the result"));
     app.poll();
     assert_eq!(app.snapshot().text, "first confirmed result");
     assert_eq!(*editor.0.lock().unwrap(), "draft\nfirst confirmed result");
 
     app.dispatch(Control::Start);
-    let second_id = ids.recv().unwrap();
+    let second_id = script.last().id();
     for update in [
         SessionUpdate::Failed(SessionFailure {
             error: "late failure from the old session".into(),
@@ -295,12 +219,10 @@ fn repeated_confirmation_and_other_sessions_late_events_cannot_deliver_twice_or_
         SessionUpdate::Stable("late old sentence".into()),
         complete(first_id, "late old result").update,
     ] {
-        second_events
-            .send(SessionEvent {
-                id: first_id,
-                update,
-            })
-            .unwrap();
+        script.session(1).send_event(SessionEvent {
+            id: first_id,
+            update,
+        });
         app.poll();
         let capturing = app.snapshot();
         assert_eq!(capturing.phase, Phase::Capturing);
@@ -309,24 +231,29 @@ fn repeated_confirmation_and_other_sessions_late_events_cannot_deliver_twice_or_
         assert_eq!(*editor.0.lock().unwrap(), "draft\nfirst confirmed result");
     }
     app.dispatch(Control::Stop);
-    second_events
-        .send(complete(first_id, "old confirmation after the new stop"))
-        .unwrap();
+    script
+        .session(1)
+        .send_event(complete(first_id, "old confirmation after the new stop"));
     app.poll();
     assert_eq!(app.snapshot().phase, Phase::Processing);
-    second_events
-        .send(complete(second_id, "second confirmed result"))
-        .unwrap();
+    script
+        .session(1)
+        .send_event(complete(second_id, "second confirmed result"));
     let second = wait_for_result(&mut app);
     assert_eq!(second.text, "second confirmed result");
-    second_events
-        .send(complete(second_id, "duplicate second result"))
-        .unwrap();
+    script
+        .session(1)
+        .send_event(complete(second_id, "duplicate second result"));
     app.poll();
     app.dispatch(Control::Stop);
     assert_eq!(app.snapshot().text, "second confirmed result");
     assert_eq!(
         *editor.0.lock().unwrap(),
         "draft\nfirst confirmed result\nsecond confirmed result"
+    );
+    assert_eq!(
+        script.retry_attempts(),
+        0,
+        "no late or duplicate event may ask the adapter to retry"
     );
 }
