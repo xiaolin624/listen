@@ -14,11 +14,14 @@
 - 识别一律走本地引擎（包内 `engine\sherpa` + `models\sense-voice` 的 SenseVoiceSmall q8）；
   `LOCALAPPDATA` 指向隔离目录，`LISTEN_ALI_API_KEY` / `LISTEN_ALI_WORKSPACE_ID` 未设置，
   全程不走云端识别路径、不产生付费请求、不消耗百炼额度。
-- 交付件直接用 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0`（manifest `git_commit=9a53e9aa…`、
-  `git_dirty_at_package_time=false`、21 文件 / 264,881,704 B），**没有重新打包**。该目录下另有 #23
-  流程遗留的 `runtime\`（7 文件 / 5,707 B，git 忽略、不在 manifest 内）；本段所有运行都用 `--runtime`
-  指到 `.artifacts` 下，未向该遗留目录写入任何内容。另有一份逐字节相同的副本放在
-  `%TEMP%\listen-24-user-machine\Listen-0.1.0`，用来证明包不依赖仓库里的 engine/model 目录。
+- 验收时用的交付件是 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0`（manifest `git_commit=9a53e9aa…`、
+  `git_dirty_at_package_time=false`、21 文件 / 264,881,704 B），**验收当时没有重新打包**。该目录下另有
+  #23 流程遗留的 `runtime\`（7 文件 / 5,707 B，git 忽略、不在 manifest 内）；本段所有运行都用 `--runtime`
+  指到 `.artifacts` 下。另有一份逐字节相同的副本放在 `%TEMP%\listen-24-user-machine\Listen-0.1.0`，
+  用来证明包不依赖仓库里的 engine/model 目录。
+- **当前交付件已重建**：最终提交 `fece14b` 上重新打包，落在 `E:\luyin\dist\Listen-0.1.0`
+  （264,882,314 B、`git_commit=fece14b…`、`git_dirty_at_package_time=false`、无 `runtime\`），
+  并在落地位置重新校验通过（含启动器冒烟）。详见 [#14](#14-交付件重建2026-11-24-1853)。
 - 浏览器通道用 **Edge 158 + `--force-renderer-accessibility`**（§2.2）；Chrome 157 在本机不向 UIA
   暴露渲染树（§10 偏差 2）。
 - 证据目录 `.artifacts\issue-24\` 被 Git 忽略；仓库内的交付物是本文件与 `scripts\` 下的脚本。
@@ -405,9 +408,11 @@ partial-result.txt,panel.txt,delivery.json,…}`、`device.log`。
 10. **一次与场景无关的计时用例抖动**：`glossary::tests::correcting_hundreds_of_terms_stays_in_the
     _millisecond_range`（100 ms 预算）在有负载时用了 124 ms；重跑通过。它不是本次改动引入的，但确实
     挡住过一次浏览器只读尝试，故记录。
-11. **未重打包**：只用 #23 的交付件（`git_dirty_at_package_time=false`）。本段改的是 `scripts\`、
-    `app\listen\examples\long_session.rs` 与本文件；`long_session` 是 example，不进入交付包字节，
-    因此 `docs\issue-23-verification.md` 的包哈希仍然成立。
+11. **本段没有重打包**：桌面验收用的是 #23 的交付件（`git_dirty_at_package_time=false`）。本段改的是
+    `scripts\`、`app\listen\examples\long_session.rs` 与本文件；`long_session` 是 example，不进入交付包
+    字节。**但那个交付目录在验收过程中被写入了 `runtime\`**（见文首），已不能通过包检查；
+    [#14](#14-交付件重建2026-11-24-1853) 在最终提交 `fece14b` 上重建了交付件并重新校验，
+    这才是当前交付件的权威记录。
 12. **文档现状核对**：`docs\issue-40-delivery.md` 与 `README.md` 没有与新包/新验收矛盾的说法
     （#40 已注明「交付包的本地引擎是 whisper.cpp；SenseVoice 换包由 #23 完成」，README 已写
     SenseVoice 包与 `--control` + `status.txt`/`panel.txt`/`current-result.txt` 的验收口径），
@@ -577,8 +582,8 @@ PASS launcher smoke: 启动 Listen 本地备用.cmd started listen.exe, phase=Re
 
 > 为什么用副本跑：交付目录 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0` 里有 #23 遗留的
 > `runtime\`（本文件开头已记录），包检查会按设计拒绝 `runtime` 目录；本单**没有**删除或改写交付目录，
-> 而是用 robocopy 复制出 21 文件 / 264,881,704 B 的逐字节副本（不含该遗留目录）再验证。重打包与
-> 清理由下一个交付件重建负责。
+> 而是用 robocopy 复制出 21 文件 / 264,881,704 B 的逐字节副本（不含该遗留目录）再验证。
+> 交付件重建与清理见 [#14](#14-交付件重建2026-11-24-1853)。
 
 ### 测试与格式（复审复跑）
 
@@ -588,3 +593,34 @@ PASS launcher smoke: 启动 Listen 本地备用.cmd started listen.exe, phase=Re
 - `.\scripts\build-listen.ps1 -Task CheckFormat`：无输出，退出码 0。
 - example 编译：`long_session.exe`（debug profile，`-Task Test` 一并构建）成功，别名改动不改变
   whisper 路径行为。
+
+## 14. 交付件重建（2026-11-24 18:53）
+
+验收期间在 `E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0` 里写进了 `runtime\`，那个目录因此按设计
+通不过包检查；`E:\luyin\dist\Listen-0.1.0` 当时还是 2026-11-21 的 whisper 旧包。为了交付一个与最终
+代码对应的干净包，在**最终提交 `fece14b` 的干净工作树**（`E:\luyin\.worktrees\delivery`，detached、
+`git status --porcelain` 为空）里重建并重新校验。
+
+| 项 | 实测 |
+| --- | --- |
+| 重建命令 | `.\scripts\package-listen.ps1 -ToolsRoot E:\luyin\.tools -IncludeModels`（工作树 `fece14b`，干净） |
+| 包位置 | `E:\luyin\dist\Listen-0.1.0`（旧的 471.5 MB whisper 包已删除后覆盖） |
+| 字节数 | 264,882,314（19 个 manifest 文件项 + `manifest.json` + `.listen-package`，共 21 个文件） |
+| `manifest.json` | `git_commit=fece14bdd4da85bed04ad9afd3b028309eb46ce1`、`git_dirty_at_package_time=false`、`engine_source=SenseVoice q8 (sherpa-onnx) CPU; AVX2 required` |
+| 包内 `runtime\` | **不存在**（干净交付） |
+| 构建时校验 | `files_checked=17`、`hashes_verified=19`、`pinned_hashes_verified=5`、`launchers_checked=2`、`cloud_paid_requests=0`、`third_party_notices=true` |
+| 启动器冒烟（构建时） | PASS：`phase=Ready`、`recognition_mode=local`、`backend` 含 `SenseVoice q8`、`package_untouched=true`、`request_to_ready_ms=2866` |
+| 落地位置复校 | 对 `E:\luyin\dist\Listen-0.1.0` 再跑一次同一校验脚本：全部字段一致，启动器冒烟再次 PASS（`request_to_ready_ms=2634`） |
+
+证据：`.artifacts\delivery\package-verify-built.json`（构建位置 `…\delivery\dist`）、
+`.artifacts\delivery\package-verify-installed.json`（落地位置 `E:\luyin\dist`）。
+
+口径说明：
+
+- 之前 §1–§8 的桌面验收跑的是同一个代码树上的包内容（`9a53e9a` 与 `fece14b` 之间只改了
+  `scripts\`、example 与文档，交付包字节相同；5 个 pinned 哈希与引擎/模型文件未变），因此验收结论
+  仍然对应当前交付件；重建只是把「同内容的干净副本」放到了交付位置。
+- 重建后**没有**重跑全部桌面验收：唯一变化的包内元数据是 `manifest.json` 的提交与时间字段，以及
+  新增的启动器冒烟本身；启动器路径已在构建与落地两处各跑一次真启动。
+- `E:\luyin\.worktrees\issue-23\dist` 与 `.worktrees\issue-24` 下的临时包目录属于验收残留，
+  交付以 `E:\luyin\dist\Listen-0.1.0` 为准。

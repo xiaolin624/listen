@@ -397,3 +397,22 @@ models\sense-voice\tokens.txt, models\sense-voice\silero_vad.onnx
 
 以上 `.artifacts` 目录被 Git 忽略；仓库内的交付物是本文件、打包/验证脚本、`packaging\`
 文档与许可证原文。
+
+## 11. 交付件重建（2026-11-24 18:53，最终提交 `fece14b`）
+
+本文件记录的包构建于 `9a53e9a`，放在 `.worktrees\issue-23\dist`。那个目录在 #24 的桌面验收过程中被
+写进了 `runtime\`，已按设计通不过包检查；`E:\luyin\dist\Listen-0.1.0` 当时仍是 2026-11-21 的 whisper 旧包。
+
+因此在最终提交 `fece14b` 的干净工作树里重新打包，落到 `E:\luyin\dist\Listen-0.1.0`：
+
+| 项 | 实测 |
+| --- | --- |
+| 字节数 | 264,882,314（21 文件） |
+| `manifest.json` | `git_commit=fece14b…`、`git_dirty_at_package_time=false`、本地引擎 `SenseVoice q8 (sherpa-onnx, CPU, AVX2 required)` |
+| 包检查 | `files_checked=17`、`hashes_verified=19`、`pinned_hashes_verified=5`、`launchers_checked=2`、`cloud_paid_requests=0` |
+| 启动器冒烟 | PASS（`phase=Ready`、`recognition_mode=local`、`backend` 含 `SenseVoice q8`、`package_untouched=true`），构建位置与落地位置各跑一次 |
+
+`9a53e9a..fece14b` 之间只改了 `scripts\`、`app\listen\examples\long_session.rs` 与文档，交付包的引擎、
+模型与 5 个 pinned 哈希未变，因此本文件 §1–§7 的结论仍对应当前交付件。完整记录见
+[`docs/issue-24-verification.md`](issue-24-verification.md#14-交付件重建2026-11-24-1853)。
+证据：`.artifacts\delivery\package-verify-built.json`、`.artifacts\delivery\package-verify-installed.json`。
