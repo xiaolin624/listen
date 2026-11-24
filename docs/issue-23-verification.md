@@ -14,7 +14,7 @@
 | 1 | 包内不再有 whisper 模型或运行库，包含 SenseVoice 运行库与 q8 模型 | 通过 | `manifest.json` / 包内清单：`engine\sherpa\{sherpa-onnx-c-api.dll, onnxruntime.dll, onnxruntime_providers_shared.dll}` + `models\sense-voice\{model.int8.onnx, tokens.txt, silero_vad.onnx}`；包内 `whisper|ggml` 文件名 **0** 个（见 §1） |
 | 2 | 双击启动 → 胶囊出现 → 采集 → 结果追加或进入面板，完整流程可用 | 通过 | 用包内 `启动 Listen 本地备用.cmd` 真实启动：**36 项检查全过**；`status.txt` `recognition_mode=local`、`backend=SenseVoice q8…`、`endpoint_name=耳机 (WH-1000XM4)`；面板可见且含完整结果（§2） |
 | 3 | 禁网条件下完整流程通过 | **部分：替代证据**（未做真防火墙禁网，原因 UAC） | 全程 66 次 `Get-NetTCPConnection` 采样：远程连接 **0**、监听端口 **0**；本地运行目录无云端凭据/待处理云端音频；同一完整流程 37 项检查全过（§4） |
-| 4 | 包体约 260 MB，文件哈希校验通过 | 通过 | 实测 **264,881,295 B**（264.88 MB 十进制 / 252.61 MiB）；`manifest.json` 19 项逐文件哈希全过，5 个 pinned 引擎/模型哈希独立复核全过（§1） |
+| 4 | 包体约 260 MB，文件哈希校验通过 | 通过 | 实测 **264,881,704 B**（264.88 MB 十进制 / 252.61 MiB）；`manifest.json` 19 项逐文件哈希全过，5 个 pinned 引擎/模型哈希独立复核全过（§1） |
 | 5 | README 或「关于」里有 FunASR/SenseVoice 署名与许可证说明 | 通过 | `packaging\README.md`「署名与许可」节 + 包内 `THIRD-PARTY-NOTICES.md` + `licenses\` 三份上游原文 + `VERSION.txt` 署名行；验证脚本断言字样与原文标记（§6） |
 | 6 | 没有 key 时精修不可用，本地功能不受影响 | 通过 | 同一流程：`refine=unavailable`、原因含 `DEEPSEEK_API_KEY`、按钮 `精修（不可用）` 置灰、`--control refine` 被拒且 `current-result.txt` 逐字符不变（§5） |
 
@@ -38,7 +38,7 @@
 | `models\sense-voice\silero_vad.onnx` | 643,854 | Silero VAD（pinned） |
 | `README.md` | 21,851 | 用户说明（含署名与许可） |
 | `CLOUD-TRIAL.md` | 8,346 | 云端指南 |
-| `THIRD-PARTY-NOTICES.md` | 4,459 | 第三方署名与许可证索引 |
+| `THIRD-PARTY-NOTICES.md` | 4,868 | 第三方署名与许可证索引 |
 | `licenses\FunASR-MODEL_LICENSE.txt` | 5,306 | FunASR MODEL_LICENSE 原文 |
 | `licenses\sherpa-onnx-LICENSE.txt` | 11,358 | Apache License 2.0 原文 |
 | `licenses\onnxruntime-LICENSE.txt` | 1,073 | MIT 原文 |
@@ -53,11 +53,11 @@
 | 项 | 实测 |
 | --- | --- |
 | 文件总数 | 21（清单 TSV：`.artifacts\issue-23\package-inventory.tsv`） |
-| 包内总字节 | **264,881,295 B**（264.88 MB 十进制 / 252.61 MiB） |
+| 包内总字节 | **264,881,704 B**（264.88 MB 十进制 / 252.61 MiB） |
 | 其中 SenseVoice 引擎+模型 | 262,392,373 B |
 | 其中应用与运行库 | 2,414,592 B |
-| 其中文档/启动器/脚本/许可证 | 67,918 B |
-| 旧 whisper 包对照 | 494,424,525 B → 减少 229,543,230 B（−46.4%） |
+| 其中文档/启动器/脚本/许可证 | 68,327 B |
+| 旧 whisper 包对照 | 494,424,525 B → 减少 229,542,821 B（−46.4%） |
 | 工单目标「约 260 MB」 | 差 +4.88 MB（+1.9%），在验证脚本 245–285 MB 带内 |
 
 ### 1.2 whisper 负断言
@@ -94,7 +94,7 @@
 | 字段 | 实测 |
 | --- | --- |
 | 必需文件 / manifest 哈希 / pinned 哈希 / 启动器 / 扫描文件 | 17 / 19 / 5 / 2 / 19 |
-| 包内总字节 | 264,881,295 |
+| 包内总字节 | 264,881,704 |
 | 本地备用 | `Ready`，`recognition_mode=local`，phase 序列 `Preparing → Ready`，启动到状态 1–3 s（每次运行不同，见 `package-verify*.json`） |
 | 本地 backend | `SenseVoice q8, resident (sherpa-onnx), CPU, 6 thread(s); Silero VAD gates every window and each detected utterance is decoded separately.` |
 | 云端默认（无凭据） | `Failure` / `cloud-trial`，backend 显示 `Alibaba Model Studio / qwen-audio-3.1-asr-flash-message / cn-beijing`，detail 含 `valid Alibaba workspace` |
