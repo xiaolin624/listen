@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][ValidateSet('plain', 'rich')][string]$Target,
     [ValidateSet('normal', 'rebuild', 'readonly')][string]$Scenario = 'normal',
     [string]$ToolsRoot = '',
@@ -167,7 +167,11 @@ function Start-OwnedProcess([string]$fileName, [string]$arguments) {
     return [System.Diagnostics.Process]::Start($info)
 }
 function Get-ProfileProcesses {
-    return @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    # -Chrome accepts any Chromium build, so cleanup matches whatever executable was
+    # started (chrome.exe, msedge.exe, ...) instead of assuming Chrome.
+    $name = Split-Path $Chrome -Leaf
+    if (-not $name) { $name = 'chrome.exe' }
+    return @(Get-CimInstance Win32_Process -Filter ("Name='{0}'" -f $name) -ErrorAction SilentlyContinue | Where-Object {
             $_.CommandLine -and $_.CommandLine.IndexOf($Profile, [StringComparison]::OrdinalIgnoreCase) -ge 0
         })
 }
@@ -200,7 +204,10 @@ try {
         try { Stop-Process -Id $stale.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
     }
     if (Test-Path $Profile) { Remove-Item -Recurse -Force -Path $Profile }
-    $chromeProcess = Start-OwnedProcess $Chrome ('"--user-data-dir={0}" --no-first-run --no-default-browser-check --disable-session-crashed-bubble --new-window "{1}"' -f $Profile, $url)
+    # Chromium only builds the renderer accessibility tree on request. Edge exposes the
+    # fixture editors as UIA Edit elements with this switch; Chrome 157 exposes none even
+    # with it, so the flag is harmless there and required here.
+    $chromeProcess = Start-OwnedProcess $Chrome ('"--user-data-dir={0}" --no-first-run --no-default-browser-check --disable-session-crashed-bubble --force-renderer-accessibility --new-window "{1}"' -f $Profile, $url)
     $window = Wait-FixtureWindow
     $targetName = if ($Target -eq 'plain') { 'Listen plain target' } else { '网页富文本编辑区' }
     $plain = Find-Edit $window 'Listen plain target'

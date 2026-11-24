@@ -9,9 +9,16 @@ param(
     [string]$Model = '',
     [string]$Engine = '',
     [string]$VadModel = '',
+    [string]$PackageRoot = '',
+    [string]$SherpaLib = '',
+    [string]$SenseVoiceModel = '',
+    [string]$SenseVoiceTokens = '',
+    [string]$SenseVoiceVad = '',
+    [string]$SenseVoiceLanguage = 'auto',
     [ValidateSet('host', 'cli')][string]$Backend = 'host'
 )
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $projectRoot = Split-Path $PSScriptRoot -Parent
 if (-not $ToolsRoot) {
     $commonGit = & git -C $projectRoot rev-parse --path-format=absolute --git-common-dir
@@ -19,13 +26,41 @@ if (-not $ToolsRoot) {
     $ToolsRoot = Join-Path (Split-Path $commonGit -Parent) '.tools'
 }
 $ToolsRoot = [IO.Path]::GetFullPath($ToolsRoot)
-if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-small.bin' }
-if (-not $Engine) { $Engine = Join-Path $ToolsRoot 'whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe' }
-if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
+# -Engine sensevoice (or a -PackageRoot / -SherpaLib) selects the resident SenseVoice
+# engine; anything else keeps the historical whisper-cli shape.
+$senseVoice = ($Engine -in @('sensevoice', 'sense-voice', 'sense_voice')) -or [bool]$SherpaLib -or [bool]$PackageRoot
+if ($senseVoice) {
+    if ($PackageRoot) {
+        $package = [IO.Path]::GetFullPath($PackageRoot)
+        if (-not $SherpaLib) { $SherpaLib = Join-Path $package 'engine\sherpa' }
+        if (-not $SenseVoiceModel) { $SenseVoiceModel = Join-Path $package 'models\sense-voice\model.int8.onnx' }
+        if (-not $SenseVoiceTokens) { $SenseVoiceTokens = Join-Path $package 'models\sense-voice\tokens.txt' }
+        if (-not $SenseVoiceVad) { $SenseVoiceVad = Join-Path $package 'models\sense-voice\silero_vad.onnx' }
+    }
+    foreach ($required in @(
+            @('SherpaLib', $SherpaLib), @('SenseVoiceModel', $SenseVoiceModel),
+            @('SenseVoiceTokens', $SenseVoiceTokens), @('SenseVoiceVad', $SenseVoiceVad))) {
+        if (-not $required[1]) { throw ('-{0} is required for the SenseVoice engine.' -f $required[0]) }
+    }
+    $SherpaLib = (Get-Item -LiteralPath $SherpaLib).FullName
+    $SenseVoiceModel = (Get-Item -LiteralPath $SenseVoiceModel).FullName
+    $SenseVoiceTokens = (Get-Item -LiteralPath $SenseVoiceTokens).FullName
+    $SenseVoiceVad = (Get-Item -LiteralPath $SenseVoiceVad).FullName
+    $dll = Join-Path $SherpaLib 'sherpa-onnx-c-api.dll'
+    if (-not (Test-Path -LiteralPath $dll)) { throw ('The sherpa library directory has no sherpa-onnx-c-api.dll: ' + $SherpaLib) }
+    $Engine = 'sensevoice'
+    # -Backend only chooses the whisper.cpp model host vs the whisper CLI child process.
+    if ($Backend -ne 'host') { Write-Warning '-Backend only applies to the whisper.cpp engine and is ignored for SenseVoice.' }
+}
+else {
+    if (-not $Engine) { $Engine = Join-Path $ToolsRoot 'whisper-v1.8.2-cpu\bin\Release\whisper-cli.exe' }
+    if (-not $Model) { $Model = Join-Path $ToolsRoot 'models\ggml-small.bin' }
+    if (-not $VadModel) { $VadModel = Join-Path $ToolsRoot 'models\ggml-silero-v5.1.2.bin' }
+    $Model = (Get-Item -LiteralPath $Model).FullName
+    $Engine = (Get-Item -LiteralPath $Engine).FullName
+    $VadModel = (Get-Item -LiteralPath $VadModel).FullName
+}
 $InputWav = (Get-Item -LiteralPath $InputWav).FullName
-$Model = (Get-Item -LiteralPath $Model).FullName
-$Engine = (Get-Item -LiteralPath $Engine).FullName
-$VadModel = (Get-Item -LiteralPath $VadModel).FullName
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $runtime = Join-Path $OutputDirectory 'runtime'
@@ -41,28 +76,62 @@ $metadata = [ordered]@{
     started_utc = [DateTime]::UtcNow.ToString('o')
     source = $InputWav
     source_sha256 = (Get-FileHash -LiteralPath $InputWav -Algorithm SHA256).Hash
-    model = $Model
-    model_sha256 = (Get-FileHash -LiteralPath $Model -Algorithm SHA256).Hash
-    vad_model = $VadModel
-    vad_sha256 = (Get-FileHash -LiteralPath $VadModel -Algorithm SHA256).Hash
     engine = $Engine
-    backend = $Backend
+    backend = if ($senseVoice) { 'ignored for SenseVoice (requested {0})' -f $Backend } else { $Backend }
     seconds = $Seconds
     threads = $Threads
     delay_ms = $DelayMs
     spool_limit_bytes = $SpoolBytes
     audio_boundary = 'substituted playback device, looping real PCM with wall-clock pacing; no audio output'
-    production_path = 'Application::dispatch -> production segmented writer -> actual VAD/Whisper -> complete fallback result'
+    production_path = if ($senseVoice) {
+        'Application::dispatch -> production segmented writer -> actual Silero VAD + SenseVoice -> complete fallback result'
+    }
+    else {
+        'Application::dispatch -> production segmented writer -> actual VAD/Whisper -> complete fallback result'
+    }
     resource_sampling = '3 second samples of harness and direct child processes; observed peaks can miss short child lifetimes; GPU is global device usage'
     success_criterion = 'the harness terminal NDJSON record reports phase Result with terminal true'
 }
+if ($senseVoice) {
+    $metadata.package_root = $PackageRoot
+    $metadata.sherpa_lib = $SherpaLib
+    $metadata.sherpa_dll = $dll
+    $metadata.sherpa_dll_sha256 = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+    $metadata.sensevoice_model = $SenseVoiceModel
+    $metadata.sensevoice_model_sha256 = (Get-FileHash -LiteralPath $SenseVoiceModel -Algorithm SHA256).Hash
+    $metadata.sensevoice_tokens = $SenseVoiceTokens
+    $metadata.sensevoice_tokens_sha256 = (Get-FileHash -LiteralPath $SenseVoiceTokens -Algorithm SHA256).Hash
+    $metadata.sensevoice_vad = $SenseVoiceVad
+    $metadata.sensevoice_vad_sha256 = (Get-FileHash -LiteralPath $SenseVoiceVad -Algorithm SHA256).Hash
+    $metadata.sensevoice_language = $SenseVoiceLanguage
+}
+else {
+    $metadata.model = $Model
+    $metadata.model_sha256 = (Get-FileHash -LiteralPath $Model -Algorithm SHA256).Hash
+    $metadata.vad_model = $VadModel
+    $metadata.vad_sha256 = (Get-FileHash -LiteralPath $VadModel -Algorithm SHA256).Hash
+}
 $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'metadata.json') -Encoding UTF8
-$arguments = @(
-    '--input', ('"{0}"' -f $InputWav), '--runtime', ('"{0}"' -f $runtime),
-    '--engine', ('"{0}"' -f $Engine), '--model', ('"{0}"' -f $Model),
-    '--vad-model', ('"{0}"' -f $VadModel), '--backend', $Backend, '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
-    '--threads', $Threads, '--delay-ms', $DelayMs, '--spool-bytes', $SpoolBytes
-)
+if ($senseVoice) {
+    $arguments = @(
+        '--input', ('"{0}"' -f $InputWav), '--runtime', ('"{0}"' -f $runtime),
+        '--engine', 'sensevoice', '--sherpa-lib', ('"{0}"' -f $SherpaLib),
+        '--sensevoice-model', ('"{0}"' -f $SenseVoiceModel),
+        '--sensevoice-tokens', ('"{0}"' -f $SenseVoiceTokens),
+        '--sensevoice-vad', ('"{0}"' -f $SenseVoiceVad),
+        '--sensevoice-language', $SenseVoiceLanguage,
+        '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '--threads', $Threads, '--delay-ms', $DelayMs, '--spool-bytes', $SpoolBytes
+    )
+}
+else {
+    $arguments = @(
+        '--input', ('"{0}"' -f $InputWav), '--runtime', ('"{0}"' -f $runtime),
+        '--engine', ('"{0}"' -f $Engine), '--model', ('"{0}"' -f $Model),
+        '--vad-model', ('"{0}"' -f $VadModel), '--backend', $Backend, '--seconds', $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '--threads', $Threads, '--delay-ms', $DelayMs, '--spool-bytes', $SpoolBytes
+    )
+}
 # Windows PowerShell rebuilds a case-insensitive environment dictionary when it
 # redirects a child, so an inherited block holding both HTTP_PROXY and http_proxy
 # makes Start-Process fail before the harness starts. Drop the case duplicates once.
@@ -124,7 +193,8 @@ try {
         throw "Long-session harness did not reach a complete result; inspect $stdout and $stderr"
     }
     Write-Output $OutputDirectory
-} finally {
+}
+finally {
     # A failed sample loop must not leave the measurement running unattended.
     if (-not $process.HasExited) {
         try { $process.Kill() } catch { }
