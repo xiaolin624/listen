@@ -7,10 +7,13 @@
 //! enters the taskbar, and is excluded from screen capture with
 //! `WDA_EXCLUDEFROMCAPTURE`.
 //!
-//! The visual state comes from [`crate::capsule::capsule_state`]; this module only
-//! turns that state into pixels, drag behaviour and a remembered position.
+//! The visual state comes from [`crate::capsule::capsule_state`], and the picture
+//! itself — colour, opacity and motion — comes from [`crate::capsule::CapsuleState`]'s
+//! single style specification through [`crate::capsule::paint`]. This module keeps
+//! only what needs Windows: the DIB section, the timer cadence, the message loop,
+//! DPI handling, dragging, the remembered position and `WDA_EXCLUDEFROMCAPTURE`.
 
-use crate::capsule::CapsuleState;
+use crate::capsule::{self, CapsuleState};
 use std::{
     cell::RefCell,
     ffi::c_void,
@@ -308,7 +311,7 @@ impl Window {
     fn start_timer(&mut self) {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ID);
-            let interval = if animates(self.state) {
+            let interval = if self.state.animates() {
                 TIMER_ANIMATED_MS
             } else {
                 TIMER_IDLE_MS
@@ -323,7 +326,7 @@ impl Window {
         if self.state == state {
             return;
         }
-        let cadence_changed = animates(self.state) != animates(state);
+        let cadence_changed = self.state.animates() != state.animates();
         self.state = state;
         if cadence_changed {
             self.start_timer();
@@ -335,7 +338,7 @@ impl Window {
     }
 
     fn tick(&mut self) {
-        if !animates(self.state) {
+        if !self.state.animates() {
             // Idle states are static: nothing to repaint until the state changes.
             return;
         }
@@ -351,7 +354,7 @@ impl Window {
     unsafe fn paint(&mut self, elapsed_ms: u64) -> Result<(), String> {
         unsafe {
             let pixels = self.surface.pixels();
-            paint_pixels(
+            capsule::paint(
                 pixels,
                 self.width,
                 self.height,
@@ -734,13 +737,6 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn animates(state: CapsuleState) -> bool {
-    matches!(
-        state,
-        CapsuleState::Preparing | CapsuleState::Capturing | CapsuleState::Processing
-    )
-}
-
 fn pixel_size(scale: f32) -> (i32, i32) {
     (
         (LOGICAL_WIDTH * scale).round().max(1.0) as i32,
@@ -829,132 +825,4 @@ fn since_process_start_ms() -> Option<u64> {
 
 fn filetime_ticks(value: FILETIME) -> u64 {
     ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
-}
-
-/// Rasterise one frame of the capsule. Pure except for writing `pixels`; no GDI
-/// text and no external dependencies. The rounded bar is a stadium shape sampled
-/// analytically with a one-device-pixel anti-aliasing ramp, and the state only
-/// changes colour, brightness and horizontal motion.
-fn paint_pixels(
-    pixels: &mut [u32],
-    width: i32,
-    height: i32,
-    scale: f32,
-    state: CapsuleState,
-    time: f32,
-) {
-    let logical_width = width as f32 / scale;
-    let logical_height = height as f32 / scale;
-    let half_width = logical_width * 0.5;
-    let half_height = logical_height * 0.5;
-    let radius = half_height;
-    for y in 0..height {
-        for x in 0..width {
-            let px = (x as f32 + 0.5) / scale;
-            let py = (y as f32 + 0.5) / scale;
-            let coverage = capsule_coverage(px, py, half_width, half_height, radius, scale);
-            let index = (y * width + x) as usize;
-            if coverage <= 0.0 {
-                pixels[index] = 0;
-                continue;
-            }
-            let (red, green, blue, alpha) =
-                state_layer(state, px, py, logical_width, logical_height, time);
-            let alpha = (alpha * coverage).clamp(0.0, 1.0);
-            let a = (alpha * 255.0).round() as u32;
-            let r = (red.clamp(0.0, 1.0) * a as f32).round() as u32;
-            let g = (green.clamp(0.0, 1.0) * a as f32).round() as u32;
-            let b = (blue.clamp(0.0, 1.0) * a as f32).round() as u32;
-            pixels[index] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-}
-
-fn capsule_coverage(
-    x: f32,
-    y: f32,
-    half_width: f32,
-    half_height: f32,
-    radius: f32,
-    scale: f32,
-) -> f32 {
-    let qx = (x - half_width).abs() - (half_width - radius);
-    let qy = (y - half_height).abs() - (half_height - radius);
-    let outside = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
-    let inside = qx.max(qy).min(0.0);
-    let distance = outside + inside - radius;
-    (0.5 - distance * scale).clamp(0.0, 1.0)
-}
-
-/// Colour and opacity for one logical point. `time` is in seconds since the
-/// capsule appeared; only animated states use it.
-fn state_layer(
-    state: CapsuleState,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    time: f32,
-) -> (f32, f32, f32, f32) {
-    let half_height = (height * 0.5).max(1.0);
-    let vertical = (1.0 - ((y - half_height) / half_height).abs()).clamp(0.0, 1.0);
-    match state {
-        // Calm and dim: the tool is idle, nothing needs attention.
-        CapsuleState::Ready => (0.36, 0.62, 0.55, 0.32 + 0.14 * vertical),
-        // Dim and dashed with a slow breath: not ready yet, do not expect it.
-        CapsuleState::Preparing => {
-            let dash = if ((x / 14.0) as i32) % 2 == 0 {
-                1.0
-            } else {
-                0.16
-            };
-            let pulse = 0.5 + 0.5 * (std::f32::consts::TAU * time / 1.8).sin();
-            (
-                0.58,
-                0.64,
-                0.74,
-                (0.22 + 0.18 * vertical) * dash * (0.55 + 0.45 * pulse),
-            )
-        }
-        // Live capture: saturated green that breathes steadily.
-        CapsuleState::Capturing => {
-            let pulse = 0.5 + 0.5 * (std::f32::consts::TAU * time / 1.1).sin();
-            (
-                0.10,
-                0.86,
-                0.58,
-                (0.50 + 0.32 * vertical) * (0.80 + 0.20 * pulse),
-            )
-        }
-        // Working: a bright band sweeps across a dim blue body.
-        CapsuleState::Processing => {
-            let sweep = ((time / 1.15) % 1.0) * (width + 56.0) - 28.0;
-            let offset = (x - sweep) / 13.0;
-            let band = (-(offset * offset)).exp();
-            (
-                0.38 + 0.45 * band,
-                0.52 + 0.32 * band,
-                1.0,
-                (0.18 + 0.24 * vertical + 0.55 * band).min(0.94),
-            )
-        }
-        // Failure: red and static, the only warm colour the capsule uses.
-        CapsuleState::Failure => (0.93, 0.24, 0.27, 0.52 + 0.32 * vertical),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_capsule_is_transparent_outside_its_rounded_bar() {
-        let (width, height) = (220, 26);
-        let mut pixels = vec![0u32; (width * height) as usize];
-        paint_pixels(&mut pixels, width, height, 1.0, CapsuleState::Ready, 0.0);
-        // The corners are outside the stadium shape; the middle is fully covered.
-        assert_eq!(pixels[0], 0);
-        assert_eq!(pixels[(width - 1) as usize], 0);
-        assert_ne!(pixels[((height / 2) * width + width / 2) as usize], 0);
-    }
 }
