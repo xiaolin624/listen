@@ -851,6 +851,38 @@ fn an_unreadable_delivery_record_keeps_the_complete_late_result_pending() {
 }
 
 #[test]
+fn a_normal_delivery_still_appends_when_the_started_marker_cannot_be_saved() {
+    let runtime = Runtime::new();
+    let path = runtime.0.clone();
+    // The durable record is unusable, so `started` cannot be persisted. A late
+    // result must give up (proven above); a normal result is an unconditional append
+    // whose only safety rule is the lock and the adapter's own read-back, so it still
+    // appends. This is the one delivery rule that does not require the marker, and it
+    // is frozen behaviour: the record is reported degraded elsewhere.
+    fs::write(
+        path.join("delivery.json"),
+        r#"{"version":99,"segments":[]}"#,
+    )
+    .unwrap();
+    let mut h = Harness::with_runtime(runtime, &["会议草稿"]);
+    let first = h.start(0);
+    h.stop();
+    h.finish(first, "正常但完整的转写。", false);
+    let settled = h.poll_until("the normal delivery", |snapshot| {
+        snapshot.phase == Phase::Result
+    });
+
+    assert_eq!(settled.delivery, Some(Delivery::Appended), "{settled:?}");
+    assert_eq!(h.draft(0), "会议草稿\n正常但完整的转写。");
+    assert_eq!(h.editors[0].replace_calls(), 1);
+    assert_eq!(
+        fs::read(path.join("delivery.json")).unwrap(),
+        br#"{"version":99,"segments":[]}"#,
+        "the unreadable record is never rewritten by a normal append"
+    );
+}
+
+#[test]
 fn a_late_result_of_an_older_segment_never_borrows_the_current_results_refine_or_target_memory() {
     let mut h = Harness::new(&["草稿甲", "草稿乙"]);
     let first = h.start(0);

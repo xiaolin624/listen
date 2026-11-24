@@ -88,6 +88,9 @@ pub fn refine_note(snapshot: &Snapshot) -> Option<String> {
         Refine::NotApplied(reason) => Some(format!(
             "精修结果没有写回目标输入框：{reason}。精修文本在下方，你的编辑保持不变。"
         )),
+        Refine::Unconfirmed(reason) => Some(format!(
+            "精修结果可能已经写入目标输入框，但无法确认：{reason}。精修文本在下方；不会再次写入，也不会自动发送。"
+        )),
         Refine::Failed(reason) => Some(format!("精修失败：{reason}。当前结果保持不变，仍可复制。")),
         Refine::Unavailable(reason) if snapshot.phase == Phase::Result => {
             Some(format!("精修不可用：{reason}"))

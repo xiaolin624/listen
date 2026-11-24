@@ -35,6 +35,7 @@ pub mod usage;
 pub use usage::UsageSummary;
 #[cfg(windows)]
 pub mod target;
+pub(crate) mod target_write;
 #[cfg(windows)]
 pub mod whisper;
 #[cfg(windows)]
@@ -50,6 +51,7 @@ use recognition::{
 use segments::SegmentStore;
 use storage::Storage;
 use streaming::{CaptureProgress, SegmentStream};
+use target_write::{AppendValue, TargetWriteSession, WriteRule, Written};
 
 pub type AppResult<T> = Result<T, String>;
 
@@ -306,6 +308,11 @@ pub enum Refine {
     /// The refined text is valid but was deliberately not written to the target; it
     /// is exposed as `Snapshot::refined_text` and the user's target is untouched.
     NotApplied(String),
+    /// The refined text may already be in the target, but the write could not be
+    /// confirmed. It is exposed as `Snapshot::refined_text`, is never written again,
+    /// and the target is never reported as untouched (#44: ADR 0005 on the refine
+    /// path).
+    Unconfirmed(String),
     /// The refine request itself failed. The complete result is unchanged.
     Failed(String),
 }
@@ -320,6 +327,7 @@ impl Refine {
             Refine::Running => "running",
             Refine::Applied => "applied",
             Refine::NotApplied(_) => "not_applied",
+            Refine::Unconfirmed(_) => "unconfirmed",
             Refine::Failed(_) => "failed",
         }
     }
@@ -327,9 +335,10 @@ impl Refine {
     /// Why the refine entry is not (or no longer) usable, if there is a reason.
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Refine::Unavailable(reason) | Refine::NotApplied(reason) | Refine::Failed(reason) => {
-                Some(reason)
-            }
+            Refine::Unavailable(reason)
+            | Refine::NotApplied(reason)
+            | Refine::Unconfirmed(reason)
+            | Refine::Failed(reason) => Some(reason),
             Refine::Running => Some("a refine request is already running"),
             Refine::Applied => Some("the refined text was already applied to this result"),
             Refine::Available => None,
@@ -774,21 +783,6 @@ impl DeliveryOutcome {
     }
 }
 
-/// Only one delivery may write to a target at a time. Segments finish at their own
-/// pace, but one editor's read/modify/write pair must never interleave with another
-/// segment's, or a confirmed append would be misread as a user edit. The lock is
-/// taken on a delivery worker's thread, never on the application thread, so a slow
-/// editor can never block a new capture.
-static TARGET_WRITER: Mutex<()> = Mutex::new(());
-
-/// Which delivery rule produced this append. A normal result appends to the latest
-/// draft; a late one may only append to a draft proven unchanged since its Stop.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AppendKind {
-    Normal,
-    Late,
-}
-
 /// A normal result append. The latest draft is read at delivery time and kept, so
 /// edits made during the capture stay in place (#33 keeps this per segment).
 fn deliver(
@@ -811,28 +805,57 @@ fn deliver(
             return DeliveryOutcome::fallback(detail);
         }
     };
-    let lock_started = Instant::now();
-    let _writer = TARGET_WRITER
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let lock_ms = elapsed_ms(lock_started);
-    let read_started = Instant::now();
-    let latest = match target
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .content()
-    {
-        Ok(latest) => latest,
+    let session = match TargetWriteSession::open(target.clone()) {
+        Ok(session) => session,
         Err(error) => {
             let detail = not_delivered(error);
             ledger.keep_pending(sequence, &detail);
             return DeliveryOutcome::fallback(detail);
         }
     };
-    let read_ms = elapsed_ms(read_started);
-    let mut outcome = append_to_target(target, sequence, ledger, latest, text, AppendKind::Normal);
-    outcome.lock_ms = Some(lock_ms);
-    outcome.read_ms = Some(read_ms);
+    let attempt = session.write(
+        AppendValue {
+            base: session.draft(),
+            text,
+        },
+        ledger,
+        sequence,
+        WriteRule::delivery(),
+    );
+    let mut outcome = match attempt.outcome {
+        Written::Confirmed { before, after } => DeliveryOutcome {
+            delivery: Delivery::Appended,
+            detail: "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
+            memory: Some(DeliveryMemory {
+                target,
+                before,
+                after,
+                appended: text.to_string(),
+            }),
+            lock_ms: None,
+            read_ms: None,
+            write_ms: attempt.write_ms,
+            save_ms: attempt.save_ms,
+        },
+        Written::Unconfirmed { delivery, detail } => DeliveryOutcome {
+            delivery,
+            detail,
+            memory: None,
+            lock_ms: None,
+            read_ms: None,
+            write_ms: attempt.write_ms,
+            save_ms: attempt.save_ms,
+        },
+        Written::Refused { reason } => {
+            // `WriteRule::delivery` never requires the started marker, so this arm
+            // cannot happen; keep the complete result rather than panicking.
+            let detail = not_delivered(reason);
+            ledger.keep_pending(sequence, &detail);
+            DeliveryOutcome::fallback(detail)
+        }
+    };
+    outcome.lock_ms = Some(session.lock_ms());
+    outcome.read_ms = Some(session.read_ms());
     outcome
 }
 
@@ -861,18 +884,8 @@ fn deliver_late(
     if let Err(reason) = ledger.wait_baseline(sequence) {
         return keep_late(ledger, sequence, &reason);
     }
-    let lock_started = Instant::now();
-    let _writer = TARGET_WRITER
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let lock_ms = elapsed_ms(lock_started);
-    let read_started = Instant::now();
-    let current = match target
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .content()
-    {
-        Ok(current) => current,
+    let session = match TargetWriteSession::open(target.clone()) {
+        Ok(session) => session,
         Err(error) => {
             return keep_late(
                 ledger,
@@ -881,14 +894,46 @@ fn deliver_late(
             );
         }
     };
-    let read_ms = elapsed_ms(read_started);
-    match ledger.plan_late_append(sequence, &current) {
+    match ledger.plan_late_append(sequence, session.draft()) {
         LatePlan::Keep { reason } => keep_late(ledger, sequence, &reason),
         LatePlan::Append => {
-            let mut outcome =
-                append_to_target(target, sequence, ledger, current, text, AppendKind::Late);
-            outcome.lock_ms = Some(lock_ms);
-            outcome.read_ms = Some(read_ms);
+            let attempt = session.write(
+                AppendValue {
+                    base: session.draft(),
+                    text,
+                },
+                ledger,
+                sequence,
+                WriteRule::late_delivery(),
+            );
+            let mut outcome = match attempt.outcome {
+                Written::Confirmed { before, after } => DeliveryOutcome {
+                    delivery: Delivery::Appended,
+                    detail: late_appended(),
+                    memory: Some(DeliveryMemory {
+                        target,
+                        before,
+                        after,
+                        appended: text.to_string(),
+                    }),
+                    lock_ms: None,
+                    read_ms: None,
+                    write_ms: attempt.write_ms,
+                    save_ms: attempt.save_ms,
+                },
+                Written::Unconfirmed { delivery, detail } => DeliveryOutcome {
+                    delivery,
+                    detail: late_failed(detail),
+                    memory: None,
+                    lock_ms: None,
+                    read_ms: None,
+                    write_ms: attempt.write_ms,
+                    save_ms: attempt.save_ms,
+                },
+                Written::Refused { reason } => return keep_late(ledger, sequence, &reason),
+            };
+            outcome.lock_ms = Some(session.lock_ms());
+            outcome.read_ms = Some(session.read_ms());
             outcome
         }
     }
@@ -900,101 +945,28 @@ fn keep_late(ledger: &DeliveryLedger, sequence: u64, reason: &str) -> DeliveryOu
     DeliveryOutcome::fallback(late_kept(reason))
 }
 
-/// One append attempt, shared by both delivery rules. The write is never repeated:
-/// a failed or unconfirmed write is diagnosed by exactly one read-back and the
-/// complete text stays available. `begin_append` records the started state first;
-/// a late append is refused when that durable marker cannot be written, because
-/// then the single write could never be proven after a lost response.
-fn append_to_target(
-    target: Arc<Mutex<Box<dyn Target>>>,
-    sequence: u64,
-    ledger: &DeliveryLedger,
-    before: String,
-    text: &str,
-    kind: AppendKind,
-) -> DeliveryOutcome {
-    let replacement = if before.is_empty() {
-        text.to_string()
-    } else {
-        format!("{before}\n{text}")
-    };
-    // The fail-closed marker must be on disk before the write, and the confirmed
-    // append on disk before the outcome is trusted. Both are measured: this is the
-    // part of a delivery that grows with confirmed history.
-    let save_started = Instant::now();
-    let begin = ledger.begin_append(sequence, &before);
-    let begin_ms = elapsed_ms(save_started);
-    if let Err(reason) = begin {
-        if kind == AppendKind::Late {
-            return keep_late(ledger, sequence, &reason);
-        }
-    }
-    let write_started = Instant::now();
-    let write = target
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .replace(&before, &replacement);
-    let write_ms = elapsed_ms(write_started);
-    match write {
-        Ok(()) => {
-            let confirm_started = Instant::now();
-            ledger.confirm_append(sequence, &before, &replacement);
-            let confirm_ms = elapsed_ms(confirm_started);
-            DeliveryOutcome {
-                delivery: Delivery::Appended,
-                detail: match kind {
-                    AppendKind::Normal => "The complete result was appended to the original target. Review and send it manually. A copy remains in Listen.".into(),
-                    AppendKind::Late => late_appended(),
-                },
-                memory: Some(DeliveryMemory {
-                    target,
-                    before,
-                    after: replacement,
-                    appended: text.to_string(),
-                }),
-                lock_ms: None,
-                read_ms: None,
-                write_ms: Some(write_ms),
-                save_ms: Some(begin_ms + confirm_ms),
-            }
-        }
-        Err(error) => {
-            // Diagnose the failed write by reading the target again. Reading is not a
-            // retry: the write is never repeated and the previous text is never restored.
-            let observed = target
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .content();
-            let failed = failed_write(&before, &replacement, &error, observed);
-            if failed.uncertain {
-                ledger.mark_uncertain(sequence, &failed.detail);
-            } else {
-                ledger.keep_pending(sequence, &failed.detail);
-            }
-            let detail = match kind {
-                AppendKind::Normal => failed.detail,
-                AppendKind::Late => late_failed(failed.detail),
-            };
-            DeliveryOutcome {
-                delivery: failed.delivery,
-                detail,
-                memory: None,
-                lock_ms: None,
-                read_ms: None,
-                write_ms: Some(write_ms),
-                save_ms: Some(begin_ms),
-            }
-        }
-    }
-}
-
 /// The result of one refine request. The delivery memory was moved to the worker so
 /// the target read, replace and read-back all happen off the UI thread; a target that
 /// must not be written leaves the current result untouched.
 enum RefineOutcome {
-    Applied { refined: String, note: String },
-    NotApplied { refined: String, reason: String },
-    Failed { reason: String },
+    Applied {
+        refined: String,
+        note: String,
+    },
+    NotApplied {
+        refined: String,
+        reason: String,
+    },
+    /// The refined text may already be in the target, but the write could not be
+    /// confirmed. It is never written again and the target is never reported as
+    /// untouched (#44: ADR 0005 on the refine path).
+    Unconfirmed {
+        refined: String,
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 /// Run one refine and, when it is safe, replace only the appended transcript. This
@@ -1003,12 +975,16 @@ enum RefineOutcome {
 /// * the refine port only ever receives `text` (the local 转写文本);
 /// * a target is written only when it still holds exactly the content delivery wrote
 ///   and the appended transcript is still the current result;
-/// * the write is confirmed by reading it back before success is claimed;
+/// * the write goes through the one target write session, so the `started` marker is
+///   durable before the write and the confirmed replacement is recorded after the
+///   read-back (ADR 0005 on all three write paths);
 /// * any failure keeps the complete result and never re-appends or restores.
 fn refine_delivery(
     refine: Arc<dyn RefineText>,
     text: String,
     memory: Option<DeliveryMemory>,
+    sequence: u64,
+    ledger: Arc<DeliveryLedger>,
     current_result: PathBuf,
 ) -> RefineOutcome {
     let refined = match refine.refine(&text) {
@@ -1051,18 +1027,8 @@ fn refine_delivery(
                     .into(),
         };
     }
-    let _writer = TARGET_WRITER
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let observed = {
-        let mut target = memory
-            .target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        target.content()
-    };
-    let observed = match observed {
-        Ok(observed) => observed,
+    let session = match TargetWriteSession::open(memory.target.clone()) {
+        Ok(session) => session,
         Err(error) => {
             return RefineOutcome::NotApplied {
                 refined,
@@ -1072,7 +1038,7 @@ fn refine_delivery(
             };
         }
     };
-    if normalize_newlines(&observed) != normalize_newlines(&memory.after) {
+    if normalize_newlines(session.draft()) != normalize_newlines(&memory.after) {
         return RefineOutcome::NotApplied {
             refined,
             reason:
@@ -1080,33 +1046,19 @@ fn refine_delivery(
                     .into(),
         };
     }
-    let replacement = if memory.before.is_empty() {
-        refined.clone()
-    } else {
-        format!("{}\n{}", memory.before, refined)
-    };
-    if let Err(error) = memory
-        .target
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .replace(&observed, &replacement)
-    {
-        return RefineOutcome::NotApplied {
-            refined,
-            reason: format!(
-                "writing the refined text to the original target failed ({error}), so the target was left as it was and the refined text stays in the panel"
-            ),
-        };
-    }
-    let readback = {
-        let mut target = memory
-            .target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        target.content()
-    };
-    match readback {
-        Ok(readback) if normalize_newlines(&readback) == normalize_newlines(&replacement) => {
+    // Only the transcript is swapped: the replacement rebuilds the draft the earlier
+    // append sat on with the refined text, using the one append value.
+    let attempt = session.write(
+        AppendValue {
+            base: &memory.before,
+            text: &refined,
+        },
+        &ledger,
+        sequence,
+        WriteRule::refine(),
+    );
+    match attempt.outcome {
+        Written::Confirmed { .. } => {
             let mut note = "The refined text replaced the appended transcript in the original target and was read back in full; review and send it manually.".to_string();
             if let Err(error) = fs::write(&current_result, &refined) {
                 note.push_str(&format!(
@@ -1115,17 +1067,16 @@ fn refine_delivery(
             }
             RefineOutcome::Applied { refined, note }
         }
-        Ok(_) => RefineOutcome::NotApplied {
+        Written::Refused { reason } => RefineOutcome::NotApplied { refined, reason },
+        Written::Unconfirmed { delivery, detail } if delivery == Delivery::Uncertain => {
+            RefineOutcome::Unconfirmed {
+                refined,
+                reason: detail,
+            }
+        }
+        Written::Unconfirmed { detail, .. } => RefineOutcome::NotApplied {
             refined,
-            reason:
-                "the original target did not confirm the complete refined text, so no complete write is claimed and the current result is kept"
-                    .into(),
-        },
-        Err(error) => RefineOutcome::NotApplied {
-            refined,
-            reason: format!(
-                "the refined text could not be confirmed in the original target ({error}), so the current result is kept; the target is not written again"
-            ),
+            reason: detail,
         },
     }
 }
@@ -1156,84 +1107,6 @@ fn late_kept(reason: &str) -> String {
 /// confirmed. The failed-write diagnosis already says what the target holds.
 fn late_failed(detail: String) -> String {
     format!("This complete result was recovered after waiting for the network. {detail}")
-}
-
-/// One failed write's honest report, including whether anything about it is still
-/// uncertain. `uncertain` is true whenever the target may hold a complete or partial
-/// write: the segment is then never appended again automatically.
-struct FailedWrite {
-    delivery: Delivery,
-    detail: String,
-    uncertain: bool,
-}
-
-/// Reports what the target actually holds after a failed write, without ever claiming
-/// a complete delivery. The read-back distinguishes a refused write from a truncated
-/// one, a late complete write, and a possibly partial one. A write that may have
-/// landed is reported as [`Delivery::Uncertain`]; only a read-back proving the target
-/// still holds its previous content may claim [`Delivery::Fallback`].
-fn failed_write(
-    previous: &str,
-    intended: &str,
-    error: &str,
-    observed: AppResult<String>,
-) -> FailedWrite {
-    let advice = "Check the original target before copying; output is not retried automatically and the original text is not reverted.";
-    let fallback = "The complete result is in the expanded result panel.";
-    let (detail, uncertain) = match observed {
-        Err(read_error) => (
-            format!(
-                "The write to the original target could not be confirmed ({error}); the target could not be read back ({read_error}). {advice} {fallback}"
-            ),
-            true,
-        ),
-        Ok(observed) => {
-            // Line endings are not part of the delivered text's meaning.
-            let observed = observed.replace("\r\n", "\n");
-            let previous = previous.replace("\r\n", "\n");
-            let intended = intended.replace("\r\n", "\n");
-            if observed == previous {
-                (
-                    format!(
-                        "The original target still holds its previous content, so nothing was written to it ({error}). {fallback} Review and copy it to the intended input."
-                    ),
-                    false,
-                )
-            } else if observed == intended {
-                (
-                    format!(
-                        "The write to the original target could not be confirmed ({error}), but it now contains the complete appended text. {advice} A copy remains in Listen."
-                    ),
-                    true,
-                )
-            } else if !observed.is_empty() && intended.starts_with(&observed) {
-                (
-                    format!(
-                        "The original target holds only {} of {} characters of the intended text, so the appended transcript is truncated; this is not a complete delivery. {advice} {fallback}",
-                        observed.chars().count(),
-                        intended.chars().count()
-                    ),
-                    true,
-                )
-            } else {
-                (
-                    format!(
-                        "The write to the original target could not be confirmed ({error}); the target content changed and may be partially written. {advice} {fallback}"
-                    ),
-                    true,
-                )
-            }
-        }
-    };
-    FailedWrite {
-        delivery: if uncertain {
-            Delivery::Uncertain
-        } else {
-            Delivery::Fallback
-        },
-        detail,
-        uncertain,
-    }
 }
 
 pub struct Application {
@@ -2093,6 +1966,16 @@ impl Application {
                     "Refine was not written back: {reason}. The refined text is in the expanded panel and the complete result is unchanged. Nothing is sent automatically."
                 );
             }
+            RefineOutcome::Unconfirmed { refined, reason } => {
+                // The refined text may already be in the target; the panel must say
+                // so instead of claiming the target was left untouched.
+                self.snapshot.refined_text = Some(refined);
+                self.snapshot.refine = Refine::Unconfirmed(reason.clone());
+                let reason = reason.trim_end_matches('.').trim_end();
+                self.snapshot.detail = format!(
+                    "Refine could not be confirmed: {reason}. The refined text is in the expanded panel; the complete result here is unchanged, the target is not written again, and nothing is sent automatically."
+                );
+            }
             RefineOutcome::Failed { reason } => {
                 self.snapshot.refined_text = None;
                 self.snapshot.refine = Refine::Failed(reason.clone());
@@ -2206,6 +2089,10 @@ impl Application {
                 // moves to the worker so the target read/write never blocks the UI.
                 let text = self.snapshot.text.clone();
                 let memory = self.delivery_memory.take();
+                // The refine write is a target write like any other: it records its
+                // `started` marker and its confirmed result in the same ledger (#44).
+                let sequence = self.current_sequence;
+                let ledger = self.delivery.clone();
                 let current_result = self.runtime.join("current-result.txt");
                 let (tx, rx) = mpsc::channel();
                 self.refine_job = Some(rx);
@@ -2213,7 +2100,14 @@ impl Application {
                 self.snapshot.refined_text = None;
                 self.snapshot.detail = "Refining the current result through the configured DeepSeek API; only the transcript text is sent, never the audio. The current result stays available meanwhile.".into();
                 thread::spawn(move || {
-                    let _ = tx.send(refine_delivery(refine, text, memory, current_result));
+                    let _ = tx.send(refine_delivery(
+                        refine,
+                        text,
+                        memory,
+                        sequence,
+                        ledger,
+                        current_result,
+                    ));
                 });
             }
             Control::Retry => {

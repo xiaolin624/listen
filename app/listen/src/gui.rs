@@ -402,6 +402,7 @@ impl Ui {
             let refine_reason = match &state.refine {
                 Refine::Unavailable(reason)
                 | Refine::NotApplied(reason)
+                | Refine::Unconfirmed(reason)
                 | Refine::Failed(reason) => reason.replace('\r', "").replace('\n', " "),
                 _ => String::new(),
             };

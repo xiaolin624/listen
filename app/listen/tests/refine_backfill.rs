@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -227,6 +227,32 @@ impl RefineText for FakeRefine {
     }
 }
 
+/// Failure injection for one editor. Everything is off by default, so a test that
+/// does not care about a lost or slow write behaves exactly as before.
+#[derive(Clone, Default)]
+struct Gate {
+    /// Store the replacement, then wait before reporting the write, so the test can
+    /// observe the durable `started` marker in the window between write and
+    /// confirmation.
+    block_after_write: Arc<AtomicBool>,
+    /// The write reached the block (readiness signal for the test).
+    entered: Arc<AtomicBool>,
+    /// The test releases the blocked write.
+    release: Arc<AtomicBool>,
+    /// Store the replacement, then report a lost response.
+    lose_response: Arc<AtomicBool>,
+}
+
+/// Releases a blocked fake write even when the test fails, so a red test cannot keep
+/// holding the process-wide target writer and hang the rest of the test binary.
+struct ReleaseOnDrop(Gate);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release.store(true, Ordering::SeqCst);
+    }
+}
+
 struct Editors {
     focused: Option<usize>,
     drafts: [String; 2],
@@ -236,16 +262,21 @@ struct Editors {
     /// on line endings.
     crlf: bool,
     replace_calls: usize,
+    gate: Gate,
 }
 
 impl Editors {
     fn new(first: &str) -> Self {
+        Self::with_gate(first, Gate::default())
+    }
+    fn with_gate(first: &str, gate: Gate) -> Self {
         Self {
             focused: Some(0),
             drafts: [first.into(), String::new()],
             available: [true; 2],
             crlf: false,
             replace_calls: 0,
+            gate,
         }
     }
 }
@@ -254,6 +285,7 @@ struct Desktop(Arc<Mutex<Editors>>);
 struct BoundEditor {
     editors: Arc<Mutex<Editors>>,
     selected: usize,
+    gate: Gate,
 }
 
 impl TargetSelection for Desktop {
@@ -268,6 +300,7 @@ impl TargetSelection for Desktop {
         Ok(Some(Box::new(BoundEditor {
             editors: self.0.clone(),
             selected,
+            gate: desktop.gate.clone(),
         })))
     }
 }
@@ -303,6 +336,17 @@ impl Target for BoundEditor {
             );
         }
         desktop.drafts[self.selected] = replacement.replace("\r\n", "\n");
+        drop(desktop);
+        // The write already landed; only the response is delayed or lost.
+        if self.gate.block_after_write.load(Ordering::SeqCst) {
+            self.gate.entered.store(true, Ordering::SeqCst);
+            while !self.gate.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if self.gate.lose_response.load(Ordering::SeqCst) {
+            return Err("The complete target output could not be confirmed".into());
+        }
         Ok(())
     }
 }
@@ -320,6 +364,17 @@ fn refine_application(
     )
     .with_targets(Arc::new(Desktop(editors.clone())))
     .with_refine(refine.clone())
+}
+
+/// One durable delivery record from `delivery.json`, if the file can be read.
+fn delivery_record(runtime: &Runtime, sequence: u64) -> Option<serde_json::Value> {
+    let bytes = fs::read(runtime.0.join("delivery.json")).ok()?;
+    let index: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    index["segments"]
+        .as_array()?
+        .iter()
+        .find(|record| record["sequence"] == sequence)
+        .cloned()
 }
 
 #[test]
@@ -536,6 +591,288 @@ fn a_failed_refine_keeps_the_local_result_and_never_appends_it_again() {
         refined.detail
     );
     assert!(refined.detail.contains("unchanged"), "{}", refined.detail);
+}
+
+#[test]
+fn a_refine_write_persists_its_start_before_the_target_write_and_a_crash_then_stays_uncertain() {
+    let runtime = Runtime::new();
+    let gate = Gate::default();
+    let editors = Arc::new(Mutex::new(Editors::with_gate("原有草稿", gate.clone())));
+    let refine = Arc::new(FakeRefine::answering(REFINED));
+    let mut app = refine_application(&runtime, &editors, &refine);
+
+    assert_eq!(capture_result(&mut app).delivery, Some(Delivery::Appended));
+    assert_eq!(
+        delivery_record(&runtime, 1).expect("a durable delivery record")["state"],
+        "appended"
+    );
+
+    // The target applies the refined replacement and then waits before reporting the
+    // write: the window in which a crash loses only the confirmation. The guard
+    // releases the fake write even if an assertion below fails.
+    gate.block_after_write.store(true, Ordering::SeqCst);
+    let _release = ReleaseOnDrop(gate.clone());
+    app.dispatch(Control::Refine);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gate.entered.load(Ordering::SeqCst) {
+        app.poll();
+        assert!(
+            Instant::now() < deadline,
+            "the refine write never reached the target"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    // The write is now in flight and not confirmed. The durable record must already
+    // say that a write started, and it must describe the complete draft it replaces.
+    let started = delivery_record(&runtime, 1).expect("a durable delivery record");
+    assert_eq!(
+        started["state"], "started",
+        "the started marker must be persisted before the target write: {started}"
+    );
+    assert_eq!(
+        started["before"],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "the started marker describes the complete draft the write replaces: {started}"
+    );
+    assert_eq!(
+        editors.lock().unwrap().drafts[0],
+        format!("原有草稿\n{REFINED}"),
+        "the write landed, so this is exactly the 'written but not confirmed' window"
+    );
+
+    // The process now ends in that window. Nothing can be proven, so the durable
+    // record stays `started` (terminal) and a restarted application must neither
+    // rewrite the old target nor claim a panel-only fallback.
+    //
+    // Boundary, stated in docs/issue-44-verification.md: a confirmed append already
+    // removed this segment's index record and text file, so the restart cannot attach
+    // the `started` record to a segment entry. The transcript is still the current
+    // result from current-result.txt and stays in the panel; the write is never
+    // replayed and the record is never downgraded.
+    let restarted_editors = Arc::new(Mutex::new(Editors::new("新进程中的目标草稿")));
+    let restarted_refine = Arc::new(FakeRefine::answering("再次精修的结果"));
+    let mut restarted = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(restarted_editors.clone())))
+    .with_refine(restarted_refine.clone());
+    let recovered = restarted.snapshot();
+    assert_eq!(
+        recovered.text, TRANSCRIPT,
+        "the transcript is still the current result in the panel: {recovered:?}"
+    );
+    assert!(
+        recovered.segments.is_empty(),
+        "a confirmed append leaves no segment record; the started record is the only \
+         trace of the unconfirmed refine write: {recovered:?}"
+    );
+    assert_eq!(
+        delivery_record(&runtime, 1).expect("the durable record")["state"],
+        "started",
+        "recovery never rewrites or downgrades the started marker"
+    );
+
+    // Even a refine requested after the restart only rewrites the panel: the old
+    // target memory is gone, so the target is never written again.
+    restarted.dispatch(Control::Refine);
+    let refined_again = await_refined(&mut restarted);
+    assert_eq!(refined_again.refine, Refine::Applied);
+    assert_eq!(
+        restarted_editors.lock().unwrap().replace_calls,
+        0,
+        "a restart never writes the old target again"
+    );
+    assert_eq!(
+        fs::read_to_string(runtime.0.join("current-result.txt")).unwrap(),
+        "再次精修的结果",
+        "the restarted refine only updates the local result"
+    );
+}
+
+#[test]
+fn a_refine_write_with_a_lost_response_is_reported_and_recorded_as_uncertain() {
+    let runtime = Runtime::new();
+    let gate = Gate::default();
+    let editors = Arc::new(Mutex::new(Editors::with_gate("原有草稿", gate.clone())));
+    let refine = Arc::new(FakeRefine::answering(REFINED));
+    let mut app = refine_application(&runtime, &editors, &refine);
+
+    assert_eq!(capture_result(&mut app).delivery, Some(Delivery::Appended));
+    let writes_before = editors.lock().unwrap().replace_calls;
+    gate.lose_response.store(true, Ordering::SeqCst);
+
+    app.dispatch(Control::Refine);
+    let refined = await_refined(&mut app);
+
+    assert_eq!(
+        refined.refine.name(),
+        "unconfirmed",
+        "a write whose response was lost is not claimed and not denied: {:?}",
+        refined.refine
+    );
+    assert!(
+        refined.detail.contains("could not be confirmed"),
+        "{}",
+        refined.detail
+    );
+    assert_eq!(
+        refined.refined_text.as_deref(),
+        Some(REFINED),
+        "the refined text stays available in the panel"
+    );
+    assert_eq!(refined.text, TRANSCRIPT, "the local result is unchanged");
+    assert_eq!(
+        editors.lock().unwrap().drafts[0],
+        format!("原有草稿\n{REFINED}"),
+        "the write really landed; only its confirmation was lost"
+    );
+    let record = delivery_record(&runtime, 1).expect("a durable delivery record");
+    assert_eq!(record["state"], "uncertain", "{record}");
+
+    // The durable record is terminal for this segment, and the refine memory was
+    // consumed, so a second request cannot write the target again.
+    app.dispatch(Control::Refine);
+    app.poll();
+    assert_eq!(
+        editors.lock().unwrap().replace_calls,
+        writes_before + 1,
+        "an unconfirmed refine write is never repeated"
+    );
+}
+
+#[test]
+fn a_refined_result_is_recorded_and_never_written_again_after_a_restart() {
+    let runtime = Runtime::new();
+    let editors = Arc::new(Mutex::new(Editors::new("原有草稿")));
+    let refine = Arc::new(FakeRefine::answering(REFINED));
+    let mut app = refine_application(&runtime, &editors, &refine);
+
+    assert_eq!(capture_result(&mut app).delivery, Some(Delivery::Appended));
+    app.dispatch(Control::Refine);
+    let refined = await_refined(&mut app);
+    assert_eq!(refined.refine, Refine::Applied);
+
+    let record = delivery_record(&runtime, 1).expect("a durable delivery record");
+    assert_eq!(record["state"], "appended", "{record}");
+    assert_eq!(
+        record["before"],
+        format!("原有草稿\n{TRANSCRIPT}"),
+        "{record}"
+    );
+    assert_eq!(
+        record["after"],
+        format!("原有草稿\n{REFINED}"),
+        "the confirmed refine is recorded around the write: {record}"
+    );
+
+    drop(app);
+    let restarted_editors = Arc::new(Mutex::new(Editors::new("新进程中的目标草稿")));
+    let restarted_refine = Arc::new(FakeRefine::answering("再次精修的结果"));
+    let mut restarted = Application::new(
+        Arc::new(Playback),
+        Arc::new(LocalModel),
+        runtime.0.clone(),
+        Ok(()),
+    )
+    .with_targets(Arc::new(Desktop(restarted_editors.clone())))
+    .with_refine(restarted_refine.clone());
+    let recovered = restarted.snapshot();
+    assert_eq!(
+        recovered.text, REFINED,
+        "the refined text is the current result after a restart: {recovered:?}"
+    );
+    // The confirmed append removed the segment's index record, so on a restart the
+    // refined text comes back as a complete result the index did not describe. Its
+    // delivery state cannot be proven from the index, so it is reported conservatively
+    // as uncertain — never as a panel-only fallback and never as a fresh delivery.
+    assert!(
+        recovered
+            .segments
+            .iter()
+            .all(|segment| segment.delivery != Some(Delivery::Fallback)),
+        "a restart never claims a panel-only fallback for a result a target may hold: {recovered:?}"
+    );
+    assert_eq!(
+        delivery_record(&runtime, 1).expect("the durable record")["after"],
+        format!("原有草稿\n{REFINED}"),
+        "the confirmed refine survives the restart"
+    );
+
+    // A refine requested after the restart only rewrites the panel/current result: the
+    // old target memory is gone and the old target is never written again.
+    restarted.dispatch(Control::Refine);
+    let refined_again = await_refined(&mut restarted);
+    assert_eq!(refined_again.refine, Refine::Applied);
+    for _ in 0..5 {
+        restarted.poll();
+    }
+    assert_eq!(
+        restarted_editors.lock().unwrap().replace_calls,
+        0,
+        "a restart never writes the old target again"
+    );
+}
+
+#[test]
+fn a_refine_whose_started_marker_cannot_be_saved_does_not_write_the_target() {
+    let runtime = Runtime::new();
+    // A record from a future version is never rewritten, so the `started` marker
+    // cannot be persisted at all.
+    fs::write(
+        runtime.0.join("delivery.json"),
+        r#"{"version":99,"segments":[]}"#,
+    )
+    .unwrap();
+    let editors = Arc::new(Mutex::new(Editors::new("原有草稿")));
+    let refine = Arc::new(FakeRefine::answering(REFINED));
+    let mut app = refine_application(&runtime, &editors, &refine);
+
+    assert_eq!(
+        capture_result(&mut app).delivery,
+        Some(Delivery::Appended),
+        "a normal append does not require the durable marker"
+    );
+    let written = editors.lock().unwrap().drafts[0].clone();
+    let writes_before = editors.lock().unwrap().replace_calls;
+
+    app.dispatch(Control::Refine);
+    let refined = await_refined(&mut app);
+
+    assert!(
+        matches!(refined.refine, Refine::NotApplied(_)),
+        "{:?}",
+        refined.refine
+    );
+    assert!(
+        refined.detail.contains("delivery record"),
+        "the refusal names the durable record that could not be written: {}",
+        refined.detail
+    );
+    assert!(
+        refined.detail.contains("not written"),
+        "the refusal says nothing was written: {}",
+        refined.detail
+    );
+    assert_eq!(
+        editors.lock().unwrap().drafts[0],
+        written,
+        "an unmarked refine write is refused, so the target is untouched"
+    );
+    assert_eq!(
+        editors.lock().unwrap().replace_calls,
+        writes_before,
+        "no write was attempted"
+    );
+    assert_eq!(refined.refined_text.as_deref(), Some(REFINED));
+    assert_eq!(refined.text, TRANSCRIPT);
+    assert_eq!(
+        fs::read(runtime.0.join("delivery.json")).unwrap(),
+        br#"{"version":99,"segments":[]}"#,
+        "the future record is never downgraded"
+    );
 }
 
 #[test]

@@ -12,7 +12,10 @@
 //! id), never on the process alone, so another editor in the same application keeps
 //! the direct path.
 
-use crate::{AppResult, Target, TargetSelection, paste};
+use crate::{
+    AppResult, Target, TargetSelection, paste,
+    target_write::{appended_part, separator},
+};
 use std::{
     cell::Cell,
     collections::HashSet,
@@ -1105,15 +1108,10 @@ fn plan_paste(expected: &str, replacement: &str, draft: &str) -> AppResult<Paste
     if replacement.trim_end() == expected.trim_end() {
         return Ok(PastePlan::NothingToAppend);
     }
-    let appended = if expected.is_empty() {
-        replacement.as_str()
-    } else {
-        let prefix = format!("{expected}\n");
-        replacement.strip_prefix(&prefix).ok_or_else(|| {
-            "The intended target value does not start with the draft read at stop; the fallback writer refused to paste to avoid duplicating the original draft"
-                .to_string()
-        })?
-    };
+    let appended = appended_part(&expected, &replacement).ok_or_else(|| {
+        "The intended target value does not start with the draft read at stop; the fallback writer refused to paste to avoid duplicating the original draft"
+            .to_string()
+    })?;
     if appended.trim().is_empty() {
         return Ok(PastePlan::NothingToAppend);
     }
@@ -1124,7 +1122,7 @@ fn plan_paste(expected: &str, replacement: &str, draft: &str) -> AppResult<Paste
     let expected_trimmed = expected.trim_end();
     if live == expected_trimmed {
         return Ok(PastePlan::Append {
-            separator: if draft.is_empty() { "" } else { "\n" },
+            separator: separator(&draft),
             text: appended.to_string(),
         });
     }
@@ -1141,7 +1139,7 @@ fn plan_paste(expected: &str, replacement: &str, draft: &str) -> AppResult<Paste
     // The user or provider changed the draft after it was read. Keep that changed
     // draft and append only the transcript, never a stale copy of the old draft.
     Ok(PastePlan::Append {
-        separator: if draft.is_empty() { "" } else { "\n" },
+        separator: separator(&draft),
         text: appended.to_string(),
     })
 }
@@ -1220,6 +1218,30 @@ fn runtime_id(element: &IUIAutomationElement) -> AppResult<Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_direct_write_and_the_paste_fallback_use_the_one_append_value() {
+        use crate::target_write::{append_value, appended_part, separator};
+        for (draft, text) in [
+            ("", "今天轉寫"),
+            ("原有草稿", "今天轉寫"),
+            ("第一行\r\n第二行", "今天轉寫"),
+        ] {
+            let replacement = append_value(draft, text);
+            // The value one direct write stores is exactly the value the paste
+            // fallback would paste from the same draft: one separator, one rule.
+            assert_eq!(
+                plan_paste(draft, &replacement, draft).unwrap(),
+                PastePlan::Append {
+                    separator: separator(draft),
+                    text: text.into(),
+                }
+            );
+            // The appended part is recovered from that same value, so the two paths
+            // cannot disagree about where the transcript starts.
+            assert_eq!(appended_part(draft, &replacement), Some(text));
+        }
+    }
 
     #[test]
     fn crlf_expected_never_repeats_the_original_draft() {
