@@ -30,9 +30,9 @@
 | # | 本段验收项 | 结果 | 证据 |
 | --- | --- | --- | --- |
 | 1 | `verify-capsule.ps1`、`verify-panel.ps1` 支持 SenseVoice / 包内 exe | **PASS** | 红→绿见 §1；胶囊 **43/43** 检查通过，面板 **46/46 验收 + 42/42 自检**通过；两者都断言进程实际加载的是**包内** `engine\sherpa\sherpa-onnx-c-api.dll` |
-| 2 | 目标追加回归（含重复停止、邻居不变、0 Enter / 0 Submit） | **部分 BLOCKED / 部分 PASS** | Chrome 夹具路径 **BLOCKED**（Chrome 157 不向 UIA 暴露渲染树，§4.1）；同样的语义在**新包**的原生 EDIT 目标上 **PASS**：追加恰好一次、重复停止为 no-op、邻居与其他窗口不变、`enter=0`/`send=0`（§4.2） |
-| 3 | 只读 / 容量截断 / 目标失效 | **PASS** | 新包上三例全过：只读不写、容量 40 字符截断（39/54，`uncertain`，完整结果在面板）、目标销毁不写；邻居与其他窗口不变、0 Enter/0 Send、无临时音频（§5）。只读的浏览器 `-Scenario readonly` 路径与 §4.1 同一个 BLOCKED |
-| 4 | 识别失败重试 + 成功清理 | **PASS** | 新包上：真识别失败（`preparation=Ready`、音频保留、retry 可用）→ 故障未修复时重试仍失败且**同一份音频**仍可重试 → 修复后 `--control retry` → `Result` 且**不重放语音**、只追加一次 → 后一次失败 `--control cleanup` 删除保留音频、禁用重试、结果与目标不变（§6） |
+| 2 | 目标追加回归（含重复停止、邻居不变、0 Enter / 0 Submit） | **部分 BLOCKED / 部分 PASS** | Chrome 夹具路径 **BLOCKED**（Chrome 157 不向 UIA 暴露渲染树，§2.1）；同样的语义在**新包**的原生 EDIT 目标上 **PASS**：追加恰好一次、重复停止为 no-op、邻居与其他窗口不变、`enter=0`/`send=0`（§2.2） |
+| 3 | 只读 / 容量截断 / 目标失效 | **PASS** | 新包上三例全过：只读不写、容量 40 字符截断（39/54，`uncertain`，完整结果在面板）、目标销毁不写；邻居与其他窗口不变、0 Enter/0 Send、无临时音频（§3）。只读的浏览器 `-Scenario readonly` 路径与 §2.1 同一个 BLOCKED |
+| 4 | 识别失败重试 + 成功清理 | **PASS** | 新包上：真识别失败（`preparation=Ready`、音频保留、retry 可用）→ 故障未修复时重试仍失败且**同一份音频**仍可重试 → 修复后 `--control retry` → `Result` 且**不重放语音**、只追加一次 → 后一次失败 `--control cleanup` 删除保留音频、禁用重试、结果与目标不变（§4） |
 | — | 附带覆盖：胶囊可见性 / 共享隐身、无目标面板 | **PASS** | 第 1 项跑胶囊与面板脚本时顺带取证：胶囊可见、行为级置顶、`WDA_EXCLUDEFROMCAPTURE`、`capsule_capture_excluded=1`、拖拽持久化、托盘；无目标时结果进面板且不追加（§7） |
 
 ## 1. 两个脚本的 SenseVoice / 包内 exe 支持（红 → 绿）
@@ -133,7 +133,7 @@ At E:\luyin\.worktrees\issue-24\scripts\verify-generic-editor.ps1:76 char:5
 
 ### 2.2 替代证据：新包上的原生 EDIT 目标 — **PASS**
 
-`scripts\verify-native-target.ps1`（新增，§5 共用）在**交付包原地**跑第一例：
+`scripts\verify-native-target.ps1`（新增，§3 共用）在**交付包原地**跑第一例：
 
 | 断言 | 实测 |
 | --- | --- |
