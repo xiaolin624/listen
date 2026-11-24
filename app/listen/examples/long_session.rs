@@ -1,9 +1,11 @@
 //! Silent wall-clock replay at the same Start/Stop/result seam as the hotkey.
-//! Only the playback device is replaced; segmentation, local Whisper and output
-//! lifecycle are production code. This program never opens an audio device.
+//! Only the playback device is replaced; segmentation, local SenseVoice or Whisper
+//! and the output lifecycle are production code. This program never opens an audio
+//! device.
 use listen::{
     AppResult, Application, CapturedAudio, Control, LocalTranscriber, Phase, PlaybackAudio,
     Recording, TimedText,
+    sensevoice::SenseVoice,
     streaming::{CaptureProgress, Progress, SegmentConfig, SegmentStream, SegmentedAudioWriter},
     whisper::Whisper,
 };
@@ -126,7 +128,7 @@ impl Drop for Playing {
 }
 
 struct DelayedModel {
-    inner: Whisper,
+    inner: Arc<dyn LocalTranscriber>,
     delay: Duration,
 }
 impl LocalTranscriber for DelayedModel {
@@ -159,6 +161,11 @@ fn run() -> AppResult<()> {
     let mut engine = None;
     let mut model = None;
     let mut vad_model = None;
+    let mut sherpa_lib = None;
+    let mut sensevoice_model = None;
+    let mut sensevoice_tokens = None;
+    let mut sensevoice_vad = None;
+    let mut sensevoice_language = String::from("auto");
     let mut seconds = 3600.0f64;
     let mut delay_ms = 0u64;
     let mut threads = 6usize;
@@ -169,7 +176,7 @@ fn run() -> AppResult<()> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "long_session --input <16k-mono-PCM16.wav> --runtime <directory> --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--backend host|cli] [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
+                "long_session --input <16k-mono-PCM16.wav> --runtime <directory>\n  SenseVoice: --engine sensevoice --sherpa-lib <directory> --sensevoice-model <model.int8.onnx> --sensevoice-tokens <tokens.txt> --sensevoice-vad <silero_vad.onnx> [--sensevoice-language auto]\n  Whisper:    --engine <whisper-cli.exe> --model <ggml.bin> --vad-model <ggml-silero.bin> [--backend host|cli]\n  Common:     [--seconds 3600] [--threads 6] [--interval-seconds 5] [--delay-ms 0] [--spool-bytes 9600440]\nOnly playback is substituted; this uses real wall-clock pacing, production segmentation and actual local inference. No desktop or audio device is opened."
             );
             return Ok(());
         }
@@ -182,6 +189,11 @@ fn run() -> AppResult<()> {
             "--engine" => engine = Some(PathBuf::from(value)),
             "--model" => model = Some(PathBuf::from(value)),
             "--vad-model" => vad_model = Some(PathBuf::from(value)),
+            "--sherpa-lib" => sherpa_lib = Some(PathBuf::from(value)),
+            "--sensevoice-model" => sensevoice_model = Some(PathBuf::from(value)),
+            "--sensevoice-tokens" => sensevoice_tokens = Some(PathBuf::from(value)),
+            "--sensevoice-vad" => sensevoice_vad = Some(PathBuf::from(value)),
+            "--sensevoice-language" => sensevoice_language = value,
             "--backend" => {
                 backend = match value.as_str() {
                     "host" => listen::whisper::Backend::ModelHost,
@@ -217,15 +229,30 @@ fn run() -> AppResult<()> {
         samples: requested,
         config,
     };
-    let transcriber = DelayedModel {
-        inner: Whisper::with_backend(
-            engine.ok_or("--engine is required")?,
+    // `--engine sensevoice` selects the resident engine exactly like the application's
+    // command line; anything else is a whisper-cli path (the historical shape).
+    let engine = engine.ok_or("--engine is required")?;
+    let transcriber: Arc<dyn LocalTranscriber> = if engine.to_str() == Some("sensevoice") {
+        Arc::new(SenseVoice::new(
+            sherpa_lib.ok_or("--sherpa-lib is required for --engine sensevoice")?,
+            sensevoice_model.ok_or("--sensevoice-model is required for --engine sensevoice")?,
+            sensevoice_tokens.ok_or("--sensevoice-tokens is required for --engine sensevoice")?,
+            sensevoice_vad.ok_or("--sensevoice-vad is required for --engine sensevoice")?,
+            sensevoice_language,
+            threads,
+        ))
+    } else {
+        Arc::new(Whisper::with_backend(
+            engine,
             model.ok_or("--model is required")?,
             vad_model.ok_or("--vad-model is required")?,
             "zh".into(),
             threads,
             backend,
-        ),
+        ))
+    };
+    let transcriber = DelayedModel {
+        inner: transcriber,
         delay: Duration::from_millis(delay_ms),
     };
     let mut app = Application::new(Arc::new(tape), Arc::new(transcriber), runtime, Ok(()));
