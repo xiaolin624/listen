@@ -105,18 +105,22 @@ SenseVoice（**#17 合并后**，默认参数；具体 flag 以 #17 为准）：
 2. 根据结果在 issue #22 / #23 里记录启用闸门的结论与理由。**在看到真实录音数据之前不写结论。**
 3. 语料 WAV、`sentence-*.txt` 和 `manifest.json` 留在 `.artifacts\meeting-corpus`，后续回归可直接重跑；manifest 的 SHA-256 会防止音频被替换。
 
-## Comparison results (pending)
+## Comparison results（2026-11-24 已测）
 
-This section will hold the measured comparison once the ten sentences are recorded and both
-engines have been run on the same manifest. Nothing below is a result yet; the harness never
-fills in numbers that it did not read from `runtime\status.txt` and `runtime\current-result.txt`.
+十句流程没有单独再录：本次复用 #28 冻结的 20 段真人录音（前十句与本指南逐字相同），
+在同一份 `recording\manifest.json` 上分别跑 whisper 与 SenseVoice。完整口径、逐段文本和限制
+见 [issue-22-verification.md](issue-22-verification.md) 与脚本生成的 [issue-22-benchmark.md](issue-22-benchmark.md)。
 
-| Metric | whisper | SenseVoice |
+| Metric | whisper small | SenseVoice q8 |
 | --- | ---: | ---: |
-| Chinese accuracy (1 - micro CER) | pending | pending |
-| Mean stop → result (ms) | pending | pending |
-| Median stop → result (ms) | pending | pending |
-| Proper-noun recall | pending | pending |
+| Chinese accuracy (1 - micro CER) | 66.4% | 75.8% |
+| Mean stop → result (ms) | 6,812 | 952 |
+| Median stop → result (ms) | 6,775 | 861 |
+| Proper-noun recall | 40% (2/5) | 20% (1/5) |
 
-Gate decision: pending. It is recorded with its reasons after both result files exist and
-`docs\issue-22-benchmark.md` has been reviewed; this guide does not choose an outcome in advance.
+Gate decision: **继续替换**。中文准确率与停止延迟两项判据都明显占优；专名召回与纯英文段是
+需要随替换一起带走的已知限制。
+
+> 注意：本指南「跑基准」一节里 SenseVoice 的 `-ListenArgs @()` 写法已过时。那是 #40 之前的
+> 默认值；今天不带 `--engine sensevoice` 会启动云端试用路径，而结果文件仍被标成 `sensevoice`。
+> 现存命令见 [issue-22-verification.md](issue-22-verification.md)「测量方法」。
