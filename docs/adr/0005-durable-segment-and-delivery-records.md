@@ -10,3 +10,13 @@
 - 已解决（`appended`/`fallback`）的交付历史按条数与字节有界修剪；`pending`/`started`/`uncertain` 永不修剪，因为它们是防止重复写入的安全标记。缺链只会让迟到结果更保守地留在面板，并在原因中说明是历史被修剪，而不是声称用户改过目标文本。
 - 目标写入仍受单写入者与完整读回确认约束；`started`/`uncertain` 是终态，重复事件、重复停止和重复 poll 都不能再写一次。磁盘记录只用于证明/保守判断，从不被当作“已发送”或“已成功”的替代证据。
 - `segments.json` 与 `delivery.json` 的版本提升是兼容性决策：旧版本可读时保持原样，新字段用可选/默认值追加。
+
+## 修订（2026-11-25）：正常交付在 `started` 落不下时保持 fail-open
+
+用户 2026-11-25 决定：**正常交付（最新一段、停止后立刻交付）在 `started` 标记无法落盘时仍然写目标**，不改成 fail-closed。本文第 5 行的「写目标前先落盘 `started`」对这条路径是**尽力而为**，不是前置条件。
+
+理由（用户的取舍）：那一刻磁盘写不进属于边缘故障；漏掉一次交付比偶尔要手动删掉一段重复文字更麻烦。完整结果在任何情况下都仍在展开面板里可复制。
+
+边界：这条例外**只适用于正常交付**。迟到回填（`deliver_late`）与精修（`refine_delivery`）仍是 `Required` —— 标记落不下就不写目标。落地位置是 `app/listen/src/target_write.rs` 的 `StartMarker::{IfPossible, Required}`；行为由测试 `a_normal_delivery_still_appends_when_the_started_marker_cannot_be_saved` 钉住。
+
+残留风险（用户已知悉并接受）：标记没落盘 + 写入过程中崩溃时，重启后的恢复逻辑没有 `started` 证据，理论上可能重复追加一次。

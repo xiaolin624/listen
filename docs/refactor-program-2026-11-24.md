@@ -50,9 +50,10 @@
 - W2（#44）给 `Refine` 增加了 `Unconfirmed(原因)`：精修改写可能已经落入目标，但读回无法证明；精修文本留在面板，绝不第二次写目标。
 - `status.txt` 的键名、68 键总数、29 个 required 键都没有变；只有 `refine` 这个键的**值域**扩展：`unavailable | available | running | applied | not_applied | failed` 之外增加 `unconfirmed`，原因仍只进 `refine_reason`。`docs/issue-24-verification.md` 的口径已同步一句。
 
-## 待决定（用户）
+## 已决定（用户 2026-11-25）
 
-1. **`StartMarker::IfPossible`**：正常交付在 `started` 标记无法落盘时仍会写目标。这是待用户决定的安全取舍——要么保持「尽量写」的现有行为，要么改成「标记落不了盘就拒绝写目标」。本修复分支只记录，不改代码。
+1. **`StartMarker::IfPossible` 保持原样**：正常交付在 `started` 标记无法落盘时**仍然写目标**（fail-open）；迟到回填与精修仍是 fail-closed。理由与残留风险已写进 [`docs/adr/0005-durable-segment-and-delivery-records.md`](adr/0005-durable-segment-and-delivery-records.md) 的修订段，行为由测试 `a_normal_delivery_still_appends_when_the_started_marker_cannot_be_saved` 钉住。**不要再把它当 bug 改成 fail-closed。**
+2. **#51（W4 收尾）暂不做**：段存储/恢复的注入 seam、`start_capture` 手抄快照字段、`delete_segment` 直写状态，保留在票里作为 backlog，不阻塞任何事。
 
 ## 已知的两处矛盾（等产品决定，不在本程序内改）
 
