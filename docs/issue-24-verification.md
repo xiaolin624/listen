@@ -19,7 +19,9 @@
 `LOCALAPPDATA` 被指向隔离目录，`LISTEN_ALI_API_KEY`/`LISTEN_ALI_WORKSPACE_ID` 被清除。
 
 交付件（`E:\luyin\.worktrees\issue-23\dist\Listen-0.1.0`，manifest `git_commit=9a53e9aa…`、
-`git_dirty_at_package_time=false`、21 文件 / 264,881,704 B）**直接使用**，没有重新打包。另外
+`git_dirty_at_package_time=false`、21 文件 / 264,881,704 B）**直接使用**，没有重新打包。该目录下另有
+#23 流程遗留的 `runtime\`（7 个文件、5,707 B，git 忽略、不在 manifest 内）；本段所有运行都用
+`--runtime` 指到 `.artifacts` 下，未向该遗留目录写入任何内容。另外
 在 `%TEMP%\listen-24-user-machine\Listen-0.1.0` 放了一份逐字节相同的副本（同样 21 文件 /
 264,881,704 B），该目录没有任何 `.tools` 祖先，用来证明包不依赖仓库里的 engine/model 目录。
 
