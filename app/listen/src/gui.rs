@@ -86,7 +86,8 @@ struct Ui {
     panel_error: Option<String>,
     tray: bool,
     /// `--hidden` still shows the capsule and the panel on demand (they are the only
-    /// user-visible surfaces) but suppresses transient tray notifications.
+    /// user-visible surfaces) but suppresses transient tray notifications. Without
+    /// the tray icon (`--no-tray`) there is nowhere to show a bubble at all.
     notify: bool,
     quit_requested: bool,
     /// The currently installed status-timer interval, so it is only changed when
@@ -168,10 +169,13 @@ pub fn run(config: Config) -> Result<(), String> {
     capsule_window::enable_dpi_awareness();
     unsafe {
         if FindWindowW(HOST_CLASS, None).is_ok() {
-            return Err(
+            return Err(if config.tray() {
                 "Listen is already running. Exit it from the tray before changing configuration."
-                    .into(),
-            );
+                    .into()
+            } else {
+                "Listen is already running. Exit it from the capsule's right-click menu before changing configuration."
+                    .into()
+            });
         }
         fs::create_dir_all(config.runtime()).map_err(|e| {
             format!(
@@ -190,9 +194,10 @@ pub fn run(config: Config) -> Result<(), String> {
         if RegisterClassW(&class) == 0 {
             return Err("Cannot register Listen's window class".into());
         }
-        // A tiny off-screen owner window: it makes the tray menu behave like a
-        // normal foreground menu, and it never appears in the taskbar. Showing it
-        // does not activate it and nothing is ever painted into it.
+        // A tiny off-screen owner window: it makes the shared tray/capsule menu
+        // behave like a normal foreground menu, and it never appears in the
+        // taskbar. Showing it does not activate it and nothing is ever painted
+        // into it.
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             HOST_CLASS,
@@ -243,18 +248,25 @@ pub fn run(config: Config) -> Result<(), String> {
             last_auto_open: None,
             panel_error: None,
             tray: false,
-            notify: !config.hidden(),
+            notify: config.notify(),
             quit_requested: false,
             poll_ms: POLL_TIMER_MS,
         };
-        let mut icon = state.icon_data();
-        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        icon.uCallbackMessage = TRAY_MESSAGE;
-        state.tray = Shell_NotifyIconW(NIM_ADD, &icon).as_bool();
+        // `--no-tray` (#55): no icon at all, so there is nothing to update or
+        // delete later and nowhere to show a bubble. Without the flag the icon is
+        // installed exactly as before.
+        if config.tray() {
+            let mut icon = state.icon_data();
+            icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            icon.uCallbackMessage = TRAY_MESSAGE;
+            state.tray = Shell_NotifyIconW(NIM_ADD, &icon).as_bool();
+        }
         UI.with(|ui| *ui.borrow_mut() = Some(state));
-        // A click on the capsule toggles the expanded result panel. The handler is a
-        // plain function so the capsule window never depends on the application.
+        // A click on the capsule toggles the expanded result panel; a right click
+        // shows the same menu as the tray. The handlers are plain functions so the
+        // capsule window never depends on the application.
         capsule_window::set_click_handler(toggle_panel_on_click);
+        capsule_window::set_context_handler(show_context_menu_on_capsule);
         let registered = UI.with(|ui| {
             let mut slot = ui.borrow_mut();
             if slot.as_mut().is_none() {
@@ -406,12 +418,13 @@ impl Ui {
                 startup_capsule_ms: self.capsule.startup_ms(),
                 capture_excluded: self.capsule.capture_excluded(),
                 panel_capture_excluded: self.panel_capture_excluded(),
+                tray: self.tray,
             };
             // `status.txt` is a pure function of the snapshot plus the facts outside
             // it. The rewrite decision compares those three values themselves — the
             // whole `Snapshot` and the `FactsKey` that owns copies of `HostFacts` and
             // `WindowFacts` — so a new snapshot field can never be left out of the
-            // comparison the way a hand-written field list could. The 68-key string
+            // comparison the way a hand-written field list could. The 70-key string
             // is only formatted when one of them changed, and only written when the
             // text itself changed (#49, F6).
             let facts = status::FactsKey::of(&host, &window);
@@ -603,7 +616,7 @@ impl Ui {
                     self.quit_requested = true;
                     let _ = DestroyWindow(self.hwnd);
                 }
-                // The tray's per-segment cleanup submenu and --control
+                // The tray menu's per-segment cleanup submenu and --control
                 // delete-segment:<n> share this id scheme.
                 id if id >= DELETE_SEGMENT_ID_BASE => {
                     self.app
@@ -634,7 +647,31 @@ fn toggle_panel_on_click() {
     });
 }
 
-unsafe fn show_tray_menu(hwnd: HWND, state: &Snapshot) {
+/// The capsule right-click handler. It shows exactly the menu the tray icon shows,
+/// at the cursor, and every command it posts goes through the same command ids as
+/// the tray path. The snapshot is copied and the UI borrow released before the
+/// native menu runs its own message loop; the capsule window procedure does the
+/// same with its own state before calling in here.
+fn show_context_menu_on_capsule() {
+    let context = UI.with(|ui| {
+        let Ok(slot) = ui.try_borrow() else {
+            return None;
+        };
+        let state = slot.as_ref()?;
+        Some((state.hwnd, state.app.snapshot()))
+    });
+    if let Some((owner, snapshot)) = context {
+        unsafe {
+            show_context_menu(owner, &snapshot);
+        }
+    }
+}
+
+/// The one native context menu (#55). The tray icon's right click and the capsule's
+/// right click both call this at the cursor, so the items, their order and their
+/// availability rules cannot drift apart. `hwnd` is the hidden owner window, so a
+/// selection arrives in `window_proc` as a normal `WM_COMMAND` on either path.
+unsafe fn show_context_menu(hwnd: HWND, state: &Snapshot) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else {
             return;
@@ -779,7 +816,7 @@ unsafe extern "system" fn window_proc(
                 let snapshot =
                     UI.with(|slot| slot.borrow().as_ref().map(|state| state.app.snapshot()));
                 if let Some(snapshot) = snapshot {
-                    show_tray_menu(hwnd, &snapshot);
+                    show_context_menu(hwnd, &snapshot);
                 }
             }
             LRESULT(0)

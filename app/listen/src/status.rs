@@ -37,6 +37,10 @@ pub struct WindowFacts<'a> {
     /// before the panel window exists and when the platform refused; the key is
     /// reported either way, exactly like `capture_excluded`.
     pub panel_capture_excluded: bool,
+    /// Whether this process installed the notification-area icon (#55). False
+    /// with `--no-tray`, and also when the shell refused to create it; the key is
+    /// reported either way, exactly like the capture-exclusion keys.
+    pub tray: bool,
 }
 
 /// A cheap identity of the report's inputs that live outside the snapshot.
@@ -57,6 +61,7 @@ pub struct FactsKey {
     startup_capsule_ms: u64,
     capture_excluded: bool,
     panel_capture_excluded: bool,
+    tray: bool,
 }
 
 impl FactsKey {
@@ -71,6 +76,7 @@ impl FactsKey {
             startup_capsule_ms: window.startup_capsule_ms,
             capture_excluded: window.capture_excluded,
             panel_capture_excluded: window.panel_capture_excluded,
+            tray: window.tray,
         }
     }
 }
@@ -119,7 +125,7 @@ pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_
     let milliseconds =
         |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
     let mut status = format!(
-        "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\npanel_capture_excluded={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
+        "phase={:?}\ndetail={}\nendpoint_role={}\nendpoint_id={}\nendpoint_name={}\ncurrent_result={}\nretained_audio={}\nretry_available={}\nbackend={}\nrecognition_mode={}\nglossary={}\npreparation={}\nrefine={}\nrefine_reason={}\nnotice={}\ncapsule={}\npanel_visible={}\npanel_error={}\nstartup_capsule_ms={}\ncapsule_capture_excluded={}\npanel_capture_excluded={}\ntray={}\ntiming_capture_start_ms={}\ntiming_preparation_ms={}\ntiming_stop_to_result_ms={}\ntiming_finalize_ms={}\ntiming_recognition_ms={}\ntiming_last_window_wait_ms={}\ntiming_last_window_inference_ms={}\ntiming_save_ms={}\ntiming_delivery_ms={}\ntiming_recognition_windows={}\nprocess_id={}\nrecognition={}\nwaiting_segments={}\npending_results={}\n",
         snapshot.phase,
         snapshot.detail,
         snapshot
@@ -160,6 +166,7 @@ pub fn report(snapshot: &Snapshot, host: &HostFacts<'_>, window: &WindowFacts<'_
         window.startup_capsule_ms,
         if window.capture_excluded { 1 } else { 0 },
         if window.panel_capture_excluded { 1 } else { 0 },
+        if window.tray { 1 } else { 0 },
         milliseconds(timing.capture_start_ms),
         milliseconds(timing.preparation_ms),
         milliseconds(timing.stop_to_result_ms),
@@ -261,8 +268,8 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
-    /// The 35 unconditional keys, in the order they were written before this wave.
-    const BASE_KEYS: [&str; 35] = [
+    /// The 36 unconditional keys, in the order they were written before this wave.
+    const BASE_KEYS: [&str; 36] = [
         "phase",
         "detail",
         "endpoint_role",
@@ -284,6 +291,7 @@ mod tests {
         "startup_capsule_ms",
         "capsule_capture_excluded",
         "panel_capture_excluded",
+        "tray",
         "timing_capture_start_ms",
         "timing_preparation_ms",
         "timing_stop_to_result_ms",
@@ -422,6 +430,7 @@ mod tests {
             startup_capsule_ms: 42,
             capture_excluded: false,
             panel_capture_excluded: false,
+            tray: true,
         }
     }
 
@@ -478,6 +487,10 @@ mod tests {
             },
             WindowFacts {
                 panel_capture_excluded: true,
+                ..window()
+            },
+            WindowFacts {
+                tray: false,
                 ..window()
             },
         ] {
@@ -667,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn every_block_together_is_the_frozen_sixty_nine_keys_and_the_required_thirty() {
+    fn every_block_together_is_the_frozen_seventy_keys_and_the_required_thirty() {
         let mut state = snapshot();
         state.usage = Some(UsageSummary::default());
         state.storage = Some(storage());
@@ -679,7 +692,7 @@ mod tests {
         expected.extend(STORAGE_KEYS);
         expected.extend(TIMING_KEYS);
         assert_eq!(keys, expected);
-        assert_eq!(keys.len(), 69);
+        assert_eq!(keys.len(), 70);
 
         // No key is emitted twice; the contract is a set with one defined order.
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
@@ -741,6 +754,7 @@ mod tests {
             startup_capsule_ms: 42,
             capture_excluded: true,
             panel_capture_excluded: true,
+            tray: true,
         };
         let report = report(&state, &host(), &window);
 
@@ -786,6 +800,7 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("\npanel_capture_excluded=1\n"), "{report}");
+        assert!(report.contains("\ntray=1\n"), "{report}");
         assert!(
             report.contains("\ntiming_recognition_ms=1234\n"),
             "{report}"
@@ -819,6 +834,22 @@ mod tests {
             assert!(
                 report.contains(&format!("\npanel_capture_excluded={expected}\n")),
                 "panel_capture_excluded={expected} must be reported: {report}"
+            );
+        }
+    }
+
+    /// The notification-area icon is a launch fact (#55): `1` when this process
+    /// installed it (the default launch), `0` with `--no-tray` or when the shell
+    /// refused to create it. The key is always present, exactly like the two
+    /// capture-exclusion keys.
+    #[test]
+    fn the_tray_icon_is_always_reported_as_zero_or_one() {
+        for (tray, expected) in [(false, "0"), (true, "1")] {
+            let window = WindowFacts { tray, ..window() };
+            let report = report(&snapshot(), &host(), &window);
+            assert!(
+                report.contains(&format!("\ntray={expected}\n")),
+                "tray={expected} must be reported: {report}"
             );
         }
     }

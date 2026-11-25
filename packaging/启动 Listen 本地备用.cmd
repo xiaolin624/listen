@@ -21,7 +21,7 @@ if not exist "%~dp0engine\sherpa\onnxruntime.dll" goto engine_missing
 if not exist "%~dp0models\sense-voice\model.int8.onnx" goto model_missing
 if not exist "%~dp0models\sense-voice\tokens.txt" goto model_missing
 if not exist "%~dp0models\sense-voice\silero_vad.onnx" goto model_missing
-start "" "%~dp0listen.exe" --engine sensevoice --sherpa-lib "%~dp0engine\sherpa" --sensevoice-model "%~dp0models\sense-voice\model.int8.onnx" --sensevoice-tokens "%~dp0models\sense-voice\tokens.txt" --sensevoice-vad "%~dp0models\sense-voice\silero_vad.onnx" --runtime "%~dp0runtime" --glossary "%~dp0glossary.txt"
+start "" "%~dp0listen.exe" --engine sensevoice --sherpa-lib "%~dp0engine\sherpa" --sensevoice-model "%~dp0models\sense-voice\model.int8.onnx" --sensevoice-tokens "%~dp0models\sense-voice\tokens.txt" --sensevoice-vad "%~dp0models\sense-voice\silero_vad.onnx" --runtime "%~dp0runtime" --glossary "%~dp0glossary.txt" --no-tray
 exit /b 0
 
 :engine_missing

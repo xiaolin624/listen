@@ -7,7 +7,7 @@
 ## 后果
 
 - 现有桌面验收脚本依赖 `ListenCaptureToCopyWindowV1` 与控件 ID，需要改为通过 `--control`、`status.txt` 和胶囊展开面板验收。
-- 托盘菜单保留退出、重试、清理；精修入口放在展开面板。
+- 托盘菜单保留退出、重试、清理；精修入口放在展开面板。胶囊右键菜单与托盘菜单共用同一份实现（#55）；`--no-tray` 时通知区域不建图标，胶囊右键菜单就是退出入口。默认不传 `--no-tray` 时托盘行为不变。
 - 展开的结果面板显示完整转写，所以它与胶囊使用同一显示排除。平台拒绝时不能静默：`status.txt` 报 `panel_capture_excluded=0`，并通过面板/状态里的 `notice` 说明屏幕共享会看到完整转写。
 - 面板被排除后，普通屏幕截图（`CopyFromScreen`）拍不到面板，验收不能再拿它当外观证据。面板提供与胶囊同型的帧导出通道（`PANEL_FRAME_MESSAGE = WM_APP + 21` → `panel-frame.bmp`），由同一进程把自己当前渲染画到内存位图；同时保留全桌面截图，证明共享/录屏画面里看不到面板。这条消息只服务验收脚本，产品路径不发送，也不改变外观、焦点或位置。
-- `status.txt` 的键集合因此变化：新增 `panel_capture_excluded=0|1`（usage 与 storage 都存在时文件共 69 键，`scripts\verify-panel.ps1` 的 `$requiredKeys` 共 30 个）。键顺序与既有键含义不变。
+- `status.txt` 的键集合因此变化：新增 `panel_capture_excluded=0|1`（usage 与 storage 都存在时文件共 69 键；#55 又新增 `tray=0|1`，共 70 键，`scripts\verify-panel.ps1` 的 `$requiredKeys` 仍为 30 个）。键顺序与既有键含义不变。

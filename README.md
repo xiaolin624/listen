@@ -9,7 +9,7 @@ Windows 桌面小工具 · 双击即用 · 不装驱动、不改你的输入习�
 | 平台 | Windows 10 / 11（实测 Windows 11 26200，x64） |
 | 语言 | Rust（`app/listen`），PowerShell 打包与验收脚本 |
 | 版本 | 0.1.0 |
-| 测试 | **374 passed / 0 failed / 16 ignored** |
+| 测试 | **378 passed / 0 failed / 16 ignored** |
 | 交付包 | 21 个文件 / 253 MiB，无安装器 |
 | 默认识别 | 云端（阿里云百炼，已通过 20 段真实语料验收） |
 | 本地备用 | SenseVoiceSmall q8（sherpa-onnx 常驻进程内，需 AVX2） |
@@ -72,7 +72,7 @@ flowchart LR
 1. 解压 `dist\Listen-0.1.0\`（**整个文件夹一起用**，别只拷 exe）。
 2. **安装并登录百炼 CLI**：终端里跑一次 `bl auth login --console`。云端路径每次开始采集前都要用它做一次只读的免费保护核验（工作空间、型号、额度、`autoStop`、到期日）—— 这些是控制台级信息，API Key 拿不到。包**不包含**这个 CLI，也不会替你登录或改保护设置。
 3. 首次使用云端：跑一次 `scripts\configure-cloud-trial.ps1`，按提示输入凭据（写进当前用户的 Windows 凭据管理器，不落明文文件）。这是**应用凭据**，和上一步的 CLI 会话是两套东西。
-4. 双击 **`启动 Listen.cmd`**。屏幕上方出现细长胶囊即表示已就绪。
+4. 双击 **`启动 Listen.cmd`**。屏幕上方出现细长胶囊即表示已就绪。启动器用 `--no-tray` 启动，**通知区域没有图标**；退出、重试、清理都在**胶囊右键菜单**里。
 
 CLI 未安装、会话过期，或工作空间/额度/`autoStop` 不满足时，**开始采集会被拒绝**：音频保留在本机、不发送、不扣费，状态里给出可操作原因。它不会偷偷改成本地识别。
 
@@ -93,6 +93,7 @@ CLI 未安装、会话过期，或工作空间/额度/`autoStop` 不满足时，
 
 - **状态胶囊**：置顶、不抢焦点、不进任务栏/Alt+Tab，不显示文字、数字或实时转写 —— 状态只用颜色、形状与动效表达。可拖动并记住位置，支持多显示器与高 DPI。
 - **展开面板**：单击胶囊展开/收起，显示完整结果、当前阶段、失败原因，并提供复制、重试、清理、精修。
+- **胶囊右键菜单**：与托盘图标右键**同一份实现**（打开结果面板、开始/停止、重试本地识别、清理失败音频、清理待处理段、退出）。两个启动器都用 `--no-tray` 启动，通知区域不出现图标，所以右键菜单就是退出入口；不传 `--no-tray` 时托盘图标、菜单项数量与顺序、气泡行为与之前完全一致。
 - **两者都用 `WDA_EXCLUDEFROMCAPTURE` 从屏幕共享与录屏中隐藏**，因为面板会显示完整转写。平台拒绝隐身时不会静默：`status.txt` 会出现 `panel_capture_excluded=0` 并附带一条 `notice`。
 
 结果只在面板中时（无目标回退）会自动展开一次；失败不会抢屏，胶囊变红由你自己点开看原因。
@@ -125,6 +126,7 @@ Key 只从环境变量 `DEEPSEEK_API_KEY` 读取；没有 key 时按钮置灰，
 | `--engine <sensevoice\|whisper\|whisper-cli.exe>` | 显式选择本地引擎；与 `--cloud-trial` 不能同时出现 |
 | `--cloud-trial ali` | 显式选择云端（默认即云端） |
 | `--runtime <dir>` `--glossary <file>` `--threads <n>` `--hidden` | 运行目录、术语表、线程数、启动时隐藏 |
+| `--no-tray` | 不创建通知区域图标（也不发气泡）；退出改由胶囊右键菜单。启动器默认传它，不传时托盘行为不变 |
 | `--sherpa-lib` `--sensevoice-model` `--sensevoice-tokens` `--sensevoice-vad` | SenseVoice 的四条本地路径（包内启动器已传好） |
 | `--pending-audio-budget-mib` `--free-disk-floor-mib` | 待处理音频总预算（默认 1 GiB）、磁盘余量底线（默认 1 GiB） |
 | `--control <start\|stop\|retry\|cleanup\|show\|panel\|copy\|refine\|quit\|delete-segment:n>` | 控制已运行实例；验收脚本与自动化用它 |
@@ -143,7 +145,7 @@ Key 只从环境变量 `DEEPSEEK_API_KEY` 读取；没有 key 时按钮置灰，
 | 共享屏幕时看得到面板 | `status.txt` 的 `panel_capture_excluded` | 为 `0` 时说明平台拒绝了隐身，`notice` 会写原因 |
 | 识别质量突然变差 | `status.txt` 的 `backend` / `endpoint_name` | 采到了错的播放设备，或蓝牙耳机切到了免提（HFP）模式 |
 
-`status.txt` 共 69 个键（其中 30 个是验收脚本要求的固定键），不含转写正文；键名与含义见 [验收口径](docs/issue-24-verification.md)。
+`status.txt` 共 70 个键（其中 30 个是验收脚本要求的固定键），不含转写正文；键名与含义见 [验收口径](docs/issue-24-verification.md)。`tray=0|1` 记录本次进程是否建了通知区域图标。
 
 ---
 
@@ -188,7 +190,7 @@ flowchart TB
 
 ```powershell
 .\scripts\build-listen.ps1 -Task Build        # release 构建
-.\scripts\build-listen.ps1 -Task Test         # 全量测试（374 passed / 16 ignored）
+.\scripts\build-listen.ps1 -Task Test         # 全量测试（378 passed / 16 ignored）
 .\scripts\build-listen.ps1 -Task CheckFormat  # cargo fmt --check
 .\scripts\package-listen.ps1 -IncludeModels   # 生成交付包并自检
 .\scripts\verify-listen-package.ps1 -PackageRoot dist\Listen-0.1.0 -Evidence <json>
@@ -266,6 +268,7 @@ Rust | re
 | 全量桌面验收回归 | [issue-24-verification.md](docs/issue-24-verification.md) |
 | 剪贴板回退在 CEF 宿主的修复 | [issue-53-verification.md](docs/issue-53-verification.md) |
 | 面板隐身 | [issue-54-verification.md](docs/issue-54-verification.md) |
+| 无托盘启动与胶囊右键菜单 | [issue-55-verification.md](docs/issue-55-verification.md) |
 | 架构加深的八波重构 | [refactor-program-2026-11-24.md](docs/refactor-program-2026-11-24.md) |
 | 决策记录 | [docs/adr/](docs/adr/) |
 

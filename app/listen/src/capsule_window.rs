@@ -49,8 +49,8 @@ use windows::{
                 SWP_NOZORDER, SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
                 ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
                 WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -238,6 +238,30 @@ thread_local! {
 /// message loop starts.
 pub fn set_click_handler(handler: fn()) {
     CLICK_HANDLER.with(|slot| slot.set(Some(handler)));
+}
+
+thread_local! {
+    /// The context-menu action registered by `gui`: the same native menu the tray
+    /// icon shows. A plain function pointer keeps this window independent of the
+    /// application state the menu reads.
+    static CONTEXT_HANDLER: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Register the action a capsule right click performs. Called once by `gui` before
+/// the message loop starts.
+pub fn set_context_handler(handler: fn()) {
+    CONTEXT_HANDLER.with(|slot| slot.set(Some(handler)));
+}
+
+/// Context-menu hook for the capsule. It runs before the window procedure takes
+/// the capsule's own state borrow, because the native menu opens a nested message
+/// loop that repaints this window and dispatches its timer.
+pub fn on_context_menu() {
+    CONTEXT_HANDLER.with(|slot| {
+        if let Some(handler) = slot.get() {
+            handler();
+        }
+    });
 }
 
 fn with_window(hwnd: HWND, action: impl FnOnce(&mut Window)) {
@@ -663,6 +687,14 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             WM_ERASEBKGND => return LRESULT(1),
+            // The right click is consumed before the capsule borrow below, because
+            // the menu owns a nested message loop. DefWindowProc is not reached, so
+            // this window does not also generate a WM_CONTEXTMENU for the same
+            // click; the left-button toggle (and its drag) is untouched.
+            WM_RBUTTONUP => {
+                on_context_menu();
+                return LRESULT(0);
+            }
             CAPSULE_FRAME_MESSAGE => {
                 // Returns 1 so the caller can tell a saved frame from a timeout.
                 let saved = CAPSULE.with(|slot| {

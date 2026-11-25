@@ -45,8 +45,11 @@ Options:
         SenseVoice language hint (default auto).
   --model <ggml.bin> --vad-model <ggml-silero.bin> --language <zh|auto|...> --backend <host|cli>
         whisper.cpp fallback settings; --backend host (default) keeps the model resident, cli starts one process per window.
-  --runtime <directory> --threads <count> --hidden
-        runtime files, recognition threads and start-hidden behavior.
+  --runtime <directory> --threads <count> --hidden --no-tray
+        runtime files, recognition threads and start-hidden behavior. --no-tray
+        starts without a notification-area icon; the capsule's right-click menu
+        is then the exit entry. Without the flag the tray icon is installed as
+        before.
   --pending-audio-budget-mib <MiB>
         pending capture audio allowed across every segment before a new capture is
         refused and a running one is stopped (default 1024 = 1 GiB). The measurement

@@ -46,6 +46,9 @@ pub struct Config {
     language: String,
     threads: usize,
     hidden: bool,
+    /// `--no-tray`: start without a notification-area icon. The default launch
+    /// keeps the icon, so this is false unless the flag is passed.
+    no_tray: bool,
     backend: Backend,
     glossary: Option<PathBuf>,
     engine_kind: Engine,
@@ -77,6 +80,7 @@ impl Config {
             language: "zh".into(),
             threads: 6,
             hidden: false,
+            no_tray: false,
             backend: Backend::ModelHost,
             glossary: None,
             engine_kind: Engine::SenseVoice,
@@ -111,6 +115,10 @@ impl Config {
         while let Some(arg) = args.next() {
             if arg == "--hidden" {
                 config.hidden = true;
+                continue;
+            }
+            if arg == "--no-tray" {
+                config.no_tray = true;
                 continue;
             }
             if arg == "--help" || arg == "-h" {
@@ -238,6 +246,18 @@ impl Config {
 
     pub fn hidden(&self) -> bool {
         self.hidden
+    }
+
+    /// Whether this process installs a notification-area icon. Only `--no-tray`
+    /// turns it off; without the flag the tray icon is created exactly as before.
+    pub fn tray(&self) -> bool {
+        !self.no_tray
+    }
+
+    /// Whether transient phase notifications may be shown. There is nowhere to
+    /// show them without the icon, and `--hidden` suppresses them as before.
+    pub fn notify(&self) -> bool {
+        self.tray() && !self.hidden
     }
 
     pub fn glossary(&self) -> Option<&Path> {

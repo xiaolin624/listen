@@ -27,5 +27,5 @@ if not exist "%~dp0CLOUD-TRIAL.md" (
   pause
   exit /b 1
 )
-start "" "%~dp0listen.exe" --runtime "%~dp0runtime-cloud" --glossary "%~dp0glossary.txt"
+start "" "%~dp0listen.exe" --runtime "%~dp0runtime-cloud" --glossary "%~dp0glossary.txt" --no-tray
 exit /b 0

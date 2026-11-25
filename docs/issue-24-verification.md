@@ -11,8 +11,9 @@
 > （以及 `delivery.json`）；窗口类名、窗口样式、控件 ID 只作自检，不作验收依据。**
 
 - 所有桌面验收**串行**执行，同一时刻只跑一个，项与项之间确认 `Get-Process listen` 为空。
-- `status.txt` 的 `refine` 键在 W2（#44）后多一个取值 `unconfirmed`：精修改写可能已落入目标但无法证明，精修文本留在面板、不会第二次写目标。该波次键名与键数未变（**当时** 68 键 / 29 required；#54 新增 `panel_capture_excluded` 后为 **69 键 / 30 required**），只是值域扩展；按取值集合断言的验收必须接受它。
+- `status.txt` 的 `refine` 键在 W2（#44）后多一个取值 `unconfirmed`：精修改写可能已落入目标但无法证明，精修文本留在面板、不会第二次写目标。该波次键名与键数未变（**当时** 68 键 / 29 required；#54 新增 `panel_capture_excluded` 后为 **69 键 / 30 required**；#55 新增 `tray` 后为 **70 键 / 30 required**），只是值域扩展；按取值集合断言的验收必须接受它。
 - `status.txt` 在 #54 后新增 `panel_capture_excluded=0|1`：展开结果面板与胶囊一样用 `WDA_EXCLUDEFROMCAPTURE` 隐身。键顺序插在 `capsule_capture_excluded` 之后；`scripts\verify-panel.ps1` 的 `$requiredKeys` 同步为 30 个，面板外观证据改由 `WM_APP+21` 帧导出（见 [issue-54 验证](issue-54-verification.md)）。
+- `status.txt` 在 #55 后新增 `tray=0|1`：本次进程是否建了通知区域图标。启动器用 `--no-tray` 启动时报 `0`，默认（不传）报 `1`；键顺序插在 `panel_capture_excluded` 之后。胶囊右键菜单与托盘菜单共用同一份实现，`scripts\verify-panel.ps1` 的 `$requiredKeys` 仍为 30 个。见 [issue-55 验证](issue-55-verification.md)。
 - 识别一律走本地引擎（包内 `engine\sherpa` + `models\sense-voice` 的 SenseVoiceSmall q8）；
   `LOCALAPPDATA` 指向隔离目录，`LISTEN_ALI_API_KEY` / `LISTEN_ALI_WORKSPACE_ID` 未设置，
   全程不走云端识别路径、不产生付费请求、不消耗百炼额度。

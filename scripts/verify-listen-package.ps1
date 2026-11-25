@@ -189,6 +189,13 @@ if ($localLauncher.Text -notmatch '--runtime\s+"%~dp0runtime"') {
 if ($localLauncher.Text -match '--cloud-trial') {
     throw 'The local fallback launcher must not pass --cloud-trial; local recognition is an explicit fallback.'
 }
+# Both launchers start without a notification-area icon (issue #55), so the only
+# exit entry is the capsule's right-click menu.
+foreach ($launcher in $launcherInfo) {
+    if ($launcher.Text -notmatch '(^|\s)--no-tray(\s|$)') {
+        throw ('The launcher does not start Listen without a notification-area icon (issue #55): ' + $launcher.File.Name)
+    }
+}
 if ([string]$manifest.local_fallback.launcher -ne $localLauncher.File.Name) {
     throw 'The manifest local fallback launcher does not name the packaged local launcher.'
 }
@@ -227,7 +234,7 @@ foreach ($phrase in @('Listen/CloudTrial/Alibaba/cn-beijing', 'SecureString', 'L
 }
 
 $readme = [IO.File]::ReadAllText((Join-Path $PackageRoot 'README.md'))
-foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'runtime-cloud', 'SenseVoice', 'FunASR', 'sherpa-onnx', 'MODEL_LICENSE', 'THIRD-PARTY-NOTICES.md', '--engine', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
+foreach ($phrase in @('Ctrl+Alt+R', 'libunwind.dll', 'runtime', 'runtime-cloud', 'SenseVoice', 'FunASR', 'sherpa-onnx', 'MODEL_LICENSE', 'THIRD-PARTY-NOTICES.md', '--engine', '--no-tray', 'qwen-audio-3.1-asr-flash-message', 'cn-beijing', 'configure-cloud-trial.ps1', 'CLOUD-TRIAL.md')) {
     if ($readme.IndexOf($phrase, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw ('The packaged README does not explain: ' + $phrase)
     }

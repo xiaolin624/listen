@@ -38,13 +38,13 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
    ```
 
    先输入北京业务空间 Workspace ID，再以隐藏输入输入 API Key。Key 只存当前 Windows 用户的 Credential Manager；`%LOCALAPPDATA%\Listen\cloud-trial\ali.json` 只保存非秘密的 `workspace_id`、`model`、`region`。不要把 Key 写进命令行、聊天、日志或脚本。
-4. 双击 **`启动 Listen.cmd`**。桌面上会出现**状态胶囊**；等待它从“准备中”变为“就绪”。
+4. 双击 **`启动 Listen.cmd`**。桌面上会出现**状态胶囊**；等待它从“准备中”变为“就绪”。启动器带 `--no-tray`，所以**通知区域没有图标**。
 5. 在 Windows 声音设置中确认实际使用的耳机是**默认多媒体播放设备**；让会议或播放器通过这个设备播放声音。
 6. 点击要用接收文字的编辑区（原生控件或网页编辑区），按 **Ctrl+Alt+R** 开始。胶囊显示采集中的动效。
 7. 再按 **Ctrl+Alt+R** 停止。状态依次为处理中、结果（或没有检测到语音）。停止后只有取得整段云端确认并保存完整文字，才会安全回填。
 8. 单击胶囊展开**结果面板**，检查完整结果；需要时点“复制完整结果”。由你手动发送；Listen 不发送 Enter，也不点发送按钮。
 
-关闭结果面板不会退出 Listen；程序继续在系统托盘运行。托盘左键打开面板，右键提供打开结果面板、开始/停止、重试、清理和退出。只运行一个实例。
+关闭结果面板不会退出 Listen；程序继续在后台运行。两个启动器都以 `--no-tray` 启动，所以通知区域没有图标；**退出、打开结果面板、开始/停止、重试、清理都在胶囊右键菜单里**（与托盘菜单是同一份实现、同样的项与顺序；左键单击胶囊展开/收起面板）。只运行一个实例。
 
 **缺少凭据、工作空间、型号或地域时**：默认启动本身会显示失败状态并写出可操作的修正提示（`No Alibaba cloud API key ...` 或 `Cloud trial requires a valid Alibaba workspace ...`），开始采集会被拒绝，**不会**悄悄改成本地识别，也不会写出任何目标。按提示修正后再按 Ctrl+Alt+R。
 
@@ -56,7 +56,7 @@ Listen 是 Windows 后台工具。先点击目标编辑区，按 **Ctrl+Alt+R** 
 2. 关闭正在运行的 Listen，双击 **`启动 Listen 本地备用.cmd`**。
 3. 状态胶囊就绪后，操作与云端相同；`runtime\status.txt` 的 `recognition_mode=local`、`backend=` 和面板会写明本机引擎，不发送音频。
 
-这是**新的**本机识别采集，不是云端失败后的自动降级。`runtime-cloud\` 里尚未完成的云端录音不会被本地模式读取；下次打开默认启动器时仍会继续云端恢复。切换识别来源请显式关闭并重新启动，不要同时开两个实例。等价的命令行选择是 `listen.exe --engine sensevoice --sherpa-lib <包内 engine\sherpa> --sensevoice-model <…model.int8.onnx> --sensevoice-tokens <…tokens.txt> --sensevoice-vad <…silero_vad.onnx> --runtime <…runtime>`；**必须显式传全部引擎与模型路径**，否则应用会从 `listen.exe` 向上查找含 `.tools` 的祖先目录，可能加载到开发目录里的文件而不是包内文件。打包脚本与验证脚本也按这组显式参数区分两个启动器。
+这是**新的**本机识别采集，不是云端失败后的自动降级。`runtime-cloud\` 里尚未完成的云端录音不会被本地模式读取；下次打开默认启动器时仍会继续云端恢复。切换识别来源请显式关闭并重新启动，不要同时开两个实例。等价的命令行选择是 `listen.exe --engine sensevoice --sherpa-lib <包内 engine\sherpa> --sensevoice-model <…model.int8.onnx> --sensevoice-tokens <…tokens.txt> --sensevoice-vad <…silero_vad.onnx> --runtime <…runtime> --no-tray`；**必须显式传全部引擎与模型路径**，否则应用会从 `listen.exe` 向上查找含 `.tools` 的祖先目录，可能加载到开发目录里的文件而不是包内文件。打包脚本与验证脚本也按这组显式参数区分两个启动器。
 
 ## 费用与免费额度
 
@@ -124,7 +124,7 @@ Get-FileHash .\models\sense-voice\silero_vad.onnx -Algorithm SHA256
 - **清理失败音频**：删除保留的失败音频，之后不能再用它重试；
 - **删除待处理段**：按采集顺序清理指定段的待处理音频和待取结果，不影响其他段；
 - **精修（不可用）**：没有 `DEEPSEEK_API_KEY` 时明确置灰；精修仍需你单独触发；
-- **关闭**：隐藏面板，程序继续在托盘运行。
+- **关闭**：隐藏面板，程序继续在后台运行（通知区域没有图标）。
 
 没有有效目标、目标失效或写入无法确认时，结果只出现在面板里并自动展开一次；成功追加不会自动打开面板。失败不会自动抢屏：胶囊变红，你点开面板即可看到原因。
 
@@ -168,7 +168,7 @@ Rust | re
 | `%LOCALAPPDATA%\Listen\cloud-trial\ledger.json` | 共享 CNY 50 试用账本；不随包分发、不自动重置 |
 | Windows Credential Manager `Listen/CloudTrial/Alibaba/cn-beijing` | 当前用户的云端 API Key；不在包内、状态或日志中 |
 
-确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和托盘会提供重试和清理入口；云端待处理音频保留在自己的运行目录，不用本地模式冒充处理。
+确认不再需要失败音频后，退出 Listen，再删除 `status.txt` 中列出的本次临时目录。重启不会自动清理旧的失败目录。识别失败时面板和胶囊右键菜单会提供重试和清理入口；云端待处理音频保留在自己的运行目录，不用本地模式冒充处理。
 
 ## 署名与许可
 
