@@ -1,9 +1,10 @@
 # #55 启动时不显示系统托盘图标，退出改到胶囊右键菜单 — 验证
 
 状态：**完成**。工单 [GitHub issue #55](https://github.com/xiaolin624/listen/issues/55)。
-分支 `implement/issue-55-no-tray`，基线 `0e9e0fa`（= `main` 尖端），工作树
-`E:\luyin\.worktrees\tray`。主工作树 `E:\luyin` 的 7 份用户改动全程未被触碰、未 add、
-未 commit、未 stash。
+分支 `implement/issue-55-no-tray`，基线 `0e9e0fa`（= `main` 尖端），实现提交
+`53477e8`（交付包也由该提交生成；本文件随后只补充打包证据，不再改产品代码），
+工作树 `E:\luyin\.worktrees\tray`。主工作树 `E:\luyin` 的 7 份用户改动全程未被触碰、
+未 add、未 commit、未 stash。
 
 ## 结论
 
@@ -13,13 +14,13 @@
 | 默认不传时行为完全不变 | 通过 | `tray=1`；UIA 枚举新增 Listen 图标；`verify-panel.ps1` acceptance **47/47**、UI 自检 **48/48**（含托盘菜单 6 项、托盘左键、胶囊左键、Esc） |
 | 胶囊右键菜单与托盘菜单是**同一份实现** | 通过 | 只保留一个 `show_context_menu`；桌面实测菜单 6 项文本/顺序与托盘一致；`capsule-context-menu.png` |
 | 右键「退出」走现有 `ID_EXIT` 路径并结束进程 | 通过 | 真实鼠标右键 + 点击「退出」后进程退出，无残留 `listen` 进程，无残留托盘图标 |
-| `status.txt` 新增 `tray=0\|1`（69 → 70 键） | 通过 | `status::tests::the_tray_icon_is_always_reported_as_zero_or_one`；两种模式实测；全有块测试 70 键 / required 仍 30 |
+| `status.txt` 新增 `tray=0\|1`（全有块 69 → 70 键） | 通过 | `status::tests::the_tray_icon_is_always_reported_as_zero_or_one`；两种模式实测；全有块测试 70 键 / required 仍 30 |
 | 两个启动器都传 `--no-tray` | 通过 | `packaging\启动 Listen.cmd`、`packaging\启动 Listen 本地备用.cmd`；`verify-listen-package.ps1` 新增断言 |
 | `-Task Test` | 通过 | **378 passed / 0 failed / 16 ignored**（基线 374 / 0 / 16，新增 4 个测试） |
 | `-Task CheckFormat` | 通过 | 无输出、exit 0 |
 | `verify-capsule.ps1`（胶囊回归，补充） | 33/33 项通过后停在无关的重启恢复步骤 | 见「胶囊回归」 |
-| 打包后双击 `启动 Listen.cmd`：无托盘图标、右键能退出 | 通过 | 见「打包与启动器实跑」 |
-| `verify-listen-package.ps1` | 通过 | 见「打包与启动器实跑」 |
+| 打包后双击 `启动 Listen.cmd`：无托盘图标、右键能退出 | 通过 | 云端默认 `tray=0`；UIA 无图标；右键 6 项菜单退出；见「打包与启动器实跑」 |
+| `verify-listen-package.ps1` | 通过 | 包内启动器冒烟 + 17 文件 / 19 哈希校验，`package_untouched=true` |
 
 ## TDD：红 → 绿
 
@@ -87,7 +88,7 @@ error: could not compile `listen` (bin "listen" test) due to 4 previous errors
   （`--hidden` 同型，不吞下一个参数）；访问器 `tray()` 表示是否安装通知区域图标，
   `notify()` = `tray() && !hidden()`。默认构造 `no_tray=false`，所以默认启动的
   `tray()` / `notify()` 都为真，行为不变。`listen.exe --help` 写明该开关。
-- **不建图标**：`gui::Ui::install` 只有在 `config.tray()` 为真时才构造
+- **不建图标**：`gui::run` 的启动段只有在 `config.tray()` 为真时才构造
   `NOTIFYICONDATAW` 并调用 `Shell_NotifyIconW(NIM_ADD)`；`Ui.tray` 保持 `false`，
   于是轮询里的 `NIM_MODIFY`（含气泡）和退出时的 `NIM_DELETE` 都不会发生，也不存在
   “有图标但状态说没有”的不一致。
@@ -101,7 +102,7 @@ error: could not compile `listen` (bin "listen" test) due to 4 previous errors
     选择结果以同一个 `WM_COMMAND` 回到 `window_proc`，「退出」走现有 `ID_EXIT`。
   - 因为 `WM_RBUTTONUP` 被直接消费、不再落到 `DefWindowProc`，同一次右键不会再生成
     `WM_CONTEXTMENU`，所以没有额外处理它；左键（点击切换面板、拖动）路径未改。
-- **状态**：`status::WindowFacts` / `FactsKey` 增加 `tray`，`Status::report` 在
+- **状态**：`status::WindowFacts` / `FactsKey` 增加 `tray`，`status::report` 在
   `panel_capture_excluded` 之后输出 `tray=0|1`；`gui` 传入 `self.tray`
   （`NIM_ADD` 成功才为 1，`--no-tray` 或 Shell 拒绝都为 0）。键集合 69 → 70，
   `scripts\verify-panel.ps1` 的 `$requiredKeys` 仍为 30、不要求新键。
@@ -139,9 +140,10 @@ listen.exe --engine sensevoice ... --runtime ...\runtime-no-tray --no-tray
 - 证据：`capsule-context-menu.png`（菜单 276×147；胶囊本身被
   `WDA_EXCLUDEFROMCAPTURE` 排除，所以画面里只有菜单，这是预期的取证方式）、
   `tray-before.txt` / `tray-default.txt` / `tray-no-tray.txt` / `tray-final.txt`。
-  通知区域检查方式是 UIA：`Shell_TrayWnd` 的可见按钮 + `SysPager`/`TrayNotifyWnd` 之外，
-  再展开“显示隐藏的图标”后的 `TopLevelWindowForOverflowXamlIsland` 浮出层
-  （`IsWindowVisible` 过滤），逐按钮读取 `Name`；没有用截图数图标。
+  通知区域检查方式是 UIA：先取 `Shell_TrayWnd` 下的全部按钮
+  （`TrayNotifyWnd` 的 `SystemTray.*` 按钮，含“显示隐藏的图标”），再展开该按钮的
+  `TopLevelWindowForOverflowXamlIsland` 浮出层（`IsWindowVisible` 过滤），逐按钮读取
+  `Name`；没有用截图数图标。
 
 ### 两种模式的 `status.txt` 摘要
 
@@ -153,10 +155,15 @@ listen.exe --engine sensevoice ... --runtime ...\runtime-no-tray --no-tray
 | `capsule` | `Ready` | `Ready` |
 | `panel_visible` | `0` | `0` |
 | `panel_error` | 空 | 空 |
-| `process_id` | 103636 | 1240 |
+| `process_id` | 120316 | 127724 |
 
-完整快照：`.artifacts\issue-55\status-default.txt`、`status-no-tray.txt`
-（`.artifacts` 被 Git 忽略，不提交）。两种模式的键数均为 70。
+完整快照：`.artifacts\issue-55\runtime-default\status.txt`、
+`runtime-no-tray\status.txt`（退出后的最后一次写入；摘要表取自
+`status-default.txt` / `status-no-tray.txt` 的 Ready 时刻；`.artifacts` 被 Git 忽略，
+不提交）。两种模式的文件都是 **59 个键**（本地识别没有云端 usage 账本，usage 块只输出
+`usage_available`；`detail` 是多行说明，按行数会更多）。全有块契约（usage 账本与
+storage 同时存在）为 **70 键**，见
+`every_block_together_is_the_frozen_seventy_keys_and_the_required_thirty`。
 
 ### `verify-panel.ps1`（默认模式，release）
 
@@ -170,8 +177,9 @@ listen.exe --engine sensevoice ... --runtime ...\runtime-no-tray --no-tray
 
 **PASS**：acceptance **47/47**、UI self-checks **48/48**、failures **0**。其中包含
 `status.txt keeps every previous key and adds panel_capture_excluded`（30 个 required
-键齐全、70 键文件）、托盘菜单可打开且恰好 6 项、第一项为“打开结果面板”、分隔线在退出前、
-重试/清理灰化与 `retry_available` 一致、托盘左键打开面板、胶囊点击切换、Esc 关闭。
+键齐全）、`panel_capture_excluded=0/1` 两个断言、托盘菜单可打开且恰好 6 项、第一项为
+“打开结果面板”、分隔线在退出前、重试/清理灰化与 `retry_available` 一致、托盘左键
+打开面板、胶囊点击切换、Esc 关闭。脚本的 `$requiredKeys` 不变，也不要求 `tray`。
 证据：`.artifacts\issue-55\panel\panel-verification.json`、`tray-menu.png` 等。
 
 ### 胶囊回归（release，`verify-capsule.ps1`，补充）
@@ -221,13 +229,31 @@ listen.exe --engine sensevoice ... --runtime ...\runtime-no-tray --no-tray
 
 ## 打包与启动器实跑
 
-在干净提交上执行（结果见本节末行补记）：
+在干净的产品提交 `53477e8` 上执行（该提交是打包时的 HEAD；本文件随后只补充这段
+打包证据，产品代码未再变化）：
 
 ```powershell
 .\scripts\package-listen.ps1 -IncludeModels
-& '.\dist\Listen-0.1.0\启动 Listen.cmd'      # 双击等价；云端口令与 bl 已配置
+& '.\dist\Listen-0.1.0\启动 Listen.cmd'      # 双击等价；云端凭据与 bl 已配置
 .\scripts\verify-listen-package.ps1 -PackageRoot .\dist\Listen-0.1.0 -Evidence <json>
 ```
+
+- **打包**：`dist\Listen-0.1.0`，manifest `git_commit=53477e85fd8f766b6c369f96e2ac7a512e5d7e10`、
+  `git_dirty_at_package_time=false`、`included_models=true`；manifest 列 19 个文件
+  （加 `.listen-package` 与 `manifest.json` 共 21 个），264,907,725 字节（≈253 MiB）。
+- **双击 `启动 Listen.cmd`**（`verify-launcher-55.ps1`，ASCII，证据
+  `.artifacts\issue-55\package\`）：启动器正常退出（exit 0），Listen 走**云端默认**
+  （`recognition_mode=cloud-trial`，`preparation=Ready`，`phase=Ready`），
+  `tray=0`；UIA 通知区域没有 Listen 图标；胶囊 `822,48 275×33`；真实右键在
+  `960,64` 打开菜单，6 项与托盘一致（`打开结果面板`、`开始 / 停止  Ctrl+Alt+R`、
+  `重试本地识别`、`清理失败音频`、分隔线、`退出`）；点击「退出」后进程结束，
+  无残留进程与托盘图标。截图：`capsule-context-menu-packaged.png`。
+  这次运行产生的 `dist\Listen-0.1.0\runtime-cloud\` 已被删除，包内容与 manifest 一致。
+- **`verify-listen-package.ps1`**：**PASS**（`package_verification.json` /
+  `package-verification.log`）：launcher smoke 用包内本地启动器启动到 `phase=Ready`、
+  `recognition_mode=local`，随后 `--control quit` 正常退出；17 个文件逐项校验、
+  19 个 SHA-256、5 个钉死哈希、密钥守卫自检、云端无效/就绪两条路径均通过，
+  `package_untouched=true`。
 
 ## 未改变的部分
 
