@@ -124,6 +124,7 @@ Key 只从环境变量 `DEEPSEEK_API_KEY` 读取；没有 key 时按钮置灰，
 | 参数 | 说明 |
 |---|---|
 | `--engine <sensevoice\|whisper\|whisper-cli.exe>` | 显式选择本地引擎；与 `--cloud-trial` 不能同时出现 |
+| `--ali-model <id>` | 云端型号开关，默认 `qwen-audio-3.1-asr-flash-message`；白名单外的型号会被明确拒绝。2026-11-26 的 A/B 显示 `-streaming` 更快但内容更差，故未改为默认 |
 | `--cloud-trial ali` | 显式选择云端（默认即云端） |
 | `--runtime <dir>` `--glossary <file>` `--threads <n>` `--hidden` | 运行目录、术语表、线程数、启动时隐藏 |
 | `--no-tray` | 不创建通知区域图标（也不发气泡）；退出改由胶囊右键菜单。启动器默认传它，不传时托盘行为不变 |
