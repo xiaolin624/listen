@@ -617,7 +617,7 @@ impl FreeOnlyStatusSource for ConsoleStatus {
     fn workspaces(&self) -> Result<Vec<u8>, CloudError> {
         Ok(serde_json::to_vec(&self.workspaces).unwrap())
     }
-    fn quota(&self) -> Result<Vec<u8>, CloudError> {
+    fn quota(&self, _model: &str) -> Result<Vec<u8>, CloudError> {
         Ok(serde_json::to_vec(&self.quota).unwrap())
     }
 }

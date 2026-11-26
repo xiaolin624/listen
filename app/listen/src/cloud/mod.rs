@@ -40,8 +40,22 @@ use std::{
 #[cfg(windows)]
 pub use transport::NativeMessageTransport;
 
+/// The shipped cloud model: the short-segment Message model the trial was
+/// accepted with (#40). The default is unchanged; #56 only measures an explicit
+/// alternative.
 pub const ALI_MODEL: &str = "qwen-audio-3.1-asr-flash-message";
+/// The candidate model for continuous meeting transcription (#56). It is not the
+/// default; `--ali-model` is the only way to select it.
+pub const ALI_MODEL_STREAMING: &str = "qwen-audio-3.1-asr-flash-streaming";
+/// The closed set of models this trial may send audio to. An id outside this list
+/// is refused rather than silently replaced by the default.
+pub const ALI_MODELS: [&str; 2] = [ALI_MODEL, ALI_MODEL_STREAMING];
 pub const ALI_REGION: &str = "cn-beijing";
+
+/// Whether the trial is allowed to use this model id at all.
+pub fn is_allowed_model(model: &str) -> bool {
+    ALI_MODELS.contains(&model)
+}
 
 /// A transient cloud failure is retried with a bounded, growing delay. The
 /// capture owns the received audio meanwhile, so waiting never discards it.
@@ -147,11 +161,22 @@ impl AliSettings {
             region: ALI_REGION.into(),
         }
     }
+    /// Applies an explicit process-level model selection (`--ali-model`, #56). The
+    /// flag is the most specific source, so it wins over the stored settings file
+    /// and `LISTEN_ALI_MODEL`; absent, the settings keep their value untouched.
+    /// The whitelist is enforced by `validate` (and earlier, by argument parsing),
+    /// so an unlisted id can never be used just because a caller skipped parsing.
+    pub fn with_model(mut self, model: Option<&str>) -> Self {
+        if let Some(model) = model {
+            self.model = model.to_owned();
+        }
+        self
+    }
     pub fn description(&self) -> String {
         format!(
             "Cloud trial: Alibaba Model Studio; model={}; region={}; shared single-vendor trial cap=CNY 50",
-            if self.model == ALI_MODEL {
-                ALI_MODEL
+            if is_allowed_model(&self.model) {
+                self.model.as_str()
             } else {
                 "unsupported model (check local settings)"
             },
@@ -163,7 +188,7 @@ impl AliSettings {
         )
     }
     fn validate(&self) -> Result<(), CloudError> {
-        if self.model != ALI_MODEL
+        if !is_allowed_model(&self.model)
             || self.region != ALI_REGION
             || self.workspace_id.is_empty()
             || self.workspace_id.len() > 64
@@ -316,7 +341,7 @@ impl fmt::Display for CloudError {
         f.write_str(match self {
             Self::MissingKey => "No Alibaba cloud API key is configured. Use scripts/configure-cloud-trial.ps1 locally, or inject LISTEN_ALI_API_KEY for this process; no cloud request was sent",
             Self::Credential => "The local cloud credential could not be read or has an invalid format; configure it again locally",
-            Self::Configuration => "Cloud trial requires a valid Alibaba workspace, cn-beijing region and qwen-audio-3.1-asr-flash-message model; check the local configuration",
+            Self::Configuration => "Cloud trial requires a valid Alibaba workspace, a cn-beijing region and a whitelisted ASR model (qwen-audio-3.1-asr-flash-message or qwen-audio-3.1-asr-flash-streaming); check the local configuration",
             Self::BudgetUnknown => "The maximum charge for this cloud trial cannot yet be confirmed. No audio was sent. Use local recognition for now; see the local cloud-trial configuration guide for the remaining requirements",
             Self::ProtectionUnavailable => "The Alibaba trial's free-only protection could not be verified for the selected default workspace and model. No audio was sent. Check the existing CLI login, quota protection and expiry locally; received audio is retained",
             Self::BudgetExhausted => "The shared CNY 50 trial budget has insufficient uncommitted funds; no new cloud task was sent",
@@ -348,11 +373,23 @@ pub struct CloudSessions {
 impl CloudSessions {
     #[cfg(windows)]
     pub fn from_local(audio: Arc<dyn PlaybackAudio>) -> AppResult<Self> {
+        Self::from_local_with_model(audio, None)
+    }
+    /// #56: the process-level `--ali-model` selection is applied to the stored
+    /// settings here. Without a selection, nothing about the stored model changes.
+    #[cfg(windows)]
+    pub fn from_local_with_model(
+        audio: Arc<dyn PlaybackAudio>,
+        model: Option<&str>,
+    ) -> AppResult<Self> {
+        let settings = local_settings()
+            .map_err(|e| e.to_string())?
+            .with_model(model);
         Ok(Self::new(
             audio,
             Arc::new(NativeMessageTransport::default()),
             Arc::new(LocalCredentials),
-            local_settings().map_err(|e| e.to_string())?,
+            settings,
             TrialLedger::shared_local().map_err(|e| e.to_string())?,
         ))
     }

@@ -1,6 +1,6 @@
 //! Live, read-only checks using the existing logged-in CLI. This never changes
 //! protection, reads a key, starts a model task or accepts a local verified flag.
-use super::{ALI_MODEL, AliSettings, CloudError, FreeOnlyPolicy};
+use super::{AliSettings, CloudError, FreeOnlyPolicy};
 use serde_json::Value;
 use std::{
     io::Read,
@@ -41,15 +41,16 @@ pub trait FreeOnlyStatusSource: Send + Sync {
         Ok(SystemTime::now())
     }
     fn workspaces(&self) -> Result<Vec<u8>, CloudError>;
-    fn quota(&self) -> Result<Vec<u8>, CloudError>;
+    /// Queried for the exact model the task will use (#56), never a fixed one.
+    fn quota(&self, model: &str) -> Result<Vec<u8>, CloudError>;
 }
 pub(super) struct CliStatusSource;
 impl FreeOnlyStatusSource for CliStatusSource {
     fn workspaces(&self) -> Result<Vec<u8>, CloudError> {
         query(&["workspace", "list"])
     }
-    fn quota(&self) -> Result<Vec<u8>, CloudError> {
-        query(&["usage", "free", "--model", ALI_MODEL])
+    fn quota(&self, model: &str) -> Result<Vec<u8>, CloudError> {
+        query(&["usage", "free", "--model", model])
     }
 }
 
@@ -81,7 +82,7 @@ pub(super) fn verify(
     if matching != 1 || defaults != 1 {
         return Err(CloudError::ProtectionUnavailable);
     }
-    let quota = single_record(source.quota()?)?;
+    let quota = single_record(source.quota(&settings.model)?)?;
     let now = source
         .checked_at()?
         .duration_since(UNIX_EPOCH)
@@ -99,7 +100,7 @@ pub(super) fn verify(
         .as_f64()
         .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or(CloudError::ProtectionUnavailable)?;
-    if quota["model"].as_str() != Some(ALI_MODEL)
+    if quota["model"].as_str() != Some(settings.model.as_str())
         || quota["type"].as_str() != Some("Audio")
         || quota["autoStop"].as_bool() != Some(true)
         || remaining > total

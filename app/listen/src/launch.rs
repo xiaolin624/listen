@@ -58,6 +58,9 @@ pub struct Config {
     sensevoice_vad: PathBuf,
     sensevoice_language: String,
     cloud_trial: bool,
+    /// #56: an explicit cloud model selection. Absent means the stored/local
+    /// settings keep deciding, so the default behavior is unchanged.
+    ali_model: Option<String>,
     /// The pending-audio budget, its warning line and the free-disk floor (#36).
     storage: crate::storage::StoragePolicy,
 }
@@ -93,6 +96,7 @@ impl Config {
             // #40: the accepted cloud path is the daily default. Local recognition
             // is an explicit fallback and is never reached by falling through.
             cloud_trial: true,
+            ali_model: None,
             storage: crate::storage::StoragePolicy::default(),
         }
     }
@@ -154,6 +158,18 @@ impl Config {
                         }
                     }
                 }
+                // #56: a closed whitelist. An unlisted id is refused here, before
+                // any credential, workspace or capture work, instead of silently
+                // falling back to the shipped model.
+                "--ali-model" => {
+                    if !crate::cloud::is_allowed_model(&value) {
+                        return Err(format!(
+                            "--ali-model must be one of {}; refusing to fall back to the default model",
+                            crate::cloud::ALI_MODELS.join(", ")
+                        ));
+                    }
+                    config.ali_model = Some(value);
+                }
                 "--sherpa-lib" => config.sherpa_lib = PathBuf::from(value),
                 "--sensevoice-model" => config.sensevoice_model = PathBuf::from(value),
                 "--sensevoice-tokens" => config.sensevoice_tokens = PathBuf::from(value),
@@ -197,6 +213,12 @@ impl Config {
         if explicit_cloud_trial && explicit_engine {
             return Err(
                 "--cloud-trial cannot be combined with --engine; cloud trial has no local fallback"
+                    .into(),
+            );
+        }
+        if explicit_engine && config.ali_model.is_some() {
+            return Err(
+                "--ali-model selects a cloud trial model and cannot be combined with --engine; the local path has no cloud model"
                     .into(),
             );
         }
@@ -248,6 +270,12 @@ impl Config {
         self.hidden
     }
 
+    /// #56: the explicitly selected cloud model, if any. `None` keeps the stored
+    /// settings in charge (and therefore the shipped default).
+    pub fn ali_model(&self) -> Option<&str> {
+        self.ali_model.as_deref()
+    }
+
     /// Whether this process installs a notification-area icon. Only `--no-tray`
     /// turns it off; without the flag the tray icon is created exactly as before.
     pub fn tray(&self) -> bool {
@@ -270,7 +298,10 @@ impl Config {
     pub fn application(&self, registration: AppResult<()>) -> AppResult<Application> {
         match self.recognition() {
             Recognition::CloudTrial => {
-                let sessions = CloudSessions::from_local(Arc::new(WasapiPcmPlayback))?;
+                let sessions = CloudSessions::from_local_with_model(
+                    Arc::new(WasapiPcmPlayback),
+                    self.ali_model.as_deref(),
+                )?;
                 Ok(self.application_with_sessions(Box::new(sessions), registration))
             }
             Recognition::Local(_) => {

@@ -33,6 +33,11 @@ Options:
         engine; whisper or a path selects the whisper.cpp fallback. An explicit
         engine deselects the cloud default and cannot be combined with
         --cloud-trial.
+  --ali-model <qwen-audio-3.1-asr-flash-message|qwen-audio-3.1-asr-flash-streaming>
+        select the cloud trial model explicitly. Without the flag the shipped
+        message model is used exactly as before. Any other id is refused before
+        capture is opened; there is no silent fallback to the default, and it
+        cannot be combined with --engine.
   --sherpa-lib <directory>
         directory holding sherpa-onnx-c-api.dll and onnxruntime.dll.
   --sensevoice-model <model.int8.onnx>
